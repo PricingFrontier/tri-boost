@@ -1,0 +1,19 @@
+# Rust
+/target
+**/target
+**/*.rs.bk
+*.profraw
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+/dist
+/wheels
+*.so
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# OS / editor
+.DS_Store
