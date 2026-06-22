@@ -19,10 +19,11 @@
 //! **Hot-loop / fail-fast (FLAG, spec §05.2 reconciliation).** §05.2 specifies a `grad_hess`
 //! whose only failure is `ShapeMismatch` (saturation + the floor make the kernel total).
 //! This crate makes `grad_hess` **stricter** — every loss rejects non-finite `y`/`raw`
-//! and negative/non-finite `weight` per row with a typed `InvalidInput` (the fail-fast
-//! house style established by the Phase-2 `SquaredError` hardening). Domain (sign) checks
-//! still live in `init_score`/`deviance` per §05.3a; this only adds a finiteness guard so
-//! a bug upstream surfaces as a typed error rather than `NaN` in the histogram.
+//! and negative/non-finite `weight` per row, and rejects any non-finite computed `g/h`,
+//! with a typed `InvalidInput` (the fail-fast house style established by the Phase-2
+//! `SquaredError` hardening). Domain (sign) checks still live in `init_score`/`deviance`
+//! per §05.3a; this adds a finiteness guard so a bug upstream surfaces as a typed error
+//! rather than `NaN`/`inf` in the histogram.
 
 use crate::error::PbError;
 use itertools::izip;
@@ -78,6 +79,58 @@ fn require_weight(obj: &str, i: usize, w: f32) -> Result<(), PbError> {
             "{obj} weight[{i}] must be finite and >= 0, got {w}"
         )))
     }
+}
+
+fn ensure_finite_grad_hess(obj: &str, i: usize, g: f32, h: f32) -> Result<(f32, f32), PbError> {
+    if g.is_finite() && h.is_finite() {
+        Ok((g, h))
+    } else {
+        Err(invalid_input(format!(
+            "{obj} grad_hess row {i} produced non-finite g/h: g={g}, h={h}"
+        )))
+    }
+}
+
+fn finish_deviance(obj: &str, acc: f64) -> Result<f32, PbError> {
+    let out = acc as f32;
+    if acc.is_finite() && out.is_finite() {
+        Ok(out)
+    } else {
+        Err(invalid_input(format!(
+            "{obj} deviance is not finite/representable as f32: {acc}"
+        )))
+    }
+}
+
+fn validate_target_domain(obj: &str, loss: LossId, y: &[f32]) -> Result<(), PbError> {
+    for (i, &yi) in y.iter().enumerate() {
+        require_finite(obj, "soft_target", i, yi)?;
+        match loss {
+            LossId::SquaredError => {}
+            LossId::Logistic => {
+                if !(0.0..=1.0).contains(&yi) {
+                    return Err(invalid_input(format!(
+                        "{obj} soft_target[{i}] must be in [0, 1], got {yi}"
+                    )));
+                }
+            }
+            LossId::Poisson | LossId::Tweedie => {
+                if yi < 0.0 {
+                    return Err(invalid_input(format!(
+                        "{obj} soft_target[{i}] must be >= 0, got {yi}"
+                    )));
+                }
+            }
+            LossId::Gamma => {
+                if yi <= 0.0 {
+                    return Err(invalid_input(format!(
+                        "{obj} soft_target[{i}] must be > 0, got {yi}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Shared entry length-guard for the three slice methods (§05.2): the one in-method
@@ -306,8 +359,10 @@ impl Loss for SquaredError {
             require_finite("squared-error", "y", i, yi)?;
             require_finite("squared-error", "raw", i, fi)?;
             require_weight("squared-error", i, wi)?;
-            *gi = wi * (fi - yi);
-            *hi = wi.max(floor);
+            let (g, h) =
+                ensure_finite_grad_hess("squared-error", i, wi * (fi - yi), wi.max(floor))?;
+            *gi = g;
+            *hi = h;
         }
         Ok(())
     }
@@ -395,7 +450,7 @@ impl Loss for SquaredError {
                 what: "squared-error deviance: all-zero (or non-positive) weights".into(),
             });
         }
-        Ok((0.5 * acc) as f32)
+        finish_deviance("squared-error", 0.5 * acc)
     }
 
     fn default_metric(&self) -> Metric {
@@ -445,8 +500,14 @@ impl Loss for Logistic {
             require_finite("logistic", "raw", i, fi)?;
             require_weight("logistic", i, wi)?;
             let s = stable_sigmoid(fi);
-            *gi = wi * (s - yi);
-            *hi = (wi * s * (1.0 - s)).max(floor);
+            let (g, h) = ensure_finite_grad_hess(
+                "logistic",
+                i,
+                wi * (s - yi),
+                (wi * s * (1.0 - s)).max(floor),
+            )?;
+            *gi = g;
+            *hi = h;
         }
         Ok(())
     }
@@ -536,7 +597,7 @@ impl Loss for Logistic {
         if sum_w <= 0.0 {
             return Err(invalid_input("logistic deviance: all-zero weights".into()));
         }
-        Ok(acc as f32)
+        finish_deviance("logistic", acc)
     }
 
     fn default_metric(&self) -> Metric {
@@ -586,8 +647,10 @@ impl Loss for Poisson {
             require_finite("poisson", "raw", i, fi)?;
             require_weight("poisson", i, wi)?;
             let mu = clamp_exp(fi);
-            *gi = wi * (mu - yi);
-            *hi = (wi * mu).max(floor);
+            let (g, h) =
+                ensure_finite_grad_hess("poisson", i, wi * (mu - yi), (wi * mu).max(floor))?;
+            *gi = g;
+            *hi = h;
         }
         Ok(())
     }
@@ -645,7 +708,7 @@ impl Loss for Poisson {
         if sum_w <= 0.0 {
             return Err(invalid_input("poisson deviance: all-zero weights".into()));
         }
-        Ok(acc as f32)
+        finish_deviance("poisson", acc)
     }
 
     fn default_metric(&self) -> Metric {
@@ -700,8 +763,9 @@ impl Loss for Gamma {
             require_weight("gamma", i, wi)?;
             let em = clamp_exp(-fi); // e^{−F} = y/μ factor base
             let t = yi * em; // y·e^{−F}
-            *gi = wi * (1.0 - t);
-            *hi = (wi * t).max(floor);
+            let (g, h) = ensure_finite_grad_hess("gamma", i, wi * (1.0 - t), (wi * t).max(floor))?;
+            *gi = g;
+            *hi = h;
         }
         Ok(())
     }
@@ -758,7 +822,7 @@ impl Loss for Gamma {
         if sum_w <= 0.0 {
             return Err(invalid_input("gamma deviance: all-zero weights".into()));
         }
-        Ok(acc as f32)
+        finish_deviance("gamma", acc)
     }
 
     fn default_metric(&self) -> Metric {
@@ -841,10 +905,13 @@ impl Loss for Tweedie {
             require_weight("tweedie", i, wi)?;
             let a = clamp_exp(p1 * fi); // e^{(1−ρ)F} = μ^{1−ρ}
             let b = clamp_exp(p2 * fi); // e^{(2−ρ)F} = μ^{2−ρ}
-            *gi = wi * (-yi * a + b);
+            let g = wi * (-yi * a + b);
             // h = w[ −y(1−ρ)e^{(1−ρ)F} + (2−ρ)e^{(2−ρ)F} ] (the §05.3 form; here
             // `-yi * p1` with p1=(1−ρ)<0 is the equivalent y(ρ−1)·a ≥ 0), ≥ 0 for y ≥ 0.
-            *hi = (wi * (-yi * p1 * a + p2 * b)).max(floor);
+            let h = (wi * (-yi * p1 * a + p2 * b)).max(floor);
+            let (g, h) = ensure_finite_grad_hess("tweedie", i, g, h)?;
+            *gi = g;
+            *hi = h;
         }
         Ok(())
     }
@@ -910,7 +977,7 @@ impl Loss for Tweedie {
         if sum_w <= 0.0 {
             return Err(invalid_input("tweedie deviance: all-zero weights".into()));
         }
-        Ok(acc as f32)
+        finish_deviance("tweedie", acc)
     }
 
     fn default_metric(&self) -> Metric {
@@ -933,6 +1000,8 @@ impl Loss for Tweedie {
 /// `y` (the teacher is not ground truth), so early stopping and the base rate stay
 /// honest. `blend` is the true-label weight: `blend = 1.0` reproduces the base loss
 /// bit-for-bit; `blend = 0.0` is the pure-soft fit.
+/// When `blend < 1.0`, the consulted soft target is preflighted against the base
+/// objective's finite natural-scale domain before the second gradient pass.
 pub struct BlendedLoss<'a> {
     base: &'a dyn Loss,
     soft_target: &'a [f32],
@@ -980,6 +1049,7 @@ impl Loss for BlendedLoss<'_> {
                 ),
             });
         }
+        validate_target_domain("blended", self.base.objective_tag().loss, self.soft_target)?;
         // soft := base(g,h) on the teacher target, then blend in fixed index order.
         let mut soft = GradHess::default();
         self.base
@@ -1168,6 +1238,26 @@ mod tests {
         ));
         assert!(matches!(
             sqe.deviance(&[1.0], &[1.0], &[f32::INFINITY]),
+            Err(PbError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn nonfinite_grad_hess_and_metric_outputs_are_invalid_input() {
+        let sqe = SquaredError;
+        let mut gh = GradHess::default();
+        // Finite inputs can still overflow f32 arithmetic; never let inf enter Hist.
+        assert!(matches!(
+            sqe.grad_hess(&[-f32::MAX], &[f32::MAX], &[1.0], &mut gh),
+            Err(PbError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            Poisson.grad_hess(&[0.0], &[30.0], &[f32::MAX], &mut gh),
+            Err(PbError::InvalidInput { .. })
+        ));
+        // Deviance is returned as f32; unrepresentable finite f64 reductions are errors.
+        assert!(matches!(
+            sqe.deviance(&[-f32::MAX], &[f32::MAX], &[f32::MAX]),
             Err(PbError::InvalidInput { .. })
         ));
     }
@@ -1624,6 +1714,15 @@ mod tests {
             bb.grad_hess(&y, &raw, &w, &mut gh),
             Err(PbError::InvalidInput { .. })
         ));
+        let out_of_domain_soft = [1.2_f32, 0.0, 1.0, 0.0];
+        let bb = BlendedLoss::new(&Logistic, &out_of_domain_soft, 0.5).unwrap();
+        assert!(matches!(
+            bb.grad_hess(&y, &raw, &w, &mut gh),
+            Err(PbError::InvalidInput { .. })
+        ));
+        let b1_bad_teacher = BlendedLoss::new(&Logistic, &out_of_domain_soft, 1.0).unwrap();
+        b1_bad_teacher.grad_hess(&y, &raw, &w, &mut gh).unwrap();
+        assert_eq!(gh.g, base_gh.g);
         // Bad blend is InvalidConfig.
         assert!(matches!(
             BlendedLoss::new(&Logistic, &soft, 1.5),
