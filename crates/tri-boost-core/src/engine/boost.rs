@@ -47,10 +47,23 @@ fn validate_fit_spec(spec: &FitSpec<'_>) -> Result<(), PbError> {
             ),
         });
     }
-    if spec.interaction.groups.is_some() {
-        return Err(invalid_config(
-            "interaction groups are not implemented in the Phase-2 green spine",
-        ));
+    if let Some(groups) = &spec.interaction.groups {
+        if groups.is_empty() {
+            return Err(invalid_config(
+                "interaction groups must be non-empty when set",
+            ));
+        }
+        for group in groups {
+            if group.order() == 0 || group.order() > usize::from(spec.interaction.max_order) {
+                return Err(PbError::InvalidConfig {
+                    what: format!(
+                        "interaction group order must be in 1..={}, got {}",
+                        spec.interaction.max_order,
+                        group.order()
+                    ),
+                });
+            }
+        }
     }
     if !spec.monotone.is_empty() {
         return Err(invalid_config(
@@ -226,6 +239,7 @@ pub(crate) fn fit(
         hist_precision: config.hist_precision,
         quant_seed: spec.seed,
         round: 0,
+        groups: spec.interaction.groups.as_deref(),
     };
 
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
@@ -236,7 +250,7 @@ pub(crate) fn fit(
         let _round_rng = pb_rng(spec.seed, t, Stage::Sample, 0);
         spec.loss.grad_hess(y, &raw, weight, &mut gh)?;
         let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
-        let mut round_grow_cfg = grow_cfg;
+        let mut round_grow_cfg = grow_cfg.clone();
         round_grow_cfg.round = t;
         match grow_oblivious_tree(x, &gh, &sampled_rows, &axes, &round_grow_cfg)? {
             Some(mut tree) => {
@@ -620,11 +634,23 @@ mod tests {
         ));
 
         let mut s = spec(&sqe);
-        s.interaction.groups = Some(vec![FeatureSet::new(&[0])]);
+        s.interaction.groups = Some(Vec::new());
         assert!(matches!(
             booster.fit(&x, &y, &s),
             Err(PbError::InvalidConfig { .. })
         ));
+
+        let mut s = spec(&sqe);
+        s.interaction.max_order = 1;
+        s.interaction.groups = Some(vec![FeatureSet::new(&[0, 1])]);
+        assert!(matches!(
+            booster.fit(&x, &y, &s),
+            Err(PbError::InvalidConfig { .. })
+        ));
+
+        let mut s = spec(&sqe);
+        s.interaction.groups = Some(vec![FeatureSet::new(&[0])]);
+        assert!(booster.fit(&x, &y, &s).is_ok());
 
         let mut s = spec(&sqe);
         s.monotone.insert("f0".into(), MonoSign::Increasing);

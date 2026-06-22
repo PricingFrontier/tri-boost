@@ -18,6 +18,7 @@ use crate::data::BinnedMatrix;
 use crate::engine::hist::{build_histogram, build_quantized_histogram, QuantizeContext};
 use crate::engine::{low_bit, Hist, HistPrecision, ObliviousTree, Split};
 use crate::error::PbError;
+use crate::explain::FeatureSet;
 use crate::loss::GradHess;
 
 fn internal(what: &'static str) -> impl Fn() -> PbError {
@@ -28,8 +29,8 @@ fn internal(what: &'static str) -> impl Fn() -> PbError {
 /// grower needs; M1.5's `Config` produces one). Credibility floors
 /// (`min_sum_hessian_in_leaf`, `min_data_in_leaf`) and monotone bounds are §07/M1.5
 /// and land then.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct GrowConfig {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GrowConfig<'a> {
     /// L2 leaf regularizer `λ` (in `w* = −G/(H+λ)` and the gain).
     pub lambda: f64,
     /// Learning rate applied to each leaf value.
@@ -47,6 +48,9 @@ pub(crate) struct GrowConfig {
     pub quant_seed: u64,
     /// Boosting round, used as the quantization re-seed coordinate.
     pub round: u32,
+    /// Optional whole-tree feature-group whitelist (§07): every realized tree support
+    /// must be a subset of at least one group.
+    pub groups: Option<&'a [FeatureSet]>,
 }
 
 /// A candidate level split with its summed Newton gain.
@@ -265,7 +269,7 @@ pub(crate) fn refit_tree_leaves(
     gh: &GradHess,
     rows: &[u32],
     tree: &mut ObliviousTree,
-    cfg: &GrowConfig,
+    cfg: &GrowConfig<'_>,
 ) -> Result<(), PbError> {
     let mut leaf_of_row: Vec<u8> = Hist::try_zeroed_vec(x.n_rows as usize, "refit leaf map")?;
     for &r in rows {
@@ -311,7 +315,7 @@ pub(crate) fn grow_oblivious_tree(
     gh: &GradHess,
     rows: &[u32],
     axes: &[u32],
-    cfg: &GrowConfig,
+    cfg: &GrowConfig<'_>,
 ) -> Result<Option<ObliviousTree>, PbError> {
     let n_rows = x.n_rows as usize;
     let mut leaf_of_row: Vec<u8> = Hist::try_zeroed_vec(n_rows, "leaf assignment")?;
@@ -327,11 +331,7 @@ pub(crate) fn grow_oblivious_tree(
         let admissible: Vec<u32> = axes
             .iter()
             .copied()
-            .filter(|&a| {
-                x.provenance
-                    .get(a as usize)
-                    .is_some_and(|prov| !used_raws.contains(&prov.raw.0))
-            })
+            .filter(|&a| axis_is_admissible(x, a, &used_raws, cfg.groups))
             .collect();
         if admissible.is_empty() {
             break;
@@ -414,6 +414,30 @@ pub(crate) fn grow_oblivious_tree(
         cfg.max_delta_step,
     )?;
     Ok(Some(ObliviousTree::try_new(splits, leaves, &x.provenance)?))
+}
+
+fn axis_is_admissible(
+    x: &BinnedMatrix,
+    axis: u32,
+    used_raws: &[u32],
+    groups: Option<&[FeatureSet]>,
+) -> bool {
+    let Some(prov) = x.provenance.get(axis as usize) else {
+        return false;
+    };
+    let raw = prov.raw;
+    if used_raws.contains(&raw.0) {
+        return false;
+    }
+    match groups {
+        None => true,
+        Some(groups) => groups.iter().any(|group| {
+            group.contains(raw)
+                && used_raws
+                    .iter()
+                    .all(|&used| group.contains(crate::data::FeatureId(used)))
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -557,7 +581,7 @@ mod tests {
 
     /// A clean depth-2 fixture: two informative features ⇒ the engine grows a depth-2
     /// tree on two DISTINCT raw features (I1), with no early termination.
-    fn cfg(lambda: f64, lr: f64, min_split_gain: f64, max_order: u8) -> GrowConfig {
+    fn cfg(lambda: f64, lr: f64, min_split_gain: f64, max_order: u8) -> GrowConfig<'static> {
         GrowConfig {
             lambda,
             lr,
@@ -567,6 +591,7 @@ mod tests {
             hist_precision: HistPrecision::FullF64,
             quant_seed: 0,
             round: 0,
+            groups: None,
         }
     }
 
@@ -693,6 +718,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(tree.depth, 1);
+    }
+
+    #[test]
+    fn group_whitelist_gates_candidate_axes() {
+        // Axis 1 is the only informative axis; a group list that contains only raw 0
+        // must therefore produce no tree, while a group containing raw 1 admits it.
+        let c0: Vec<u8> = vec![1, 1, 1, 1];
+        let c1: Vec<u8> = vec![1, 1, 2, 2];
+        let x = matrix(vec![c0, c1], &[2, 3]);
+        let gh = gradhess(&[-2.0, -2.0, 2.0, 2.0], &[1.0; 4]);
+        let rows = [0u32, 1, 2, 3];
+
+        let denied_groups = vec![FeatureSet::new(&[0])];
+        let mut denied = cfg(1.0, 0.1, 0.0, 2);
+        denied.groups = Some(&denied_groups);
+        assert!(grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &denied)
+            .unwrap()
+            .is_none());
+
+        let allowed_groups = vec![FeatureSet::new(&[1])];
+        let mut allowed = cfg(1.0, 0.1, 0.0, 2);
+        allowed.groups = Some(&allowed_groups);
+        let tree = grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &allowed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tree.splits[0].axis, 1);
     }
 
     #[test]
