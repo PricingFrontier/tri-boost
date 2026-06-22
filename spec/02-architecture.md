@@ -1,6 +1,6 @@
 ## 02 — Architecture & project layout
 
-> Owner section per the §4 ownership map. This section OWNS: the Cargo workspace layout (core / py / python / benches); the module boundaries inside `tri-boost-core`; the `PbError` + `Invariant` **definition** (the enum bodies live here, every other section maps its failures onto a variant); the `Backend` trait seam (CPU now, GPU-shaped later); the feature-flag matrix; and the `schema_version` policy. It USES every §2 shared type but defines none of them except `PbError`/`Invariant`. Grounded in research/05 (the polars/tokenizers dual-crate shape, abi3-py310, MSRV 1.64, quantized-reproducibility, defer-GPU-behind-a-`Backend`-trait) and the skeleton's engineering checklist (§1).
+> Owner section per the §4 ownership map. This section OWNS: the Cargo workspace layout (core / py / python / benches); the module boundaries inside `tri-boost-core`; the `PbError` + `Invariant` **definition** (the enum bodies live here, every other section maps its failures onto a variant); the `Backend` trait seam (CPU now, GPU-shaped later); the feature-flag matrix; and the `schema_version` policy. It USES every §2 shared type but defines none of them except `PbError`/`Invariant`. Grounded in research/05 (the polars/tokenizers dual-crate shape, abi3-py310, the updated MSRV 1.74 lint-table floor, quantized-reproducibility, defer-GPU-behind-a-`Backend`-trait) and the skeleton's engineering checklist (§1).
 
 ### 02.1 — Decision summary
 
@@ -11,7 +11,7 @@
 | pyo3 location | ONLY `tri-boost-py`; `tri-boost-core` has zero pyo3 dependency, even optional | crates.io-publishable core; `cargo test` on the core never pulls a Python toolchain |
 | Compute seam | a `Backend` trait in the core (CPU impl only in v1), GPU-shaped | keeps the door open without speculative GPU code; the pre-binned `u8` columnar layout is already GPU-friendly |
 | Binding ABI | abi3-py310 (one wheel per `(os, arch)`) | matches polars/tokenizers; smaller release matrix |
-| MSRV | 1.64, pinned in `rust-toolchain.toml` | manylinux2014/glibc 2.17 floor (Rust ≥1.64 needs glibc ≥2.17) |
+| MSRV | 1.74, verified in CI | `[workspace.lints]` inheritance requires Rust 1.74; manylinux2014/glibc 2.17 remains compatible |
 | Unsafe posture | `#![forbid(unsafe_code)]` on the core; SIMD via safe wrappers | engineering standard; no gratuitous unsafe |
 | Error model | one `PbError` enum (defined here), `Result<T, PbError>` on every fallible public fn | typed errors, no panics in library code |
 | `schema_version` | a single monotone `u32` on `Model`/`TableBank`, owned here, bumped on any wire-incompatible change | reproducible, auditable, cross-language load |
@@ -24,7 +24,7 @@
 tri-boost/
 ├── Cargo.toml                      # [workspace]; pins pyo3 + shared version + shared lint table at root
 ├── pyproject.toml                  # build-backend="maturin"; python-source/module-name/manifest-path
-├── rust-toolchain.toml             # channel="1.64" (MSRV pin); components rustfmt, clippy
+├── rust-toolchain.toml             # channel="stable" for contributors; CI verifies MSRV 1.74 with rustfmt, clippy
 ├── deny.toml                       # cargo-deny: licenses, advisories, bans  [GATE]
 ├── python/
 │   └── tri_boost/
@@ -67,7 +67,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"                 # shared; the wire schema_version is separate (02.8)
 edition = "2021"
-rust-version = "1.64"            # MSRV  [GATE: CI builds on exactly this]
+rust-version = "1.74"            # MSRV  [GATE: CI builds on exactly this]
 license = "Apache-2.0"
 repository = "https://github.com/.../tri-boost"
 
@@ -79,18 +79,21 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 bincode     = "2"                # 2.x; binary path uses bincode::serde::{encode_to_vec, decode_from_slice}
                                  # with a FROZEN bincode::config::standard() (§10) — byte-equality contract
-rand        = "0.8"
+rand        = { version = "0.8", default-features = false }
 rand_pcg    = "0.3"              # Pcg64 — the named, versioned PRNG (§1); seeded by deterministic re-seeding, NOT "split"
 thiserror   = "1"
 num-traits  = "0.2"
 smallvec    = { version = "1", features = ["serde"] }   # FeatureSet backing (§2.7)
 multiversion = "0.7"             # runtime-dispatched SIMD; safe (§11)
 pulp        = "0.18"             # safe SIMD abstraction; safe (§11)
-pyo3        = { version = "0.26", default-features = false }
-numpy       = "0.26"
+pyo3        = { version = "0.29", default-features = false }
+numpy       = "0.29"
 
 # The shared lint table — applied identically in BOTH crates' Cargo.toml via
-# `[lints] workspace = true`. This is the §1 panic/unsafe GATE expressed as config.
+# `[lints] workspace = true`. This is the §1 panic/missing-docs GATE expressed
+# as config. `tri-boost-core` also carries `#![forbid(unsafe_code)]` at crate
+# root; this is intentionally not a workspace lint because PyO3 codegen in
+# `tri-boost-py` must be locally allowed and `forbid` cannot be relaxed.
 # NOTE on integer overflow: the no-overflow guarantee is enforced primarily by
 # `overflow-checks = true` in ALL profiles (02.3a), not by a crate-blanket
 # `arithmetic_side_effects` deny — which would make every legitimate accumulation a
@@ -109,14 +112,13 @@ indexing_slicing       = "deny"
 
 [workspace.lints.rust]
 missing_docs   = "deny"
-unsafe_code    = "forbid"        # the py crate overrides this locally for pyo3 macro expansion
 ```
 
 #### 02.3a — Integer-overflow & arithmetic policy (workspace-wide)
 
 The skeleton's "no arithmetic that can overflow" rule (§1) is realized concretely as:
 
-1. **`overflow-checks = true` in every profile** — `[profile.dev]`, `[profile.release]`, `[profile.test]`, and `[profile.bench]` all set `overflow-checks = true`. Integer overflow traps (a checked panic) in every build, including release, so an overflow can never silently wrap; combined with the no-panic gate this means the only correct code is code that provably cannot overflow.
+1. **`overflow-checks = true` in every workspace-root profile** — `[profile.dev]`, `[profile.release]`, `[profile.test]`, and `[profile.bench]` in the root `Cargo.toml` all set `overflow-checks = true`. Cargo ignores member-local profile settings in a workspace, so the root placement is part of the gate. Integer overflow traps (a checked panic) in every build, including release, so an overflow can never silently wrap; combined with the no-panic gate this means the only correct code is code that provably cannot overflow.
 2. **Clippy `arithmetic_side_effects` is scoped, not crate-blanket** — it is denied module-locally on the hot integer index/bin/offset arithmetic (the `Hist` accumulation, bin id construction, row/axis indexing), where each such site carries a `// JUSTIFIED:` bound or is replaced by a checked form. It is NOT denied at crate root, because that would flag every benign `usize` increment. **Float arithmetic is explicitly exempt** from both the overflow-trap reasoning and this lint (floats saturate to ±inf, handled by the loss/numeric code, not by overflow-checks).
 3. **The `Hist` bound is proven, not assumed** — §06 carries the proof that `n_rows · max|g_q| < i64::MAX` for the `i64` bin accumulators (02.5), so histogram accumulation cannot overflow even at large `n`.
 
@@ -187,7 +189,7 @@ distill = []                     # CatBoost teacher DATA hooks only (§09); no F
 nightly = []                     # portable_simd path; off the default/shipping wheel (§11)
 ```
 
-`tri-boost-py/Cargo.toml` adds `pyo3 = { workspace = true, features = ["extension-module", "abi3-py310"] }`, `numpy.workspace = true`, the path+version dep on the core, and `crate-type = ["cdylib"]`. It is the ONLY crate where `extension-module`/`abi3` appear. Its `lib.rs` carries a module-local `#![allow(unsafe_code)]` because the pyo3 procedural macros expand to `unsafe`; this is the single, justified, encapsulated exception to the workspace `forbid` (research/05 §2).
+`tri-boost-py/Cargo.toml` adds `pyo3 = { workspace = true, features = ["extension-module", "abi3-py310"] }`, `numpy.workspace = true`, the path+version dep on the core, and `crate-type = ["cdylib"]`. It is the ONLY crate where `extension-module`/`abi3` appear. Its `lib.rs` carries a module-local `#![allow(unsafe_code)]` because the pyo3 procedural macros expand to `unsafe`; this is the single, justified, encapsulated exception to the core-crate unsafe policy (research/05 §2).
 
 ### 02.4 — `PbError` + `Invariant` (OWNED HERE — defined verbatim from §2.8)
 
@@ -211,13 +213,15 @@ pub enum PbError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invariant {
     FeatureBudget,     // I1: >3 distinct raw features / non-oblivious growth
-    Decomposability,   // I2: ensemble != constant + ≤3-order tables
+    Decomposability,   // I2 purity: a table axis-slice has non-zero w-mean (the Purity check)
     MassConservation,  // purification did not conserve signed mass
     Reconstruction,    // per-cell |F_ens − Σ f_u| ≥ tol
     VarianceSum,       // σ²(F) != Σ σ²(f_u) under product/uniform w
     ThreeWayEqual,     // tree-sum != table-sum != Shapley-sum
 }
 ```
+
+As in §2.8, there is **no separate `Purity` variant**: the I2 purity check (every `EffectTable` axis-slice has `w`-weighted mean zero) reports its failures as `Invariant::Decomposability` — the implementation (`error.rs`) and §08 carry the same mapping.
 
 Two policy rules this section sets for the whole workspace: (1) an "impossible" internal state returns `PbError::Internal { what }` rather than panicking — a logic bug degrades to a typed error visible at the Python boundary, never an abort in a user's session; (2) the `extension-module` feature being off means `PbError` carries no pyo3 dependency, so the core's error type is usable by pure-Rust consumers. The `PbError → PyErr` mapping (one variant → one Python exception class) is owned by §12; this section only guarantees the variants are stable and exhaustive.
 
@@ -293,7 +297,7 @@ Rules (build `[GATE]`s): (1) **default features of the core must compile and pas
 
 `pyproject.toml` `[tool.maturin]`: `python-source = "python"`, `module-name = "tri_boost._tri_boost"`, `manifest-path = "crates/tri-boost-py/Cargo.toml"` (essential in a workspace), `features = ["pyo3/extension-module"]`, `strip = true`, plus `include` for `py.typed`/`.pyi`. `[build-system]` is `requires = ["maturin>=1.9,<2"]`, `build-backend = "maturin"`.
 
-CI is two pipelines. **Correctness CI** (every PR, the build `[GATE]`s) runs on the core: `cargo fmt --check`, `cargo clippy -- -D warnings` (with the workspace lint table + the scoped `arithmetic_side_effects` of 02.3a), `cargo test` (unit + the five Invariant gates + proptest purification identities), `cargo deny check`, the bit-reproducibility harness at `n_threads ∈ {1,2,8}`, doctests, and a Miri run over any `unsafe`-adjacent code. Builds use `overflow-checks = true` in every profile (02.3a). MSRV is verified by building the core on exactly Rust 1.64. **Release CI** (tag-triggered) uses `maturin-action` to build wheels per `(os, arch)`: linux x86_64/aarch64 + musllinux, macOS x86_64/aarch64, Windows x64; with abi3 that is one wheel per platform, not per interpreter. Targets manylinux2014 (x86_64) / manylinux_2_28 (aarch64); wheels build with a portable `-C target-cpu=x86-64-v3` baseline (AVX2), lifting to AVX-512 at runtime via `multiversion` — never `target-cpu=native`. Publishing is OIDC Trusted Publishing to PyPI; `tri-boost-core` is published to crates.io first (`cargo publish -p tri-boost-core`, wait for indexing, then the py crate is not published to crates.io — it ships only as a wheel).
+CI is two pipelines. **Correctness CI** (every PR, the build `[GATE]`s) runs on the core: `cargo fmt --check`, `cargo clippy -- -D warnings` (with the workspace lint table + the scoped `arithmetic_side_effects` of 02.3a), `cargo test` (unit + the five Invariant gates + proptest purification identities), `cargo deny check`, the bit-reproducibility harness at `n_threads ∈ {1,2,8}`, doctests, and a Miri run over any `unsafe`-adjacent code. Builds use `overflow-checks = true` in every root profile (02.3a). MSRV is verified by building the core on exactly Rust 1.74. **Release CI** (tag-triggered) uses `maturin-action` to build wheels per `(os, arch)`: linux x86_64/aarch64 + musllinux, macOS x86_64/aarch64, Windows x64; with abi3 that is one wheel per platform, not per interpreter. Targets manylinux2014 (x86_64) / manylinux_2_28 (aarch64); wheels build with a portable `-C target-cpu=x86-64-v3` baseline (AVX2), lifting to AVX-512 at runtime via `multiversion` — never `target-cpu=native`. Publishing is OIDC Trusted Publishing to PyPI; `tri-boost-core` is published to crates.io first (`cargo publish -p tri-boost-core`, wait for indexing, then the py crate is not published to crates.io — it ships only as a wheel).
 
 ### 02.8 — `schema_version` policy (OWNED HERE)
 

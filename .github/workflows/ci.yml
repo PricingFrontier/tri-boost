@@ -35,10 +35,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Fmt
         run: cargo fmt --all --check
+      # Bare `cargo clippy` targets default-members (core + xtask) — deliberately
+      # Python-free (the py crate is linted by the `py-lint` job, with a Python set up).
       - name: Clippy (no-panic deny set, all targets, all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Grep-gates (no-box-dyn / justified / wire-width / no-hashmap)
         run: cargo run -p xtask -- check-all
+
+  # ---- The PyO3 binding under the SAME no-panic/missing-docs lint wall ----
+  # tri-boost-py inherits `[lints] workspace = true`, but it is excluded from
+  # default-members, so the core `lint` job never sees it. This dedicated job
+  # enforces the inherited wall on the binding (needs a Python for pyo3 build config).
+  py-lint:
+    name: tri-boost-py lint wall
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy on the PyO3 binding
+        run: cargo clippy -p tri-boost-py --all-targets --all-features -- -D warnings
 
   # ---- Tests + doctests + the invariant & determinism harnesses ----------
   test:
@@ -67,9 +88,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # MSRV bumped from the spec's original 1.64: the `[workspace.lints]` table this
-      # workspace relies on was stabilised in Rust 1.74, so 1.64 was never achievable
-      # alongside lint inheritance. FLAG: reconcile spec §1/§02 MSRV 1.64 -> 1.74.
+      # The `[workspace.lints]` table this workspace relies on was stabilised in
+      # Rust 1.74, so the MSRV job pins that inherited-lint floor exactly.
       - uses: dtolnay/rust-toolchain@1.74.0
       - uses: Swatinem/rust-cache@v2
       - name: Build + test on MSRV

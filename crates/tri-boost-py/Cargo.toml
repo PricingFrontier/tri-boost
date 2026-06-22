@@ -8,10 +8,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-# Deliberately does NOT inherit `[lints] workspace = true`: the workspace forbids
-# nothing unsafe (that is a core-only crate attribute), and this thin binding is a
-# §12 / Release-CI concern, built via maturin — not by the core's default-member
-# Correctness gates. Lint hardening lands with §12.
+# Inherit the normal no-panic/missing-docs lint wall. `unsafe_code = "forbid"`
+# is deliberately not in the workspace table, so this PyO3 crate can allow the
+# generated binding unsafe locally while still sharing the rest of the gates.
+[lints]
+workspace = true
 
 [lib]
 name       = "_tri_boost"          # the compiled module is `tri_boost._tri_boost` (§02.7)

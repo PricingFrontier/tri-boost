@@ -12,10 +12,9 @@ resolver     = "2"
 [workspace.package]
 version      = "0.1.0"                 # shared crate semver; the wire schema_version is separate (§02.8)
 edition      = "2021"
-# MSRV. Spec §1/§02 said 1.64, but the `[workspace.lints]` table this workspace
-# relies on (F0) was stabilised in Rust 1.74 — so 1.64 was never achievable
-# alongside lint inheritance. Bumped to 1.74 (still satisfies the manylinux_2_28
-# floor). FLAG: reconcile spec §1/§02 MSRV 1.64 -> 1.74.
+# MSRV. The `[workspace.lints]` table this workspace relies on was stabilised in
+# Rust 1.74, so 1.74 is the minimum floor compatible with inherited lint gates.
+# This still satisfies the wheel portability floor.
 rust-version = "1.74"
 license      = "Apache-2.0"
 repository   = "https://github.com/PricingFrontier/tri-boost"
@@ -38,9 +37,8 @@ num-traits   = "0.2"
 smallvec     = { version = "1", features = ["serde"] }   # FeatureSet backing (§2.7)
 multiversion = "0.7"                   # runtime-dispatched SIMD; safe (§11)
 pulp         = "0.18"                  # safe SIMD abstraction; safe (§11)
-# pyo3/numpy 0.29: 0.26 (the spec's original pin) is vulnerable to RUSTSEC-2026-0177
-# (a missing `Sync` bound on `PyCFunction::new_closure`, fixed in pyo3 0.29). Bumped
-# to clear the `cargo deny` advisories gate. FLAG: reconcile spec §02/§12 pin 0.26 -> 0.29.
+# pyo3/numpy 0.29 clears RUSTSEC-2026-0177 (a missing `Sync` bound on
+# `PyCFunction::new_closure`) while preserving the abi3-py310 binding shape.
 pyo3         = { version = "0.29", default-features = false }
 numpy        = "0.29"
 # Dev-only (benches). default-features = false drops plotters/html-report to keep the
@@ -51,8 +49,7 @@ criterion    = { version = "0.5", default-features = false }
 # core via `[lints] workspace = true`. NOTE: `unsafe_code = "forbid"` is deliberately
 # NOT here — `forbid` cannot be locally relaxed, which would make the pyo3 py-crate
 # (needs `unsafe` for macro expansion) uncompilable. `forbid(unsafe_code)` is instead
-# a CORE crate attribute (crates/tri-boost-core/src/lib.rs). FLAG: spec §02.3 placed
-# it in the workspace table with "py overrides locally" — impossible; moved to the core.
+# a CORE crate attribute (crates/tri-boost-core/src/lib.rs).
 # `arithmetic_side_effects` is NOT here either: it is SCOPED per-module (§02.3a),
 # backed by `overflow-checks = true` in all profiles.
 [workspace.lints.clippy]
@@ -70,8 +67,7 @@ missing_docs = "deny"
 # rather than denied workspace-wide, so a wrapping/overflowing add in a hot loop
 # must trap at runtime in release too — never silently wrap. Profiles are only
 # honoured in the WORKSPACE ROOT manifest (cargo ignores `[profile.*]` in member
-# crates), which is why they live here. FLAG: spec §02.3 placed these on the core
-# crate; moved to the root so they actually take effect.
+# crates), which is why they live here.
 [profile.dev]
 overflow-checks = true
 

@@ -25,15 +25,15 @@ Every section's decisions MUST satisfy the following. CI gates marked **[GATE]**
 - A single `seed: u64` threads through binning subsample, subsampling, MVS, and any randomized split selection. RNG is a named, versioned PRNG (`rand_pcg::Pcg64` via `SeedableRng`); the seeding scheme is documented and frozen. Per-work-unit independent streams are produced by **deterministic re-seeding**, NOT a "splittable" PRNG (which is unimplementable as named for `Pcg64`): each work unit derives its seed as `Pcg64::seed_from_u64(splitmix64_mix(base, round, stage, block))`, where `splitmix64_mix` is a frozen `splitmix64` mixing of the `(base, round, stage, block)` tuple. This is position-stable and thread-count-independent, so the determinism `[GATE]` holds.
 
 **Unsafe policy.**
-- `#![forbid(unsafe_code)]` at the crate root of `tri-boost-core` by default. Any `unsafe` requires: an `unsafe_ok` module-local `#![allow]`, a `// SAFETY:` comment proving each precondition, encapsulation behind a safe API, and a dedicated test (plus a Miri run in CI where feasible). SIMD intrinsics live behind `multiversion`/`pulp`/`wide` (safe wrappers) — hand-written intrinsics are a last resort and must be justified in the section that introduces them.
+- `#![forbid(unsafe_code)]` lives at the crate root of `tri-boost-core`. It is deliberately **not** a workspace lint, because `forbid` cannot be locally relaxed for the `tri-boost-py` PyO3 macro boundary. Any core `unsafe` would require: an `unsafe_ok` module-local `#![allow]`, a `// SAFETY:` comment proving each precondition, encapsulation behind a safe API, and a dedicated test (plus a Miri run in CI where feasible). SIMD intrinsics live behind `multiversion`/`pulp`/`wide` (safe wrappers) — hand-written intrinsics are a last resort and must be justified in the section that introduces them.
 
 **Feature-flagging.**
 - `pyo3`/`extension-module` exist ONLY in `tri-boost-py`; `tri-boost-core` has **zero** pyo3 dependency. Optional capabilities are cargo features: `arrow` (Arrow/PyCapsule ingest), `distill` (CatBoost teacher hooks — data-side only), `nightly` (portable_simd). Default features must compile and pass all invariant gates on stable.
 
-**MSRV & toolchain.** MSRV **1.64** (manylinux2014/glibc 2.17 floor), pinned in `rust-toolchain.toml`; raised only with a changelog entry and CI matrix update.
+**MSRV & toolchain.** MSRV **1.74**. The floor is set by the required `[workspace.lints]` inheritance table, which stabilized in Rust 1.74; earlier Rust targets are incompatible with the lint architecture. CI builds exactly 1.74, while `rust-toolchain.toml` tracks contributor `stable` with the required components. Raising MSRV requires a changelog entry and CI matrix update.
 
-**Dependency philosophy.** Minimal, audited, widely-used: `rayon`, `ndarray`, `serde`, `serde_json`, `bincode`, `rand`/`rand_pcg`, `thiserror`, `num-traits`; `multiversion`/`pulp`/`wide` for SIMD; `half`/quantization helpers as needed. New deps require justification in the owning section. `cargo deny` (licenses, advisories, bans) is **[GATE]**.
-- **`bincode` is pinned to 2.x.** The removed top-level `bincode::serialize`/`deserialize` functions are NOT used; all binary (de)serialization goes through `bincode::serde::encode_to_vec(.., bincode::config::standard())` / `bincode::serde::decode_from_slice(.., bincode::config::standard())`. The `bincode::config::standard()` config is **frozen** (its variant/endian/limit choices are part of the contract) because byte-equality of the serialized model depends on it. §10/§11/§12 use exactly this API and config.
+**Dependency philosophy.** Minimal, audited, widely-used: `rayon`, `ndarray`, `serde`, `serde_json`, `bincode`, `rand`/`rand_pcg`, `thiserror`, `num-traits`; `multiversion`/`pulp`/`wide` for SIMD; `half`/quantization helpers as needed. New deps require justification in the owning section. `cargo deny` (licenses, advisories, bans) is **[GATE]**. `rand` uses `default-features = false` so deterministic core builds do not pull host-entropy plumbing and the `wasm32` smoke build remains a real no-Python/no-OS-entropy check.
+- **`bincode` is pinned to 2.x.** The removed top-level `bincode::serialize`/`deserialize` functions are NOT used; all binary (de)serialization goes through `bincode::serde::encode_to_vec(.., bincode::config::standard())` / `bincode::serde::decode_from_slice(.., bincode::config::standard())`. The `bincode::config::standard()` config is **frozen** (its variant/endian/limit choices are part of the contract) because byte-equality of the serialized model depends on it. `cargo deny` ignores `RUSTSEC-2025-0141` with an explicit justification: the advisory is "unmaintained", not a known vulnerability in this use, and the frozen bincode 2.x wire contract is release-critical unless a concrete vulnerability lands. §10/§11/§12 use exactly this API and config.
 
 **Doc & test requirements.**
 - `#![deny(missing_docs)]` on all public items. Every public type/fn has a doc comment with semantics, error conditions, and a runnable `///` example where non-trivial.
@@ -265,7 +265,7 @@ pub enum PbError {
 }
 pub enum Invariant { FeatureBudget, Decomposability, MassConservation, Reconstruction, VarianceSum, ThreeWayEqual }
 ```
-Owned by §02 (definition); every section maps its failures onto a variant.
+Owned by §02 (definition); every section maps its failures onto a variant. There is no separate `Purity` variant: the Purity check is the named zero-mean slice check, and failures map to `Invariant::Decomposability`.
 
 ### 2.9 The public booster handle
 ```rust
