@@ -21,6 +21,7 @@
 
 use crate::backend::{pb_rng, pb_seed, Stage};
 use crate::cat::CatEncoderStore;
+use crate::constraints::MonoSign;
 use crate::data::{compute_offset, BinnedMatrix};
 use crate::engine::split::{grow_oblivious_tree, refit_tree_leaves, GrowConfig};
 use crate::engine::{
@@ -65,12 +66,38 @@ fn validate_fit_spec(spec: &FitSpec<'_>) -> Result<(), PbError> {
             }
         }
     }
-    if !spec.monotone.is_empty() {
-        return Err(invalid_config(
-            "monotone constraints are not implemented in the Phase-2 green spine",
-        ));
-    }
     Ok(())
+}
+
+fn resolve_monotone(
+    spec: &FitSpec<'_>,
+    n_features: usize,
+) -> Result<Vec<Option<MonoSign>>, PbError> {
+    let mut out = vec![None; n_features];
+    for (name, sign) in &spec.monotone {
+        let Some(stripped) = name.strip_prefix('f') else {
+            return Err(PbError::InvalidConfig {
+                what: format!("unknown monotone feature `{name}`; expected default name f{{axis}}"),
+            });
+        };
+        let axis = stripped
+            .parse::<usize>()
+            .map_err(|_| PbError::InvalidConfig {
+                what: format!("unknown monotone feature `{name}`; expected default name f{{axis}}"),
+            })?;
+        if axis >= n_features {
+            return Err(PbError::InvalidConfig {
+                what: format!("monotone feature `{name}` is outside {n_features} model axes"),
+            });
+        }
+        if !matches!(sign, MonoSign::None) {
+            let slot = out.get_mut(axis).ok_or_else(|| PbError::Internal {
+                what: "monotone axis escaped bounds".into(),
+            })?;
+            *slot = Some(*sign);
+        }
+    }
+    Ok(out)
 }
 
 fn validate_binned_matrix(x: &BinnedMatrix) -> Result<(), PbError> {
@@ -219,6 +246,12 @@ pub(crate) fn fit(
     }
 
     let n_features = x.data.len();
+    let monotone = resolve_monotone(spec, n_features)?;
+    let monotone_ref = if monotone.iter().any(Option::is_some) {
+        Some(monotone.as_slice())
+    } else {
+        None
+    };
     let axes: Vec<u32> = (0..u32::try_from(n_features).map_err(|_| PbError::Internal {
         what: "more than u32::MAX features".into(),
     })?)
@@ -240,6 +273,7 @@ pub(crate) fn fit(
         quant_seed: spec.seed,
         round: 0,
         groups: spec.interaction.groups.as_deref(),
+        monotone: monotone_ref,
     };
 
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
@@ -657,10 +691,45 @@ mod tests {
 
         let mut s = spec(&sqe);
         s.monotone.insert("f0".into(), MonoSign::Increasing);
+        assert!(booster.fit(&x, &y, &s).is_ok());
+
+        let mut s = spec(&sqe);
+        s.monotone
+            .insert("unknown_feature".into(), MonoSign::Increasing);
         assert!(matches!(
             booster.fit(&x, &y, &s),
             Err(PbError::InvalidConfig { .. })
         ));
+    }
+
+    #[test]
+    fn monotone_constraint_admits_compatible_splits_and_rejects_opposite_direction() {
+        let x = binned(&[vec![1.0, 1.0, 2.0, 2.0]]);
+        let booster = Booster::with_config(Config {
+            n_trees: 1,
+            learning_rate: 1.0,
+            lambda: 0.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+        });
+        let sqe = SquaredError;
+
+        let mut inc = spec(&sqe);
+        inc.monotone.insert("f0".into(), MonoSign::Increasing);
+        let increasing = [0.0_f32, 0.0, 10.0, 10.0];
+        let model = booster.fit(&x, &increasing, &inc).unwrap();
+        assert_eq!(model.trees.len(), 1);
+        assert!(predict(&model, &x, 0) <= predict(&model, &x, 2));
+
+        let anti_monotone = [10.0_f32, 10.0, 0.0, 0.0];
+        let model = booster.fit(&x, &anti_monotone, &inc).unwrap();
+        assert!(
+            model.trees.is_empty(),
+            "anti-monotone split should terminate gracefully"
+        );
+        assert_eq!(predict(&model, &x, 0), predict(&model, &x, 2));
     }
 
     #[test]

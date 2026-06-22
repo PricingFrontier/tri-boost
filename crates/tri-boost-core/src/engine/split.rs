@@ -14,6 +14,7 @@
 //! count) with a deterministic first-wins argmax; the parallelism lives in the
 //! histogram build (`engine::hist`). Determinism is therefore structural.
 
+use crate::constraints::MonoSign;
 use crate::data::BinnedMatrix;
 use crate::engine::hist::{build_histogram, build_quantized_histogram, QuantizeContext};
 use crate::engine::{low_bit, Hist, HistPrecision, ObliviousTree, Split};
@@ -51,6 +52,8 @@ pub(crate) struct GrowConfig<'a> {
     /// Optional whole-tree feature-group whitelist (§07): every realized tree support
     /// must be a subset of at least one group.
     pub groups: Option<&'a [FeatureSet]>,
+    /// Optional per-axis monotone signs resolved at fit entry (§07).
+    pub monotone: Option<&'a [Option<MonoSign>]>,
 }
 
 /// A candidate level split with its summed Newton gain.
@@ -66,6 +69,15 @@ pub(crate) struct Candidate {
     pub gain: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MonotoneScan<'a> {
+    level: usize,
+    chosen: &'a [Option<MonoSign>],
+    candidate_axis_signs: &'a [Option<MonoSign>],
+    lr: f64,
+    max_delta_step: Option<f64>,
+}
+
 /// The Newton term `G²/(H+λ)`, guarded so a non-positive denominator contributes 0
 /// rather than `inf`/`NaN` (with `λ>0` and `H≥0` it never binds, but stays safe for
 /// general losses).
@@ -76,6 +88,55 @@ fn newton_term(g: f64, h: f64, lambda: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn newton_leaf(g: f64, h: f64, lambda: f64, lr: f64, max_delta_step: Option<f64>) -> f64 {
+    let denom = h + lambda;
+    let w = if denom > 0.0 { -g / denom } else { 0.0 };
+    let w = match max_delta_step {
+        Some(d) => w.clamp(-d, d),
+        None => w,
+    };
+    lr * w
+}
+
+fn candidate_monotone_ok(
+    values: &[f64],
+    depth: usize,
+    signs: &[Option<MonoSign>],
+) -> Result<bool, PbError> {
+    let n_leaves = 1usize << depth;
+    if values.len() != n_leaves || signs.len() != depth {
+        return Err(PbError::Internal {
+            what: "monotone candidate shape mismatch".into(),
+        });
+    }
+    for (level, sign) in signs.iter().enumerate() {
+        let Some(sign) = sign else {
+            continue;
+        };
+        if matches!(sign, MonoSign::None) {
+            continue;
+        }
+        let bit = 1usize << level;
+        for high in 0..n_leaves {
+            if high & bit != 0 {
+                continue;
+            }
+            let low = high | bit;
+            let low_v = *values.get(low).ok_or_else(internal("monotone low"))?;
+            let high_v = *values.get(high).ok_or_else(internal("monotone high"))?;
+            let ok = match sign {
+                MonoSign::Increasing => low_v <= high_v,
+                MonoSign::Decreasing => low_v >= high_v,
+                MonoSign::None => true,
+            };
+            if !ok {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Scan one level's histogram for the best shared `(axis, bin_le, missing_left)`
@@ -93,6 +154,7 @@ pub(crate) fn best_level_split(
     n_data_bins: &[usize],
     lambda: f64,
     min_split_gain: f64,
+    monotone: Option<MonotoneScan<'_>>,
 ) -> Result<Option<Candidate>, PbError> {
     let nl = hist.n_leaves;
     let mut best: Option<Candidate> = None;
@@ -180,6 +242,44 @@ pub(crate) fn best_level_split(
                     acc += newton_term(lg, lh, lambda) + newton_term(tg - lg, th - lh, lambda);
                 }
                 let gain = 0.5 * (acc - parent);
+                if let Some(scan) = monotone {
+                    let mut signs = Vec::with_capacity(scan.level + 1);
+                    signs.extend_from_slice(scan.chosen);
+                    signs.push(
+                        *scan
+                            .candidate_axis_signs
+                            .get(p)
+                            .ok_or_else(internal("monotone candidate sign"))?,
+                    );
+                    let mut values = vec![0.0_f64; 1usize << (scan.level + 1)];
+                    for leaf in 0..nl {
+                        let dlg = *data_l_g.get(leaf).ok_or_else(internal("dlg"))?;
+                        let dlh = *data_l_h.get(leaf).ok_or_else(internal("dlh"))?;
+                        let (lg, lh) = if ml {
+                            (
+                                dlg + *miss_g.get(leaf).ok_or_else(internal("mg"))?,
+                                dlh + *miss_h.get(leaf).ok_or_else(internal("mh"))?,
+                            )
+                        } else {
+                            (dlg, dlh)
+                        };
+                        let tg = *total_g.get(leaf).ok_or_else(internal("tg"))?;
+                        let th = *total_h.get(leaf).ok_or_else(internal("th"))?;
+                        let high = leaf;
+                        let low = leaf | (1usize << scan.level);
+                        *values
+                            .get_mut(low)
+                            .ok_or_else(internal("monotone low value"))? =
+                            newton_leaf(lg, lh, lambda, scan.lr, scan.max_delta_step);
+                        *values
+                            .get_mut(high)
+                            .ok_or_else(internal("monotone high value"))? =
+                            newton_leaf(tg - lg, th - lh, lambda, scan.lr, scan.max_delta_step);
+                    }
+                    if !candidate_monotone_ok(&values, scan.level + 1, &signs)? {
+                        continue;
+                    }
+                }
                 // Strict `>` ⇒ the first candidate (lowest axis/bin_le, ml=false) wins
                 // ties ⇒ deterministic argmax.
                 let improves = match best {
@@ -320,6 +420,7 @@ pub(crate) fn grow_oblivious_tree(
     let n_rows = x.n_rows as usize;
     let mut leaf_of_row: Vec<u8> = Hist::try_zeroed_vec(n_rows, "leaf assignment")?;
     let mut splits: Vec<Split> = Vec::new();
+    let mut split_signs: Vec<Option<MonoSign>> = Vec::new();
     let mut used_raws: smallvec::SmallVec<[u32; 3]> = smallvec::SmallVec::new();
     let order_cap = usize::from(cfg.max_order).min(3);
 
@@ -363,12 +464,27 @@ pub(crate) fn grow_oblivious_tree(
                 },
             )?,
         };
+        let candidate_axis_signs: Vec<Option<MonoSign>> = match cfg.monotone {
+            Some(signs) => admissible
+                .iter()
+                .map(|&axis| signs.get(axis as usize).copied().flatten())
+                .collect(),
+            None => Vec::new(),
+        };
+        let monotone_scan = cfg.monotone.map(|_| MonotoneScan {
+            level,
+            chosen: &split_signs,
+            candidate_axis_signs: &candidate_axis_signs,
+            lr: cfg.lr,
+            max_delta_step: cfg.max_delta_step,
+        });
         let cand = match best_level_split(
             &hist,
             &admissible,
             &n_data_bins,
             cfg.lambda,
             cfg.min_split_gain,
+            monotone_scan,
         )? {
             Some(c) => c,
             None => break, // graceful early-termination (depth < 3)
@@ -378,6 +494,10 @@ pub(crate) fn grow_oblivious_tree(
             axis: cand.axis,
             bin_le: cand.bin_le,
             missing_left: cand.missing_left,
+        });
+        split_signs.push(match cfg.monotone {
+            Some(signs) => signs.get(cand.axis as usize).copied().flatten(),
+            None => None,
         });
         let raw = x
             .provenance
@@ -502,7 +622,7 @@ mod tests {
         set(&mut hist, 1, 4.0, 2.0, 1);
         set(&mut hist, 2, -6.0, 3.0, 1);
 
-        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0)
+        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None)
             .unwrap()
             .unwrap();
         // Only candidate is v=1. total_g=0,total_h=6 ⇒ parent=0²/7=0.
@@ -525,7 +645,7 @@ mod tests {
         hist.g[o] = 1.0;
         hist.h[o] = 1.0;
         // Single populated bin ⇒ any split is degenerate (gain 0); a positive floor rejects it.
-        assert!(best_level_split(&hist, &[0], &[2], 1.0, 1.0)
+        assert!(best_level_split(&hist, &[0], &[2], 1.0, 1.0, None)
             .unwrap()
             .is_none());
     }
@@ -592,6 +712,7 @@ mod tests {
             quant_seed: 0,
             round: 0,
             groups: None,
+            monotone: None,
         }
     }
 
@@ -763,7 +884,7 @@ mod tests {
         set(&mut hist, 0, 2.0, 1.0);
         set(&mut hist, 1, -6.0, 3.0);
         set(&mut hist, 2, 4.0, 2.0);
-        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0)
+        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None)
             .unwrap()
             .unwrap();
         assert!(!best.missing_left, "missing should be learned RIGHT here");
