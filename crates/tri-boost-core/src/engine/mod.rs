@@ -123,19 +123,22 @@ pub struct Hist {
 }
 
 impl Hist {
-    /// A zeroed histogram with the given shape. `g`/`h`/`count` each hold
-    /// `n_leaves · n_axes · n_bins` cells.
-    #[must_use]
-    pub fn zeros(n_leaves: usize, n_axes: usize, n_bins: usize) -> Self {
-        let cells = n_leaves * n_axes * n_bins;
-        Self {
-            g: vec![0.0; cells],
-            h: vec![0.0; cells],
-            count: vec![0; cells],
+    /// Try to allocate a zeroed histogram with the given shape. `g`/`h`/`count`
+    /// each hold `n_leaves · n_axes · n_bins` cells.
+    ///
+    /// # Errors
+    /// [`PbError::Internal`] if the shape arithmetic overflows or if the backing
+    /// buffers cannot be reserved.
+    pub fn try_zeros(n_leaves: usize, n_axes: usize, n_bins: usize) -> Result<Self, PbError> {
+        let cells = Self::checked_cell_count(n_leaves, n_axes, n_bins)?;
+        Ok(Self {
+            g: Self::try_zeroed_vec(cells, "histogram g")?,
+            h: Self::try_zeroed_vec(cells, "histogram h")?,
+            count: Self::try_zeroed_vec(cells, "histogram count")?,
             n_leaves,
             n_axes,
             n_bins,
-        }
+        })
     }
 
     /// The flat row-major offset of cell `(leaf, axis, bin)`, or `None` if any index
@@ -145,7 +148,10 @@ impl Hist {
         if leaf >= self.n_leaves || axis >= self.n_axes || bin >= self.n_bins {
             return None;
         }
-        Some((leaf * self.n_axes + axis) * self.n_bins + bin)
+        leaf.checked_mul(self.n_axes)?
+            .checked_add(axis)?
+            .checked_mul(self.n_bins)?
+            .checked_add(bin)
     }
 
     /// `(n_leaves, n_axes, n_bins)` — the shape triple, for equality checks.
@@ -164,6 +170,32 @@ impl Hist {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.g.is_empty()
+    }
+
+    pub(crate) fn checked_cell_count(
+        n_leaves: usize,
+        n_axes: usize,
+        n_bins: usize,
+    ) -> Result<usize, PbError> {
+        n_leaves
+            .checked_mul(n_axes)
+            .and_then(|cells| cells.checked_mul(n_bins))
+            .ok_or_else(|| PbError::Internal {
+                what: "histogram shape overflows usize".into(),
+            })
+    }
+
+    pub(crate) fn try_zeroed_vec<T>(cells: usize, what: &'static str) -> Result<Vec<T>, PbError>
+    where
+        T: Clone + Default,
+    {
+        let mut out = Vec::new();
+        out.try_reserve_exact(cells)
+            .map_err(|_| PbError::Internal {
+                what: format!("{what} allocation failed"),
+            })?;
+        out.resize(cells, T::default());
+        Ok(out)
     }
 }
 

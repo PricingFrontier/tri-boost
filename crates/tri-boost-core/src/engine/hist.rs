@@ -30,6 +30,34 @@ fn oob(what: &'static str) -> impl Fn() -> PbError {
     move || PbError::Internal { what: what.into() }
 }
 
+fn offset2(
+    first: usize,
+    second: usize,
+    stride: usize,
+    what: &'static str,
+) -> Result<usize, PbError> {
+    first
+        .checked_mul(stride)
+        .and_then(|base| base.checked_add(second))
+        .ok_or_else(oob(what))
+}
+
+fn offset3(
+    first: usize,
+    second: usize,
+    third: usize,
+    second_stride: usize,
+    third_stride: usize,
+    what: &'static str,
+) -> Result<usize, PbError> {
+    first
+        .checked_mul(second_stride)
+        .and_then(|base| base.checked_add(second))
+        .and_then(|base| base.checked_mul(third_stride))
+        .and_then(|base| base.checked_add(third))
+        .ok_or_else(oob(what))
+}
+
 /// Build the per-level `[leaf][axis][bin]` histogram from full-precision `gh`
 /// (spec §06.3). `rows` are the row ids in scope (the subsample; in fixed order),
 /// `leaf_of_row[r]` is the leaf id (`0..n_leaves`) of row `r`, and `axes` are the
@@ -69,12 +97,19 @@ pub(crate) fn build_histogram(
 
     // Assemble the disjoint per-axis sub-histograms into the flat tensor, in axis
     // order — deterministic regardless of how rayon scheduled the per-axis tasks.
-    let mut hist = Hist::zeros(n_leaves, n_axes, max_bins);
+    let mut hist = Hist::try_zeros(n_leaves, n_axes, max_bins)?;
     for (axis_pos, sub) in subs.iter().enumerate() {
         for leaf in 0..n_leaves {
             for bin in 0..max_bins {
-                let src = leaf * max_bins + bin;
-                let dst = (leaf * n_axes + axis_pos) * max_bins + bin;
+                let src = offset2(leaf, bin, max_bins, "axis histogram offset overflow")?;
+                let dst = offset3(
+                    leaf,
+                    axis_pos,
+                    bin,
+                    n_axes,
+                    max_bins,
+                    "histogram assembly offset overflow",
+                )?;
                 *hist.g.get_mut(dst).ok_or_else(oob("assemble g"))? =
                     *sub.g.get(src).ok_or_else(oob("sub g"))?;
                 *hist.h.get_mut(dst).ok_or_else(oob("assemble h"))? =
@@ -94,6 +129,17 @@ struct AxisHist {
     count: Vec<u32>,
 }
 
+impl AxisHist {
+    fn try_zeros(n_leaves: usize, max_bins: usize) -> Result<Self, PbError> {
+        let size = Hist::checked_cell_count(n_leaves, 1, max_bins)?;
+        Ok(Self {
+            g: Hist::try_zeroed_vec(size, "axis histogram g")?,
+            h: Hist::try_zeroed_vec(size, "axis histogram h")?,
+            count: Hist::try_zeroed_vec(size, "axis histogram count")?,
+        })
+    }
+}
+
 fn accumulate_axis(
     x: &BinnedMatrix,
     gh: &GradHess,
@@ -107,10 +153,7 @@ fn accumulate_axis(
         .data
         .get(axis as usize)
         .ok_or_else(oob("axis has no column"))?;
-    let size = n_leaves * max_bins;
-    let mut g = vec![0.0_f64; size];
-    let mut h = vec![0.0_f64; size];
-    let mut count = vec![0_u32; size];
+    let mut out = AxisHist::try_zeros(n_leaves, max_bins)?;
     // Sequential over rows in their given (fixed) order ⇒ deterministic f64 fold.
     for &r in rows {
         let ru = r as usize;
@@ -121,17 +164,17 @@ fn accumulate_axis(
                 what: "leaf or bin id out of histogram range".into(),
             });
         }
-        let idx = leaf * max_bins + bin;
-        *g.get_mut(idx).ok_or_else(oob("g cell"))? +=
+        let idx = offset2(leaf, bin, max_bins, "axis histogram row offset overflow")?;
+        *out.g.get_mut(idx).ok_or_else(oob("g cell"))? +=
             f64::from(*gh.g.get(ru).ok_or_else(oob("gh.g"))?);
-        *h.get_mut(idx).ok_or_else(oob("h cell"))? +=
+        *out.h.get_mut(idx).ok_or_else(oob("h cell"))? +=
             f64::from(*gh.h.get(ru).ok_or_else(oob("gh.h"))?);
-        let c = count.get_mut(idx).ok_or_else(oob("count cell"))?;
+        let c = out.count.get_mut(idx).ok_or_else(oob("count cell"))?;
         // count <= rows.len() <= n_rows <= u32::MAX, so this never actually overflows;
         // checked_add keeps it panic-free under overflow-checks regardless.
         *c = c.checked_add(1).ok_or_else(oob("bin count overflow"))?;
     }
-    Ok(AxisHist { g, h, count })
+    Ok(out)
 }
 
 /// The subtraction trick (spec §06.3): `Hist_R = Hist_parent − Hist_L`, computed
@@ -148,7 +191,7 @@ pub(crate) fn subtract(parent: &Hist, left: &Hist) -> Result<Hist, PbError> {
             what: "histogram subtraction: parent/left shape mismatch".into(),
         });
     }
-    let mut out = Hist::zeros(parent.n_leaves, parent.n_axes, parent.n_bins);
+    let mut out = Hist::try_zeros(parent.n_leaves, parent.n_axes, parent.n_bins)?;
     for (o, (p, l)) in out.g.iter_mut().zip(parent.g.iter().zip(&left.g)) {
         *o = p - l;
     }
@@ -393,12 +436,38 @@ mod tests {
 
     #[test]
     fn subtraction_shape_mismatch_errors() {
-        let a = Hist::zeros(1, 2, 3);
-        let b = Hist::zeros(2, 2, 3);
+        let a = Hist::try_zeros(1, 2, 3).unwrap();
+        let b = Hist::try_zeros(2, 2, 3).unwrap();
         assert!(matches!(
             subtract(&a, &b),
             Err(PbError::ShapeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn oversized_hist_shapes_error_without_overflowing() {
+        assert!(matches!(
+            Hist::try_zeros(usize::MAX, 2, 2),
+            Err(PbError::Internal { .. })
+        ));
+
+        let x = matrix(vec![Vec::new()], &[3]);
+        let gh = gradhess(&[], &[]);
+        assert!(matches!(
+            build_histogram(&x, &gh, &[], &[], usize::MAX, &[0]),
+            Err(PbError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_hist_offset_overflow_returns_none() {
+        let hist = Hist {
+            n_leaves: usize::MAX,
+            n_axes: usize::MAX,
+            n_bins: usize::MAX,
+            ..Hist::default()
+        };
+        assert_eq!(hist.offset(2, 0, 0), None);
     }
 
     #[test]
@@ -431,8 +500,8 @@ mod tests {
 
     #[test]
     fn subtract_count_underflow_is_internal() {
-        let parent = Hist::zeros(1, 1, 2);
-        let mut left = Hist::zeros(1, 1, 2);
+        let parent = Hist::try_zeros(1, 1, 2).unwrap();
+        let mut left = Hist::try_zeros(1, 1, 2).unwrap();
         left.count[0] = 5; // left ⊄ parent ⇒ count underflow
         assert!(matches!(
             subtract(&parent, &left),
