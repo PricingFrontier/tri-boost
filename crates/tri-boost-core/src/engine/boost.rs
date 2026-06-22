@@ -28,6 +28,132 @@ use crate::error::PbError;
 use crate::loss::GradHess;
 use crate::serialize::SCHEMA_VERSION;
 
+fn invalid_config(what: &'static str) -> PbError {
+    PbError::InvalidConfig { what: what.into() }
+}
+
+fn invalid_input(what: String) -> PbError {
+    PbError::InvalidInput { what }
+}
+
+fn validate_fit_spec(spec: &FitSpec<'_>) -> Result<(), PbError> {
+    if !(1..=3).contains(&spec.interaction.max_order) {
+        return Err(PbError::InvalidConfig {
+            what: format!(
+                "interaction.max_order must be in 1..=3, got {}",
+                spec.interaction.max_order
+            ),
+        });
+    }
+    if spec.interaction.groups.is_some() {
+        return Err(invalid_config(
+            "interaction groups are not implemented in the Phase-2 green spine",
+        ));
+    }
+    if !spec.monotone.is_empty() {
+        return Err(invalid_config(
+            "monotone constraints are not implemented in the Phase-2 green spine",
+        ));
+    }
+    if spec.distill.is_some() {
+        return Err(invalid_config(
+            "distillation is not implemented in the Phase-2 green spine",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_binned_matrix(x: &BinnedMatrix) -> Result<(), PbError> {
+    let n = x.n_rows as usize;
+    let n_features = x.data.len();
+    if x.grids.len() != n_features {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "BinnedMatrix grids len {} != data len {n_features}",
+                x.grids.len()
+            ),
+        });
+    }
+    if x.provenance.len() != n_features {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "BinnedMatrix provenance len {} != data len {n_features}",
+                x.provenance.len()
+            ),
+        });
+    }
+
+    for (axis, col) in x.data.iter().enumerate() {
+        if col.len() != n {
+            return Err(PbError::ShapeMismatch {
+                what: format!("BinnedMatrix column {axis} len {} != n_rows {n}", col.len()),
+            });
+        }
+        let grid = x.grids.get(axis).ok_or_else(|| PbError::Internal {
+            what: "grid disappeared during BinnedMatrix validation".into(),
+        })?;
+        if grid.missing_bin != 0 {
+            return Err(invalid_input(format!(
+                "BinnedMatrix grid {axis} missing_bin must be 0, got {}",
+                grid.missing_bin
+            )));
+        }
+        if grid.n_bins == 0 || grid.n_bins > 255 {
+            return Err(invalid_input(format!(
+                "BinnedMatrix grid {axis} n_bins must be in 1..=255, got {}",
+                grid.n_bins
+            )));
+        }
+        let expected_bins = if grid.n_bins == 1 {
+            if !grid.borders.is_empty() {
+                return Err(invalid_input(format!(
+                    "BinnedMatrix grid {axis} has n_bins=1 but {} borders",
+                    grid.borders.len()
+                )));
+            }
+            1usize
+        } else {
+            grid.borders
+                .len()
+                .checked_add(2)
+                .ok_or_else(|| PbError::Internal {
+                    what: "BinnedMatrix border count overflow".into(),
+                })?
+        };
+        if expected_bins != usize::from(grid.n_bins) {
+            return Err(invalid_input(format!(
+                "BinnedMatrix grid {axis} n_bins {} != borders.len()+2 ({expected_bins})",
+                grid.n_bins
+            )));
+        }
+        for (i, &border) in grid.borders.iter().enumerate() {
+            if !border.is_finite() {
+                return Err(invalid_input(format!(
+                    "BinnedMatrix grid {axis} border {i} must be finite"
+                )));
+            }
+        }
+        for pair in grid.borders.windows(2) {
+            if let [a, b] = pair {
+                if a >= b {
+                    return Err(invalid_input(format!(
+                        "BinnedMatrix grid {axis} borders must be strictly ascending"
+                    )));
+                }
+            }
+        }
+        for (row, &bin) in col.iter().enumerate() {
+            if u16::from(bin) >= grid.n_bins {
+                return Err(invalid_input(format!(
+                    "BinnedMatrix column {axis} row {row} bin {bin} outside grid n_bins {}",
+                    grid.n_bins
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fit an ensemble (spec §06.6). See [`crate::engine::Booster::fit`].
 ///
 /// # Errors
@@ -40,6 +166,8 @@ pub(crate) fn fit(
     spec: &FitSpec,
 ) -> Result<Model, PbError> {
     config.validate()?;
+    validate_fit_spec(spec)?;
+    validate_binned_matrix(x)?;
     let n = x.n_rows as usize;
     if y.len() != n {
         return Err(PbError::ShapeMismatch {
@@ -175,8 +303,11 @@ mod tests {
         clippy::float_cmp
     )]
     use super::*;
+    use crate::boosters::{DistillSpec, TeacherKind};
+    use crate::constraints::MonoSign;
     use crate::data::{bin_columns, BinConfig};
     use crate::engine::Booster;
+    use crate::explain::FeatureSet;
     use crate::loss::SquaredError;
 
     fn spec<'a>(loss: &'a SquaredError) -> FitSpec<'a> {
@@ -385,6 +516,103 @@ mod tests {
         assert!(matches!(
             ok.fit(&x, &[1.0], &spec(&sqe)),
             Err(PbError::ShapeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn unsupported_future_fit_spec_knobs_are_rejected() {
+        let sqe = SquaredError;
+        let x = binned(&[vec![1.0, 2.0]]);
+        let y = [1.0_f32, 2.0];
+        let booster = Booster::new();
+
+        let mut s = spec(&sqe);
+        s.interaction.max_order = 0;
+        assert!(matches!(
+            booster.fit(&x, &y, &s),
+            Err(PbError::InvalidConfig { .. })
+        ));
+
+        let mut s = spec(&sqe);
+        s.interaction.max_order = 4;
+        assert!(matches!(
+            booster.fit(&x, &y, &s),
+            Err(PbError::InvalidConfig { .. })
+        ));
+
+        let mut s = spec(&sqe);
+        s.interaction.groups = Some(vec![FeatureSet::new(&[0])]);
+        assert!(matches!(
+            booster.fit(&x, &y, &s),
+            Err(PbError::InvalidConfig { .. })
+        ));
+
+        let mut s = spec(&sqe);
+        s.monotone.insert("f0".into(), MonoSign::Increasing);
+        assert!(matches!(
+            booster.fit(&x, &y, &s),
+            Err(PbError::InvalidConfig { .. })
+        ));
+
+        let mut s = spec(&sqe);
+        s.distill = Some(DistillSpec {
+            teacher_raw: vec![0.0, 0.0],
+            blend: 0.5,
+            teacher: TeacherKind::External,
+        });
+        assert!(matches!(
+            booster.fit(&x, &y, &s),
+            Err(PbError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_binned_matrix_errors_at_fit_boundary() {
+        let sqe = SquaredError;
+        let x = binned(&[vec![1.0, 2.0, 3.0]]);
+        let y = [1.0_f32, 2.0, 3.0];
+        let booster = Booster::new();
+
+        let mut bad = x.clone();
+        bad.data[0].push(1);
+        assert!(matches!(
+            booster.fit(&bad, &y, &spec(&sqe)),
+            Err(PbError::ShapeMismatch { .. })
+        ));
+
+        let mut bad = x.clone();
+        bad.grids.pop();
+        assert!(matches!(
+            booster.fit(&bad, &y, &spec(&sqe)),
+            Err(PbError::ShapeMismatch { .. })
+        ));
+
+        let mut bad = x.clone();
+        bad.provenance.pop();
+        assert!(matches!(
+            booster.fit(&bad, &y, &spec(&sqe)),
+            Err(PbError::ShapeMismatch { .. })
+        ));
+
+        let mut bad = x.clone();
+        bad.grids[0].n_bins = 0;
+        assert!(matches!(
+            booster.fit(&bad, &y, &spec(&sqe)),
+            Err(PbError::InvalidInput { .. })
+        ));
+
+        let mut bad = x.clone();
+        bad.grids[0].borders.clear();
+        assert!(matches!(
+            booster.fit(&bad, &y, &spec(&sqe)),
+            Err(PbError::InvalidInput { .. })
+        ));
+
+        let mut bad = x;
+        bad.data[0][0] = u8::MAX;
+        assert!(matches!(
+            booster.fit(&bad, &y, &spec(&sqe)),
+            Err(PbError::InvalidInput { .. })
         ));
     }
 

@@ -10,6 +10,30 @@ use crate::error::PbError;
 use itertools::izip;
 use serde::{Deserialize, Serialize};
 
+fn invalid_input(what: String) -> PbError {
+    PbError::InvalidInput { what }
+}
+
+fn require_finite(label: &'static str, i: usize, v: f32) -> Result<(), PbError> {
+    if v.is_finite() {
+        Ok(())
+    } else {
+        Err(invalid_input(format!(
+            "squared-error {label}[{i}] must be finite, got {v}"
+        )))
+    }
+}
+
+fn require_weight(i: usize, w: f32) -> Result<(), PbError> {
+    if w.is_finite() && w >= 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!(
+            "squared-error weight[{i}] must be finite and >= 0, got {w}"
+        )))
+    }
+}
+
 /// Per-row first/second derivatives of the loss w.r.t. the raw score `F`
 /// (spec §2.3). Full precision; leaves are always refit from these exact values.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -165,7 +189,12 @@ impl Loss for SquaredError {
         let floor = self.hessian_floor();
         // izip! ⇒ no indexing in the hot loop (§05 hot-loop policy). g = w(F−y);
         // h = w·1, floored so the postcondition out.h[i] >= floor holds even at w=0.
-        for (gi, hi, &yi, &fi, &wi) in izip!(&mut out.g, &mut out.h, y, raw, weight) {
+        for (i, (gi, hi, &yi, &fi, &wi)) in
+            izip!(&mut out.g, &mut out.h, y, raw, weight).enumerate()
+        {
+            require_finite("y", i, yi)?;
+            require_finite("raw", i, fi)?;
+            require_weight(i, wi)?;
             *gi = wi * (fi - yi);
             *hi = wi.max(floor);
         }
@@ -196,13 +225,18 @@ impl Loss for SquaredError {
                         what: format!("init_score: y={n}, offset={}", off.len()),
                     });
                 }
-                for ((&yi, &wi), &oi) in y.iter().zip(weight).zip(off) {
+                for (i, ((&yi, &wi), &oi)) in y.iter().zip(weight).zip(off).enumerate() {
+                    require_finite("y", i, yi)?;
+                    require_weight(i, wi)?;
+                    require_finite("offset", i, oi)?;
                     sum_w += f64::from(wi);
                     sum_wy += f64::from(wi) * (f64::from(yi) - f64::from(oi));
                 }
             }
             None => {
-                for (&yi, &wi) in y.iter().zip(weight) {
+                for (i, (&yi, &wi)) in y.iter().zip(weight).enumerate() {
+                    require_finite("y", i, yi)?;
+                    require_weight(i, wi)?;
                     sum_w += f64::from(wi);
                     sum_wy += f64::from(wi) * f64::from(yi);
                 }
@@ -237,7 +271,10 @@ impl Loss for SquaredError {
         }
         // Half-deviance = ½ Σ w (raw − y)²  (= ½ MSE·Σw). f64 fold, reported f32.
         let (mut sum_w, mut acc) = (0.0_f64, 0.0_f64);
-        for ((&yi, &fi), &wi) in y.iter().zip(raw).zip(weight) {
+        for (i, ((&yi, &fi), &wi)) in y.iter().zip(raw).zip(weight).enumerate() {
+            require_finite("y", i, yi)?;
+            require_finite("raw", i, fi)?;
+            require_weight(i, wi)?;
             sum_w += f64::from(wi);
             let r = f64::from(fi) - f64::from(yi);
             acc += f64::from(wi) * r * r;
@@ -374,6 +411,32 @@ mod tests {
         ));
         assert!(matches!(
             sqe.deviance(&[1.0, 2.0], &[1.0, 1.0], &[0.0, 0.0]),
+            Err(PbError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn nonfinite_or_negative_inputs_are_invalid_input() {
+        let sqe = SquaredError;
+        let mut gh = GradHess::default();
+        assert!(matches!(
+            sqe.grad_hess(&[f32::NAN], &[1.0], &[1.0], &mut gh),
+            Err(PbError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            sqe.grad_hess(&[1.0], &[f32::INFINITY], &[1.0], &mut gh),
+            Err(PbError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            sqe.grad_hess(&[1.0], &[1.0], &[-1.0], &mut gh),
+            Err(PbError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            sqe.init_score(&[1.0], &[1.0], Some(&[f32::NAN])),
+            Err(PbError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            sqe.deviance(&[1.0], &[1.0], &[f32::INFINITY]),
             Err(PbError::InvalidInput { .. })
         ));
     }

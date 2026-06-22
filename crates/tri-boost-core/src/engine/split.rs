@@ -225,7 +225,13 @@ pub(crate) fn leaf_values(
         let hj = *h.get(j).ok_or_else(internal("h[j]"))?;
         let denom = hj + lambda;
         let w = if denom > 0.0 { -gj / denom } else { 0.0 };
-        *leaves.get_mut(j).ok_or_else(internal("leaf slot"))? = (lr * w) as f32;
+        let value = lr * w;
+        if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+            return Err(PbError::InvalidInput {
+                what: "Newton leaf value is not finite/representable as f32".into(),
+            });
+        }
+        *leaves.get_mut(j).ok_or_else(internal("leaf slot"))? = value as f32;
     }
     Ok(leaves)
 }
@@ -430,6 +436,17 @@ mod tests {
         assert!((leaves[1] - (5.0 / 3.0 * 0.1) as f32).abs() < 1e-6);
         // Unused tail (depth 1 ⇒ leaves 2..8) is zero.
         assert!(leaves[2..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn unrepresentable_leaf_value_errors_instead_of_storing_inf() {
+        let gh = gradhess(&[f32::MAX], &[f32::MIN_POSITIVE]);
+        let rows = [0u32];
+        let leaf_of_row = [0u8];
+        assert!(matches!(
+            leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 1.0),
+            Err(PbError::InvalidInput { .. })
+        ));
     }
 
     /// A clean depth-2 fixture: two informative features ⇒ the engine grows a depth-2
