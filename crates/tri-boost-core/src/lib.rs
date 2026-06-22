@@ -69,6 +69,6 @@ pub use serialize::{
     FORMAT_VERSION, SCHEMA_VERSION,
 };
 
-pub use scoring::{PackedTree, ScoringBank};
+pub use scoring::{PackedTree, ScoringBank, TableScoringBank};
 
 pub use simd::CHUNK_ROWS;
