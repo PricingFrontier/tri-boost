@@ -349,6 +349,10 @@ pub struct Config {
     pub lambda: f32,
     /// `gamma` floor: a level terminates if the best gain is `<= min_split_gain`.
     pub min_split_gain: f32,
+    /// Leaf-stage `|w*|`-clamp (LightGBM `max_delta_step`, §05.6/§06.4). `None` falls
+    /// back to `Loss::max_delta_step()` (Poisson ⇒ `Some(0.7)`); a non-`None` value wins.
+    /// Applied on the full-precision aggregated Newton step, never per-row `h`.
+    pub max_delta_step: Option<f32>,
 }
 
 impl Default for Config {
@@ -358,6 +362,7 @@ impl Default for Config {
             learning_rate: 0.05,
             lambda: 1.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         }
     }
 }
@@ -394,6 +399,13 @@ impl Config {
                     self.min_split_gain
                 ),
             });
+        }
+        if let Some(d) = self.max_delta_step {
+            if !d.is_finite() || d <= 0.0 {
+                return Err(PbError::InvalidConfig {
+                    what: format!("max_delta_step must be finite and > 0 when set, got {d}"),
+                });
+            }
         }
         Ok(())
     }

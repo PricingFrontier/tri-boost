@@ -214,11 +214,18 @@ pub(crate) fn fit(
     })?)
         .collect();
     let rows: Vec<u32> = (0..x.n_rows).collect();
+    // Resolve the leaf-stage |w*|-clamp (§05.6): an explicit Config value wins, else fall
+    // back to the loss's advertised cap (Poisson ⇒ Some(0.7)).
+    let max_delta_step = config
+        .max_delta_step
+        .or_else(|| spec.loss.max_delta_step())
+        .map(f64::from);
     let grow_cfg = GrowConfig {
         lambda: f64::from(config.lambda),
         lr: f64::from(config.learning_rate),
         min_split_gain: f64::from(config.min_split_gain),
         max_order: spec.interaction.max_order,
+        max_delta_step,
     };
 
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
@@ -353,6 +360,7 @@ mod tests {
             learning_rate: 1.0,
             lambda: 0.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -382,6 +390,7 @@ mod tests {
             learning_rate: 0.3,
             lambda: 1.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -410,6 +419,7 @@ mod tests {
                     learning_rate: 0.3,
                     lambda: 1.0,
                     min_split_gain: 0.0,
+                    max_delta_step: None,
                 });
                 let sqe = SquaredError;
                 let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -436,6 +446,7 @@ mod tests {
             learning_rate: 0.3,
             lambda: 1.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -461,6 +472,7 @@ mod tests {
             learning_rate: 0.5,
             lambda: 1.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         });
 
         // (1) Constant target ⇒ no split ⇒ 0 trees ⇒ every prediction == f0 == mean.
@@ -506,6 +518,7 @@ mod tests {
             learning_rate: 0.1,
             lambda: 1.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         });
         assert!(matches!(
             bad.fit(&x, &[1.0, 2.0], &spec(&sqe)),
@@ -644,6 +657,7 @@ mod tests {
             learning_rate: 0.3,
             lambda: 1.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -672,6 +686,7 @@ mod tests {
             learning_rate: 0.3,
             lambda: 1.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -706,6 +721,7 @@ mod tests {
             learning_rate: 1.0,
             lambda: 0.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -729,6 +745,7 @@ mod tests {
             learning_rate: 0.3,
             lambda: 1.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -761,6 +778,7 @@ mod tests {
             learning_rate: 1.0,
             lambda: 0.0,
             min_split_gain: 0.0,
+            max_delta_step: None,
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();

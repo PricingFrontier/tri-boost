@@ -38,6 +38,9 @@ pub(crate) struct GrowConfig {
     pub min_split_gain: f64,
     /// Whole-tree interaction-order cap (`1..=3`); each level uses a fresh raw feature.
     pub max_order: u8,
+    /// Leaf-stage `|w*|`-clamp resolved from `Config.max_delta_step` ∨ `Loss::max_delta_step()`
+    /// (§05.6). `None` = uncapped; applied on the full-precision aggregated Newton step.
+    pub max_delta_step: Option<f64>,
 }
 
 /// A candidate level split with its summed Newton gain.
@@ -202,6 +205,7 @@ pub(crate) fn leaf_values(
     depth: usize,
     lambda: f64,
     lr: f64,
+    max_delta_step: Option<f64>,
 ) -> Result<[f32; 8], PbError> {
     let n_leaves = 1usize << depth;
     let mut g = vec![0.0_f64; n_leaves];
@@ -225,6 +229,12 @@ pub(crate) fn leaf_values(
         let hj = *h.get(j).ok_or_else(internal("h[j]"))?;
         let denom = hj + lambda;
         let w = if denom > 0.0 { -gj / denom } else { 0.0 };
+        // §05.6 max_delta_step: clamp |w*| ≤ δ on the FULL-PRECISION aggregated step
+        // (before lr), so the cap never perturbs the future quantized histogram.
+        let w = match max_delta_step {
+            Some(d) => w.clamp(-d, d),
+            None => w,
+        };
         let value = lr * w;
         if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
             return Err(PbError::InvalidInput {
@@ -329,7 +339,15 @@ pub(crate) fn grow_oblivious_tree(
         return Ok(None);
     }
     let depth = splits.len();
-    let leaves = leaf_values(gh, rows, &leaf_of_row, depth, cfg.lambda, cfg.lr)?;
+    let leaves = leaf_values(
+        gh,
+        rows,
+        &leaf_of_row,
+        depth,
+        cfg.lambda,
+        cfg.lr,
+        cfg.max_delta_step,
+    )?;
     Ok(Some(ObliviousTree::try_new(splits, leaves, &x.provenance)?))
 }
 
@@ -430,7 +448,7 @@ mod tests {
         let gh = gradhess(&[1.0, 2.0, -4.0, -1.0], &[1.0, 1.0, 1.0, 1.0]);
         let rows = [0u32, 1, 2, 3];
         let leaf_of_row = [0u8, 0, 1, 1];
-        let leaves = leaf_values(&gh, &rows, &leaf_of_row, 1, 1.0, 0.1).unwrap();
+        let leaves = leaf_values(&gh, &rows, &leaf_of_row, 1, 1.0, 0.1, None).unwrap();
         // w*_0 = -3/(2+1) = -1 ⇒ leaf 0.1·-1 = -0.1; w*_1 = 5/3 ⇒ leaf 0.16667.
         assert!((leaves[0] - (-0.1)).abs() < 1e-6);
         assert!((leaves[1] - (5.0 / 3.0 * 0.1) as f32).abs() < 1e-6);
@@ -439,12 +457,35 @@ mod tests {
     }
 
     #[test]
+    fn max_delta_step_caps_the_leaf_newton_step() {
+        // A tiny hessian makes the Newton step w* = -G/(H+λ) explode; the §05.6 clamp
+        // caps |w*| ≤ δ on the full-precision aggregate BEFORE the learning rate, so the
+        // stored leaf is bounded by lr·δ. (This is the Poisson stability safeguard.)
+        let gh = gradhess(&[-100.0], &[0.01]); // g=-100, h=0.01 ⇒ w* = 10000 uncapped
+        let rows = [0u32];
+        let leaf_of_row = [0u8];
+        let uncapped = leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 0.1, None).unwrap();
+        assert!(
+            uncapped[0] > 100.0,
+            "uncapped leaf should be huge, got {}",
+            uncapped[0]
+        );
+        let capped = leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 0.1, Some(0.5)).unwrap();
+        // |w*| clamped to 0.5 ⇒ leaf = 0.1·0.5 = 0.05.
+        assert!(
+            (capped[0] - 0.05).abs() < 1e-6,
+            "clamped leaf should be 0.05, got {}",
+            capped[0]
+        );
+    }
+
+    #[test]
     fn unrepresentable_leaf_value_errors_instead_of_storing_inf() {
         let gh = gradhess(&[f32::MAX], &[f32::MIN_POSITIVE]);
         let rows = [0u32];
         let leaf_of_row = [0u8];
         assert!(matches!(
-            leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 1.0),
+            leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 1.0, None),
             Err(PbError::InvalidInput { .. })
         ));
     }
@@ -457,6 +498,7 @@ mod tests {
             lr,
             min_split_gain,
             max_order,
+            max_delta_step: None,
         }
     }
 
