@@ -71,4 +71,4 @@ pub use serialize::{
 
 pub use scoring::{PackedTree, ScoringBank, TableScoringBank};
 
-pub use simd::CHUNK_ROWS;
+pub use simd::{score_tile, CHUNK_ROWS};
