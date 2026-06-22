@@ -63,7 +63,9 @@ pub use explain::{
 };
 
 pub use serialize::{
-    decode_doc, decode_model, encode_doc, encode_model, ModelDoc, FORMAT_VERSION, SCHEMA_VERSION,
+    decode_doc, decode_doc_json, decode_model, decode_model_json, encode_doc, encode_doc_json,
+    encode_model, encode_model_json, AxisExport, ModelDoc, RatingBasis, RatingExport, RatingTable,
+    FORMAT_VERSION, SCHEMA_VERSION,
 };
 
 pub use simd::CHUNK_ROWS;

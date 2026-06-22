@@ -319,6 +319,159 @@ pub struct Model {
 }
 
 impl Model {
+    /// Validate model structure after construction or deserialization.
+    ///
+    /// This is the §10 load gate: it re-checks fixed-width schema consistency, split
+    /// axis bounds, finite scalar payloads, and the I1 feature-budget shape before a
+    /// decoded model can be scored or exported.
+    ///
+    /// # Errors
+    /// [`PbError::Serialization`] for a schema-version mismatch;
+    /// [`PbError::ShapeMismatch`] for inconsistent parallel metadata;
+    /// [`PbError::InvalidInput`] for malformed grids or non-finite scalars;
+    /// [`PbError::InvariantViolated`] for an I1 feature-budget violation.
+    pub fn validate(&self) -> Result<(), PbError> {
+        if self.schema_version != crate::serialize::SCHEMA_VERSION {
+            return Err(PbError::Serialization(format!(
+                "model schema_version {} != build schema_version {}",
+                self.schema_version,
+                crate::serialize::SCHEMA_VERSION
+            )));
+        }
+        if !self.f0.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: format!("model f0 must be finite, got {}", self.f0),
+            });
+        }
+        if self.grids.len() != self.provenance.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "model grids len {} != provenance len {}",
+                    self.grids.len(),
+                    self.provenance.len()
+                ),
+            });
+        }
+        if self.schema.feature_names.len() != self.grids.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "schema feature_names len {} != grid count {}",
+                    self.schema.feature_names.len(),
+                    self.grids.len()
+                ),
+            });
+        }
+        if self.schema.feature_kinds.len() != self.grids.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "schema feature_kinds len {} != grid count {}",
+                    self.schema.feature_kinds.len(),
+                    self.grids.len()
+                ),
+            });
+        }
+        if self.schema.objective.link != self.link {
+            return Err(PbError::InvalidInput {
+                what: "schema objective link does not match model link".into(),
+            });
+        }
+        for (axis, grid) in self.grids.iter().enumerate() {
+            if grid.missing_bin != 0 {
+                return Err(PbError::InvalidInput {
+                    what: format!(
+                        "grid {axis} missing_bin must be 0, got {}",
+                        grid.missing_bin
+                    ),
+                });
+            }
+            if grid.n_bins == 0 || grid.n_bins > 255 {
+                return Err(PbError::InvalidInput {
+                    what: format!("grid {axis} n_bins must be in 1..=255, got {}", grid.n_bins),
+                });
+            }
+            let expected_bins =
+                u16::try_from(grid.borders.len().checked_add(2).ok_or_else(|| {
+                    PbError::Internal {
+                        what: "grid border count overflow".into(),
+                    }
+                })?)
+                .map_err(|_| PbError::InvalidInput {
+                    what: format!("grid {axis} has too many borders"),
+                })?;
+            if grid.n_bins != expected_bins && !(grid.n_bins == 1 && grid.borders.is_empty()) {
+                return Err(PbError::InvalidInput {
+                    what: format!(
+                        "grid {axis} n_bins {} inconsistent with {} borders",
+                        grid.n_bins,
+                        grid.borders.len()
+                    ),
+                });
+            }
+            for (i, &border) in grid.borders.iter().enumerate() {
+                if !border.is_finite() {
+                    return Err(PbError::InvalidInput {
+                        what: format!("grid {axis} border {i} must be finite"),
+                    });
+                }
+            }
+            for pair in grid.borders.windows(2) {
+                if let [a, b] = pair {
+                    if a >= b {
+                        return Err(PbError::InvalidInput {
+                            what: format!("grid {axis} borders must be strictly ascending"),
+                        });
+                    }
+                }
+            }
+        }
+        for (tree_idx, (alpha, tree)) in self.trees.iter().enumerate() {
+            if !alpha.is_finite() {
+                return Err(PbError::InvalidInput {
+                    what: format!("tree {tree_idx} alpha must be finite, got {alpha}"),
+                });
+            }
+            let depth = usize::from(tree.depth);
+            if !(1..=3).contains(&depth) || tree.splits.len() != depth {
+                return Err(PbError::invariant(Invariant::FeatureBudget));
+            }
+            let mut distinct: SmallVec<[u32; 3]> = SmallVec::new();
+            for split in &tree.splits {
+                let axis = split.axis as usize;
+                let prov = self
+                    .provenance
+                    .get(axis)
+                    .ok_or_else(|| PbError::ShapeMismatch {
+                        what: format!("tree {tree_idx} split axis {axis} absent from provenance"),
+                    })?;
+                let grid = self.grids.get(axis).ok_or_else(|| PbError::ShapeMismatch {
+                    what: format!("tree {tree_idx} split axis {axis} absent from grids"),
+                })?;
+                if u16::from(split.bin_le) >= grid.n_bins {
+                    return Err(PbError::InvalidInput {
+                        what: format!(
+                            "tree {tree_idx} split bin_le {} outside grid {axis} n_bins {}",
+                            split.bin_le, grid.n_bins
+                        ),
+                    });
+                }
+                if !distinct.contains(&prov.raw.0) {
+                    distinct.push(prov.raw.0);
+                }
+            }
+            if distinct.len() != depth {
+                return Err(PbError::invariant(Invariant::FeatureBudget));
+            }
+            for (leaf, &value) in tree.leaves.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(PbError::InvalidInput {
+                        what: format!("tree {tree_idx} leaf {leaf} must be finite, got {value}"),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The ensemble raw score for one row's bin ids, in full `f64`
     /// (`f0 + Σ alpha_t · tree_t.lookup(x)`), used by the §08 reconstruction gate.
     ///
@@ -330,6 +483,157 @@ impl Model {
             acc += f64::from(*alpha) * f64::from(tree.lookup(row_bins)?);
         }
         Ok(acc)
+    }
+
+    /// Raw score for one already-binned row, accumulated in the production `f32`
+    /// scoring width (spec §10 path A).
+    ///
+    /// # Errors
+    /// [`PbError::ShapeMismatch`] if `row_bins` does not match this model's width;
+    /// plus propagated tree lookup errors.
+    pub fn score_trees_row(&self, row_bins: &[u8], offset: f32) -> Result<f32, PbError> {
+        if row_bins.len() != self.grids.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "row width {} != model grid count {}",
+                    row_bins.len(),
+                    self.grids.len()
+                ),
+            });
+        }
+        let mut acc = self.f0 + offset;
+        for (alpha, tree) in &self.trees {
+            acc += *alpha * tree.lookup(row_bins)?;
+        }
+        Ok(acc)
+    }
+
+    /// Batch raw scores over a column-major [`BinnedMatrix`] into `out`.
+    ///
+    /// # Errors
+    /// [`PbError::ShapeMismatch`] if matrix shape or grids/provenance do not match
+    /// the model; [`PbError::InvalidInput`] if any bin escapes its grid.
+    pub fn score_trees(
+        &self,
+        x: &BinnedMatrix,
+        offset: Option<&[f32]>,
+        out: &mut [f32],
+    ) -> Result<(), PbError> {
+        self.validate_binned_matrix(x)?;
+        let n_rows = x.n_rows as usize;
+        if out.len() != n_rows {
+            return Err(PbError::ShapeMismatch {
+                what: format!("out len {} != n_rows {n_rows}", out.len()),
+            });
+        }
+        if let Some(off) = offset {
+            if off.len() != n_rows {
+                return Err(PbError::ShapeMismatch {
+                    what: format!("offset len {} != n_rows {n_rows}", off.len()),
+                });
+            }
+        }
+        let mut row = vec![0u8; self.grids.len()];
+        for r in 0..n_rows {
+            for (slot, col) in row.iter_mut().zip(&x.data) {
+                *slot = *col.get(r).ok_or_else(|| PbError::Internal {
+                    what: "validated binned column lost a row".into(),
+                })?;
+            }
+            let off = offset.and_then(|o| o.get(r).copied()).unwrap_or(0.0);
+            let score = self.score_trees_row(&row, off)?;
+            let dst = out.get_mut(r).ok_or_else(|| PbError::Internal {
+                what: "score_trees output row escaped buffer".into(),
+            })?;
+            *dst = score;
+        }
+        Ok(())
+    }
+
+    /// Response-space predictions from an already-binned design.
+    ///
+    /// # Errors
+    /// Propagates [`Model::score_trees`] validation/scoring failures.
+    pub fn predict_binned(
+        &self,
+        x: &BinnedMatrix,
+        offset: Option<&[f32]>,
+    ) -> Result<Vec<f32>, PbError> {
+        let mut raw = vec![0.0_f32; x.n_rows as usize];
+        self.score_trees(x, offset, &mut raw)?;
+        for v in &mut raw {
+            *v = inverse_link(self.link, *v);
+        }
+        Ok(raw)
+    }
+
+    /// Response-space predictions from a binned design. Alias for
+    /// [`Model::predict_binned`] until raw-data ingest is exposed at this layer.
+    ///
+    /// # Errors
+    /// Propagates [`Model::predict_binned`] failures.
+    pub fn predict(&self, x: &BinnedMatrix, offset: Option<&[f32]>) -> Result<Vec<f32>, PbError> {
+        self.predict_binned(x, offset)
+    }
+
+    fn validate_binned_matrix(&self, x: &BinnedMatrix) -> Result<(), PbError> {
+        let n_rows = x.n_rows as usize;
+        if x.data.len() != self.grids.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "matrix has {} columns, model has {} features",
+                    x.data.len(),
+                    self.grids.len()
+                ),
+            });
+        }
+        if x.grids != self.grids {
+            return Err(PbError::ShapeMismatch {
+                what: "matrix grids do not match model grids".into(),
+            });
+        }
+        if x.provenance != self.provenance {
+            return Err(PbError::ShapeMismatch {
+                what: "matrix provenance does not match model provenance".into(),
+            });
+        }
+        for (axis, col) in x.data.iter().enumerate() {
+            if col.len() != n_rows {
+                return Err(PbError::ShapeMismatch {
+                    what: format!("column {axis} len {} != n_rows {n_rows}", col.len()),
+                });
+            }
+            let grid = self.grids.get(axis).ok_or_else(|| PbError::Internal {
+                what: "model grid disappeared during score validation".into(),
+            })?;
+            for (row, &bin) in col.iter().enumerate() {
+                if u16::from(bin) >= grid.n_bins {
+                    return Err(PbError::InvalidInput {
+                        what: format!(
+                            "column {axis} row {row} bin {bin} outside grid n_bins {}",
+                            grid.n_bins
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn inverse_link(link: Link, raw: f32) -> f32 {
+    match link {
+        Link::Identity => raw,
+        Link::Log => raw.clamp(-30.0, 30.0).exp(),
+        Link::Logit => {
+            if raw >= 0.0 {
+                let z = (-raw).clamp(-30.0, 30.0).exp();
+                1.0 / (1.0 + z)
+            } else {
+                let z = raw.clamp(-30.0, 30.0).exp();
+                z / (1.0 + z)
+            }
+        }
     }
 }
 

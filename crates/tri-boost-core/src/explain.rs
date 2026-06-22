@@ -153,6 +153,12 @@ impl Tensor {
         self.shape.iter().map(|&d| d as usize).collect()
     }
 
+    /// The tensor's per-axis extents as fixed-width serialized dimensions.
+    #[must_use]
+    pub fn shape_u32(&self) -> &[u32] {
+        &self.shape
+    }
+
     /// Total number of cells.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -163,6 +169,21 @@ impl Tensor {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// The dense row-major backing values.
+    #[must_use]
+    pub fn values(&self) -> &[f64] {
+        &self.data
+    }
+
+    /// Add a constant to every cell. Used by rating-view re-basing, which moves an
+    /// equal and opposite constant into the exported intercept and therefore preserves
+    /// every reconstructed score exactly.
+    pub fn add_scalar(&mut self, delta: f64) {
+        for v in &mut self.data {
+            *v += delta;
+        }
     }
 
     fn offset(&self, coord: &[usize]) -> Option<usize> {

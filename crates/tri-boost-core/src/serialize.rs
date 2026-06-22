@@ -1,16 +1,18 @@
-//! Inference & serialization (spec §2.6, §02.8 / §10). Phase-0 scope: the version
-//! constants, the `ModelDoc` envelope, and the frozen-config bincode round-trip with
-//! a `format_version` gate. The scoring path (`ScoringBank`/`PackedTree`), the JSON
-//! rating-table export, and the `usize`→`u32` wasm guard land with §10.
+//! Inference & serialization (spec §2.6, §02.8 / §10): the versioned model wire
+//! envelope, JSON/bincode helpers, validation-on-load, and the rating-table export
+//! artifact.
 //!
 //! The binary path uses bincode 2.x's `encode_to_vec`/`decode_from_slice` with the
 //! config **frozen** to `bincode::config::standard()`. `ModelDoc` is a plain nested
 //! struct (NOT `#[serde(flatten)]`, which is incompatible with the non-self-describing
 //! bincode round-trip).
 
-use crate::engine::Model;
+use crate::engine::{ExactnessMode, Model, ModelSchema};
 use crate::error::PbError;
+use crate::explain::{FeatureSet, RefMeasure, TableBank};
+use crate::loss::{Link, ObjectiveTag};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// The on-disk container format version (the envelope around `Model`). Bumped on any
 /// wire-incompatible change to the *framing*; a load of a newer `format_version` is
@@ -46,14 +48,33 @@ impl ModelDoc {
     }
 }
 
+fn serialization_error(e: impl ToString) -> PbError {
+    PbError::Serialization(e.to_string())
+}
+
+fn validate_doc(doc: &ModelDoc) -> Result<(), PbError> {
+    if doc.format_version != FORMAT_VERSION {
+        return Err(PbError::Serialization(format!(
+            "unsupported format_version {} (this build supports exactly {FORMAT_VERSION})",
+            doc.format_version
+        )));
+    }
+    if doc.schema_version != SCHEMA_VERSION {
+        return Err(PbError::Serialization(format!(
+            "unsupported schema_version {} (this build supports exactly {SCHEMA_VERSION})",
+            doc.schema_version
+        )));
+    }
+    doc.model.validate()
+}
+
 /// Encode a [`ModelDoc`] to the fast binary format (bincode 2.x, frozen
 /// `config::standard()`).
 ///
 /// # Errors
 /// [`PbError::Serialization`] if encoding fails.
 pub fn encode_doc(doc: &ModelDoc) -> Result<Vec<u8>, PbError> {
-    bincode::serde::encode_to_vec(doc, bincode::config::standard())
-        .map_err(|e| PbError::Serialization(e.to_string()))
+    bincode::serde::encode_to_vec(doc, bincode::config::standard()).map_err(serialization_error)
 }
 
 /// Decode a [`ModelDoc`] from the fast binary format, rejecting a newer
@@ -62,21 +83,35 @@ pub fn encode_doc(doc: &ModelDoc) -> Result<Vec<u8>, PbError> {
 /// # Errors
 /// [`PbError::Serialization`] if decoding fails or the framing version is unknown.
 pub fn decode_doc(bytes: &[u8]) -> Result<ModelDoc, PbError> {
-    let (doc, _len): (ModelDoc, usize) =
+    let (doc, len): (ModelDoc, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map_err(|e| PbError::Serialization(e.to_string()))?;
-    if doc.format_version > FORMAT_VERSION {
+            .map_err(serialization_error)?;
+    if len != bytes.len() {
         return Err(PbError::Serialization(format!(
-            "unsupported format_version {} (this build supports up to {FORMAT_VERSION})",
-            doc.format_version
+            "trailing bytes after ModelDoc: decoded {len}, input {}",
+            bytes.len()
         )));
     }
-    if doc.schema_version > SCHEMA_VERSION {
-        return Err(PbError::Serialization(format!(
-            "unsupported schema_version {} (this build supports up to {SCHEMA_VERSION})",
-            doc.schema_version
-        )));
-    }
+    validate_doc(&doc)?;
+    Ok(doc)
+}
+
+/// Encode a [`ModelDoc`] to the canonical pretty JSON format.
+///
+/// # Errors
+/// [`PbError::Serialization`] if encoding fails.
+pub fn encode_doc_json(doc: &ModelDoc) -> Result<String, PbError> {
+    serde_json::to_string_pretty(doc).map_err(serialization_error)
+}
+
+/// Decode a [`ModelDoc`] from canonical JSON and validate the contained model.
+///
+/// # Errors
+/// [`PbError::Serialization`] if decoding fails or versions are unsupported; plus
+/// model validation errors.
+pub fn decode_doc_json(s: &str) -> Result<ModelDoc, PbError> {
+    let doc: ModelDoc = serde_json::from_str(s).map_err(serialization_error)?;
+    validate_doc(&doc)?;
     Ok(doc)
 }
 
@@ -85,6 +120,7 @@ pub fn decode_doc(bytes: &[u8]) -> Result<ModelDoc, PbError> {
 /// # Errors
 /// [`PbError::Serialization`] if encoding fails.
 pub fn encode_model(model: &Model) -> Result<Vec<u8>, PbError> {
+    model.validate()?;
     encode_doc(&ModelDoc::new(model.clone()))
 }
 
@@ -96,6 +132,230 @@ pub fn decode_model(bytes: &[u8]) -> Result<Model, PbError> {
     Ok(decode_doc(bytes)?.model)
 }
 
+/// Encode a bare [`Model`] to canonical JSON.
+///
+/// # Errors
+/// [`PbError::Serialization`] if encoding fails; plus validation errors.
+pub fn encode_model_json(model: &Model) -> Result<String, PbError> {
+    model.validate()?;
+    encode_doc_json(&ModelDoc::new(model.clone()))
+}
+
+/// Decode a bare [`Model`] from canonical JSON.
+///
+/// # Errors
+/// [`PbError::Serialization`] if decoding fails or versions are unsupported; plus
+/// model validation errors.
+pub fn decode_model_json(s: &str) -> Result<Model, PbError> {
+    Ok(decode_doc_json(s)?.model)
+}
+
+impl Model {
+    /// Serialize this model to the compact same-version bincode cache format.
+    ///
+    /// # Errors
+    /// [`PbError::Serialization`] if encoding fails; plus validation errors.
+    pub fn to_bincode(&self) -> Result<Vec<u8>, PbError> {
+        encode_model(self)
+    }
+
+    /// Deserialize a model from the compact same-version bincode cache format.
+    ///
+    /// # Errors
+    /// [`PbError::Serialization`] if decoding fails or versions are unsupported; plus
+    /// model validation errors.
+    pub fn from_bincode(bytes: &[u8]) -> Result<Self, PbError> {
+        decode_model(bytes)
+    }
+
+    /// Serialize this model to canonical pretty JSON.
+    ///
+    /// # Errors
+    /// [`PbError::Serialization`] if encoding fails; plus validation errors.
+    pub fn to_json(&self) -> Result<String, PbError> {
+        encode_model_json(self)
+    }
+
+    /// Deserialize a model from canonical JSON.
+    ///
+    /// # Errors
+    /// [`PbError::Serialization`] if decoding fails or versions are unsupported; plus
+    /// model validation errors.
+    pub fn from_json(s: &str) -> Result<Self, PbError> {
+        decode_model_json(s)
+    }
+}
+
+/// Optional reference-cell selector for rating-view exports. Each entry identifies a
+/// table support and the coordinate within that table that should read as neutral
+/// (`0.0` in score space, `1.000` as a log-link relativity). The shifted mass is
+/// folded into the exported intercept, so reconstructed scores are unchanged.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RatingBasis {
+    /// Per-table reference coordinates keyed by feature set.
+    pub reference: BTreeMap<FeatureSet, Vec<u32>>,
+}
+
+/// One exported rating-table axis.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AxisExport {
+    /// Raw feature id.
+    pub raw: u32,
+    /// Human-readable feature name from [`ModelSchema`].
+    pub name: String,
+    /// Merged-grid finite borders.
+    pub borders: Vec<f32>,
+    /// Number of cells including the explicit missing cell.
+    pub cells: u32,
+}
+
+/// One exported purified rating table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RatingTable {
+    /// Raw feature set this table represents.
+    pub feature_set: FeatureSet,
+    /// Feature names parallel to [`RatingTable::feature_set`].
+    pub feature_names: Vec<String>,
+    /// Axis metadata parallel to tensor dimensions.
+    pub axes: Vec<AxisExport>,
+    /// Tensor shape as fixed-width dimensions.
+    pub shape: Vec<u32>,
+    /// Score-space table values in dense row-major order.
+    pub values: Vec<f64>,
+    /// Log-link relativities (`exp(value)`) when applicable; `None` otherwise.
+    pub relativities: Option<Vec<f64>>,
+    /// Per-cell support counts, display-only.
+    pub support: Vec<f64>,
+    /// Cached table variance.
+    pub variance: f64,
+    /// Sobol share under the bank's reference measure.
+    pub sobol: f64,
+}
+
+/// The rating-table export artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RatingExport {
+    /// Export wire format version.
+    pub format_version: u32,
+    /// Model/schema wire version.
+    pub schema_version: u32,
+    /// Exactness mode carried by the source model.
+    pub mode: ExactnessMode,
+    /// The trained inverse-link family.
+    pub link: Link,
+    /// The trained objective tag.
+    pub objective: ObjectiveTag,
+    /// Exported intercept, possibly shifted by [`RatingBasis`] rebasing.
+    pub f0: f64,
+    /// Reference measure used for purification.
+    pub reference_measure: RefMeasure,
+    /// Sobol-sorted purified tables.
+    pub tables: Vec<RatingTable>,
+}
+
+impl TableBank {
+    /// Export this exact bank as a rating-table artifact.
+    ///
+    /// # Errors
+    /// [`PbError::ExactnessFirewall`] if `mode` is approximate; [`PbError::ShapeMismatch`]
+    /// if schema/table metadata is inconsistent; [`PbError::Internal`] if a reference
+    /// coordinate escapes a tensor.
+    pub fn to_rating_export(
+        &self,
+        link: Link,
+        mode: &ExactnessMode,
+        schema: &ModelSchema,
+        basis: Option<&RatingBasis>,
+    ) -> Result<RatingExport, PbError> {
+        if let ExactnessMode::Approximate { reason } = mode {
+            return Err(PbError::ExactnessFirewall(reason.clone()));
+        }
+        let sobol: BTreeMap<FeatureSet, f64> = self.sobol().into_iter().collect();
+        let mut f0 = self.f0;
+        let mut tables = Vec::with_capacity(self.tables.len());
+        for table in &self.tables {
+            let mut values = table.values.clone();
+            if let Some(coord) = basis.and_then(|b| b.reference.get(&table.u)) {
+                if coord.len() != table.u.order() {
+                    return Err(PbError::ShapeMismatch {
+                        what: format!(
+                            "rating basis for order-{} table has {} coordinates",
+                            table.u.order(),
+                            coord.len()
+                        ),
+                    });
+                }
+                let coord_usize: Vec<usize> = coord.iter().map(|&c| c as usize).collect();
+                let shift = values.at(&coord_usize).ok_or_else(|| PbError::Internal {
+                    what: "rating basis coordinate escaped table".into(),
+                })?;
+                values.add_scalar(-shift);
+                f0 += shift;
+            }
+            let mut feature_names = Vec::with_capacity(table.u.order());
+            for raw in &table.u.0 {
+                let name = schema
+                    .feature_names
+                    .get(raw.0 as usize)
+                    .ok_or_else(|| PbError::ShapeMismatch {
+                        what: format!("schema missing feature name for raw {}", raw.0),
+                    })?
+                    .clone();
+                feature_names.push(name);
+            }
+            let mut axes = Vec::with_capacity(table.axes.len());
+            for axis in &table.axes {
+                let name = schema
+                    .feature_names
+                    .get(axis.raw.0 as usize)
+                    .ok_or_else(|| PbError::ShapeMismatch {
+                        what: format!("schema missing feature name for raw {}", axis.raw.0),
+                    })?
+                    .clone();
+                axes.push(AxisExport {
+                    raw: axis.raw.0,
+                    name,
+                    borders: axis.borders.clone(),
+                    cells: axis.cells,
+                });
+            }
+            let relativities = if link == Link::Log {
+                Some(
+                    values
+                        .values()
+                        .iter()
+                        .map(|v| v.clamp(-30.0, 30.0).exp())
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            tables.push(RatingTable {
+                feature_set: table.u.clone(),
+                feature_names,
+                axes,
+                shape: values.shape_u32().to_vec(),
+                values: values.values().to_vec(),
+                relativities,
+                support: table.support.values().to_vec(),
+                variance: table.variance,
+                sobol: *sobol.get(&table.u).unwrap_or(&0.0),
+            });
+        }
+        tables.sort_by(|a, b| b.sobol.total_cmp(&a.sobol));
+        Ok(RatingExport {
+            format_version: FORMAT_VERSION,
+            schema_version: SCHEMA_VERSION,
+            mode: mode.clone(),
+            link,
+            objective: schema.objective.clone(),
+            f0,
+            reference_measure: self.w.clone(),
+            tables,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -105,6 +365,9 @@ mod tests {
         clippy::panic
     )]
     use super::*;
+    use crate::engine::ExactnessMode;
+    use crate::explain::{fixture_serve, RefMeasure};
+    use std::collections::BTreeMap;
 
     #[test]
     fn bincode_round_trip_is_bit_identical() {
@@ -117,11 +380,16 @@ mod tests {
     }
 
     #[test]
-    fn json_round_trip_matches() {
+    fn json_round_trip_matches_and_model_methods_work() {
         let doc = ModelDoc::new(crate::explain::fixture_model());
-        let json = serde_json::to_vec(&doc).unwrap();
-        let back: ModelDoc = serde_json::from_slice(&json).unwrap();
+        let json = encode_doc_json(&doc).unwrap();
+        let back = decode_doc_json(&json).unwrap();
         assert_eq!(doc, back);
+
+        let model_json = doc.model.to_json().unwrap();
+        assert_eq!(Model::from_json(&model_json).unwrap(), doc.model);
+        let model_bytes = doc.model.to_bincode().unwrap();
+        assert_eq!(Model::from_bincode(&model_bytes).unwrap(), doc.model);
     }
 
     #[test]
@@ -138,5 +406,83 @@ mod tests {
         doc.schema_version = SCHEMA_VERSION + 1;
         let bytes = encode_doc(&doc).unwrap();
         assert!(matches!(decode_doc(&bytes), Err(PbError::Serialization(_))));
+    }
+
+    #[test]
+    fn trailing_bincode_bytes_are_rejected() {
+        let mut bytes = encode_model(&crate::explain::fixture_model()).unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            decode_model(&bytes),
+            Err(PbError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn decode_revalidates_tree_axes() {
+        let mut doc = ModelDoc::new(crate::explain::fixture_model());
+        doc.model.trees[0].1.splits[0].axis = 99;
+        let bytes = encode_doc(&doc).unwrap();
+        assert!(decode_doc(&bytes).is_err());
+    }
+
+    #[test]
+    fn path_a_scoring_matches_ensemble_and_predicts_response() {
+        let model = crate::explain::fixture_model();
+        let x = fixture_serve();
+        let mut out = vec![0.0_f32; x.0.n_rows as usize];
+        model.score_trees(&x.0, None, &mut out).unwrap();
+        for (row, &score) in out.iter().enumerate() {
+            let bins: Vec<u8> = x.0.data.iter().map(|c| c[row]).collect();
+            assert_eq!(
+                score.to_bits(),
+                (model.ensemble_f64(&bins).unwrap() as f32).to_bits()
+            );
+        }
+        assert_eq!(model.predict_binned(&x.0, None).unwrap(), out);
+        assert_eq!(model.predict(&x.0, None).unwrap(), out);
+    }
+
+    #[test]
+    fn rating_export_pure_and_rebased_forms_are_exact() {
+        let model = crate::explain::fixture_model();
+        let x = fixture_serve();
+        let bank = model.explain(&x, RefMeasure::Uniform).unwrap();
+        let pure = bank
+            .to_rating_export(model.link, &model.mode, &model.schema, None)
+            .unwrap();
+        assert_eq!(pure.mode, ExactnessMode::Exact);
+        assert_eq!(pure.tables.len(), bank.tables.len());
+
+        let first = bank.tables[0].clone();
+        let coord = vec![0_u32; first.u.order()];
+        let shift = first.values.at(&vec![0_usize; first.u.order()]).unwrap();
+        let basis = RatingBasis {
+            reference: BTreeMap::from([(first.u.clone(), coord)]),
+        };
+        let rebased = bank
+            .to_rating_export(model.link, &model.mode, &model.schema, Some(&basis))
+            .unwrap();
+        assert!((rebased.f0 - (bank.f0 + shift)).abs() < 1e-12);
+        let table = rebased
+            .tables
+            .iter()
+            .find(|t| t.feature_set == first.u)
+            .unwrap();
+        assert!(table.values[0].abs() < 1e-12);
+    }
+
+    #[test]
+    fn rating_export_refuses_approximate_mode() {
+        let model = crate::explain::fixture_model();
+        let x = fixture_serve();
+        let bank = model.explain(&x, RefMeasure::Uniform).unwrap();
+        let mode = ExactnessMode::Approximate {
+            reason: "test".into(),
+        };
+        assert!(matches!(
+            bank.to_rating_export(model.link, &mode, &model.schema, None),
+            Err(PbError::ExactnessFirewall(_))
+        ));
     }
 }
