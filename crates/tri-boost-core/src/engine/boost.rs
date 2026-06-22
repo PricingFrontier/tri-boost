@@ -55,11 +55,6 @@ fn validate_fit_spec(spec: &FitSpec<'_>) -> Result<(), PbError> {
             "monotone constraints are not implemented in the Phase-2 green spine",
         ));
     }
-    if spec.distill.is_some() {
-        return Err(invalid_config(
-            "distillation is not implemented in the Phase-2 green spine",
-        ));
-    }
     Ok(())
 }
 
@@ -310,7 +305,6 @@ mod tests {
         clippy::float_cmp
     )]
     use super::*;
-    use crate::boosters::{DistillSpec, TeacherKind};
     use crate::constraints::MonoSign;
     use crate::data::{bin_columns, BinConfig};
     use crate::engine::Booster;
@@ -324,7 +318,6 @@ mod tests {
             exposure: None,
             monotone: crate::constraints::MonotoneMap::new(),
             interaction: crate::constraints::InteractionPolicy::default(),
-            distill: None,
             seed: 0,
         }
     }
@@ -562,17 +555,6 @@ mod tests {
 
         let mut s = spec(&sqe);
         s.monotone.insert("f0".into(), MonoSign::Increasing);
-        assert!(matches!(
-            booster.fit(&x, &y, &s),
-            Err(PbError::InvalidConfig { .. })
-        ));
-
-        let mut s = spec(&sqe);
-        s.distill = Some(DistillSpec {
-            teacher_raw: vec![0.0, 0.0],
-            blend: 0.5,
-            teacher: TeacherKind::External,
-        });
         assert!(matches!(
             booster.fit(&x, &y, &s),
             Err(PbError::InvalidConfig { .. })

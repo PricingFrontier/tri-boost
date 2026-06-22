@@ -1,8 +1,7 @@
 //! Objectives & the `Loss` trait (spec §2.4 / §05). The trait + companion types are
 //! frozen here; the full v1 objective set ships: `SquaredError` (Identity),
 //! `Logistic` (Logit), and the log-link frequency/severity objectives `Poisson`,
-//! `Gamma`, `Tweedie { rho }`. The `BlendedLoss` distillation adaptor (§05.7) provides
-//! the §09 soft-target seam.
+//! `Gamma`, `Tweedie { rho }`.
 //!
 //! The trait is fully orthogonal to tree shape, so it cannot touch I1/I2 — swapping
 //! objectives never creates a >3-feature coupling or a non-constant leaf (§05.8). Every
@@ -100,37 +99,6 @@ fn finish_deviance(obj: &str, acc: f64) -> Result<f32, PbError> {
             "{obj} deviance is not finite/representable as f32: {acc}"
         )))
     }
-}
-
-fn validate_target_domain(obj: &str, loss: LossId, y: &[f32]) -> Result<(), PbError> {
-    for (i, &yi) in y.iter().enumerate() {
-        require_finite(obj, "soft_target", i, yi)?;
-        match loss {
-            LossId::SquaredError => {}
-            LossId::Logistic => {
-                if !(0.0..=1.0).contains(&yi) {
-                    return Err(invalid_input(format!(
-                        "{obj} soft_target[{i}] must be in [0, 1], got {yi}"
-                    )));
-                }
-            }
-            LossId::Poisson | LossId::Tweedie => {
-                if yi < 0.0 {
-                    return Err(invalid_input(format!(
-                        "{obj} soft_target[{i}] must be >= 0, got {yi}"
-                    )));
-                }
-            }
-            LossId::Gamma => {
-                if yi <= 0.0 {
-                    return Err(invalid_input(format!(
-                        "{obj} soft_target[{i}] must be > 0, got {yi}"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Shared entry length-guard for the three slice methods (§05.2): the one in-method
@@ -993,114 +961,6 @@ impl Loss for Tweedie {
     }
 }
 
-/// The distillation soft-target adaptor (spec §05.7) — the §05 seam §09 drives. Forms a
-/// convex `g = blend·g_true + (1−blend)·g_soft` (likewise `h`) by calling the base
-/// objective's `grad_hess` twice in fixed order: once on the true `y`, once on the
-/// teacher's `soft_target`. `init_score`/`deviance` delegate to the base on the **true**
-/// `y` (the teacher is not ground truth), so early stopping and the base rate stay
-/// honest. `blend` is the true-label weight: `blend = 1.0` reproduces the base loss
-/// bit-for-bit; `blend = 0.0` is the pure-soft fit.
-/// When `blend < 1.0`, the consulted soft target is preflighted against the base
-/// objective's finite natural-scale domain before the second gradient pass.
-pub struct BlendedLoss<'a> {
-    base: &'a dyn Loss,
-    soft_target: &'a [f32],
-    blend: f32,
-}
-
-impl<'a> BlendedLoss<'a> {
-    /// Wrap `base` with a teacher `soft_target` and a true-label `blend` weight.
-    ///
-    /// # Errors
-    /// [`PbError::InvalidConfig`] if `blend` is not finite or not in `[0, 1]`.
-    pub fn new(base: &'a dyn Loss, soft_target: &'a [f32], blend: f32) -> Result<Self, PbError> {
-        if !blend.is_finite() || !(0.0..=1.0).contains(&blend) {
-            return Err(PbError::InvalidConfig {
-                what: format!("BlendedLoss blend must be in [0, 1], got {blend}"),
-            });
-        }
-        Ok(BlendedLoss {
-            base,
-            soft_target,
-            blend,
-        })
-    }
-}
-
-impl Loss for BlendedLoss<'_> {
-    fn grad_hess(
-        &self,
-        y: &[f32],
-        raw: &[f32],
-        weight: &[f32],
-        out: &mut GradHess,
-    ) -> Result<(), PbError> {
-        // out := base(g,h) on the TRUE y.
-        self.base.grad_hess(y, raw, weight, out)?;
-        if self.blend == 1.0 {
-            return Ok(()); // pure base — soft_target not consulted (bit-for-bit base).
-        }
-        if self.soft_target.len() != y.len() {
-            return Err(PbError::ShapeMismatch {
-                what: format!(
-                    "blended grad_hess: y={}, soft_target={}",
-                    y.len(),
-                    self.soft_target.len()
-                ),
-            });
-        }
-        validate_target_domain("blended", self.base.objective_tag().loss, self.soft_target)?;
-        // soft := base(g,h) on the teacher target, then blend in fixed index order.
-        let mut soft = GradHess::default();
-        self.base
-            .grad_hess(self.soft_target, raw, weight, &mut soft)?;
-        let a = self.blend;
-        let b = 1.0 - self.blend;
-        for (gi, hi, &gs, &hs) in izip!(&mut out.g, &mut out.h, &soft.g, &soft.h) {
-            *gi = a * *gi + b * gs;
-            *hi = a * *hi + b * hs;
-        }
-        Ok(())
-    }
-
-    fn init_score(
-        &self,
-        y: &[f32],
-        weight: &[f32],
-        offset: Option<&[f32]>,
-    ) -> Result<f64, PbError> {
-        self.base.init_score(y, weight, offset) // base rate on the true y
-    }
-
-    fn link(&self) -> Link {
-        self.base.link()
-    }
-
-    fn pred_from_raw(&self, raw: f32) -> f32 {
-        self.base.pred_from_raw(raw)
-    }
-
-    fn deviance(&self, y: &[f32], raw: &[f32], weight: &[f32]) -> Result<f32, PbError> {
-        self.base.deviance(y, raw, weight) // early-stop metric on the true y
-    }
-
-    fn default_metric(&self) -> Metric {
-        self.base.default_metric()
-    }
-
-    fn objective_tag(&self) -> ObjectiveTag {
-        self.base.objective_tag()
-    }
-
-    fn hessian_floor(&self) -> f32 {
-        self.base.hessian_floor()
-    }
-
-    fn max_delta_step(&self) -> Option<f32> {
-        self.base.max_delta_step()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1373,7 +1233,7 @@ mod tests {
     }
 
     // ===================================================================
-    // Phase 4 objectives: Logistic / Poisson / Gamma / Tweedie + BlendedLoss.
+    // Phase 4 objectives: Logistic / Poisson / Gamma / Tweedie.
     // ===================================================================
 
     /// Central-difference oracle (§05.9 #2): `grad_hess` g/h equal the 1st/2nd central
@@ -1663,70 +1523,5 @@ mod tests {
         let a = run(1);
         assert_eq!(a, run(2));
         assert_eq!(a, run(8));
-    }
-
-    #[test]
-    fn blended_loss_endpoints_and_error_propagation() {
-        let y = [1.0_f32, 0.0, 1.0, 0.0];
-        let raw = [0.5_f32, -0.5, 1.0, -1.0];
-        let w = [1.0_f32, 2.0, 1.0, 1.0];
-        let soft = [0.8_f32, 0.1, 0.9, 0.2];
-        let mut base_gh = GradHess::default();
-        Logistic.grad_hess(&y, &raw, &w, &mut base_gh).unwrap();
-        let mut soft_gh = GradHess::default();
-        Logistic.grad_hess(&soft, &raw, &w, &mut soft_gh).unwrap();
-
-        // blend = 1.0 reproduces the base loss bit-for-bit.
-        let b1 = BlendedLoss::new(&Logistic, &soft, 1.0).unwrap();
-        let mut gh = GradHess::default();
-        b1.grad_hess(&y, &raw, &w, &mut gh).unwrap();
-        assert_eq!(gh.g, base_gh.g);
-        assert_eq!(gh.h, base_gh.h);
-        // init_score / deviance delegate to the base on the TRUE y.
-        assert_eq!(
-            b1.init_score(&y, &w, None).unwrap().to_bits(),
-            Logistic.init_score(&y, &w, None).unwrap().to_bits()
-        );
-        // §05.7: at blend = 1.0 the soft target is NEVER consulted, so an invalid (NaN)
-        // teacher target is accepted — the degenerate zero-teacher fit is exactly the base.
-        let nan_soft = [f32::NAN, f32::NAN, f32::NAN, f32::NAN];
-        let b1n = BlendedLoss::new(&Logistic, &nan_soft, 1.0).unwrap();
-        b1n.grad_hess(&y, &raw, &w, &mut gh).unwrap();
-        assert_eq!(gh.g, base_gh.g);
-
-        // blend = 0.0 is the pure-soft fit (base on the teacher target).
-        let b0 = BlendedLoss::new(&Logistic, &soft, 0.0).unwrap();
-        b0.grad_hess(&y, &raw, &w, &mut gh).unwrap();
-        assert_eq!(gh.g, soft_gh.g);
-        assert_eq!(gh.h, soft_gh.h);
-
-        // blend = 0.5 is the exact convex midpoint.
-        let bm = BlendedLoss::new(&Logistic, &soft, 0.5).unwrap();
-        bm.grad_hess(&y, &raw, &w, &mut gh).unwrap();
-        for i in 0..y.len() {
-            assert!((gh.g[i] - 0.5 * (base_gh.g[i] + soft_gh.g[i])).abs() < 1e-6);
-        }
-
-        // A base-loss domain error on the soft target propagates as a typed PbError.
-        let bad_soft = [f32::NAN, 0.0, 1.0, 0.0];
-        let bb = BlendedLoss::new(&Logistic, &bad_soft, 0.5).unwrap();
-        assert!(matches!(
-            bb.grad_hess(&y, &raw, &w, &mut gh),
-            Err(PbError::InvalidInput { .. })
-        ));
-        let out_of_domain_soft = [1.2_f32, 0.0, 1.0, 0.0];
-        let bb = BlendedLoss::new(&Logistic, &out_of_domain_soft, 0.5).unwrap();
-        assert!(matches!(
-            bb.grad_hess(&y, &raw, &w, &mut gh),
-            Err(PbError::InvalidInput { .. })
-        ));
-        let b1_bad_teacher = BlendedLoss::new(&Logistic, &out_of_domain_soft, 1.0).unwrap();
-        b1_bad_teacher.grad_hess(&y, &raw, &w, &mut gh).unwrap();
-        assert_eq!(gh.g, base_gh.g);
-        // Bad blend is InvalidConfig.
-        assert!(matches!(
-            BlendedLoss::new(&Logistic, &soft, 1.5),
-            Err(PbError::InvalidConfig { .. })
-        ));
     }
 }

@@ -1933,7 +1933,6 @@ mod tests {
             exposure: None,
             monotone: crate::constraints::MonotoneMap::new(),
             interaction: crate::constraints::InteractionPolicy::default(),
-            distill: None,
             seed: 0,
         }
     }

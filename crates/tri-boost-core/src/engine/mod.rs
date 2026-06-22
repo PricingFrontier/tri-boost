@@ -3,7 +3,6 @@
 //! boosting loop. Phase 1 (this milestone, M1.3) lands the full-precision histogram
 //! engine ([`hist`]); the split-finder and `fit` loop land in M1.4/M1.5.
 
-use crate::boosters::DistillSpec;
 use crate::cat::CatEncoderStore;
 use crate::constraints::{InteractionPolicy, MonotoneMap};
 use crate::data::{AxisKind, AxisProvenance, BinnedMatrix, BorderGrid};
@@ -452,7 +451,7 @@ impl Booster {
 }
 
 /// The per-fit specification (spec §2.9): objective + per-row data + constraints +
-/// optional distillation + the deterministic seed.
+/// the deterministic seed.
 pub struct FitSpec<'a> {
     /// The objective.
     pub loss: &'a dyn Loss,
@@ -464,8 +463,6 @@ pub struct FitSpec<'a> {
     pub monotone: MonotoneMap,
     /// Interaction-order limit + optional group whitelist.
     pub interaction: InteractionPolicy,
-    /// Optional teacher distillation (off by default).
-    pub distill: Option<DistillSpec>,
     /// The deterministic base seed threaded through every randomized stage.
     pub seed: u64,
 }

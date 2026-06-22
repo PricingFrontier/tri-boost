@@ -46,8 +46,8 @@ pub use data::{
 pub use cat::{CatEncoder, CatEncoderStore, TsEncodingId};
 
 pub use loss::{
-    BlendedLoss, Gamma, GradHess, Link, Logistic, Loss, LossId, Metric, ObjectiveTag, Poisson,
-    SquaredError, Tweedie,
+    Gamma, GradHess, Link, Logistic, Loss, LossId, Metric, ObjectiveTag, Poisson, SquaredError,
+    Tweedie,
 };
 
 pub use engine::{
@@ -61,8 +61,6 @@ pub use explain::{
     assert_exact_decomposition, check_feature_budget, AxisId, EffectTable, ExactTol, FeatureSet,
     OverflowPolicy, PurifyMode, RefMeasure, TableBank, TableBudget, Tensor,
 };
-
-pub use boosters::{DistillSpec, TeacherKind};
 
 pub use serialize::{
     decode_doc, decode_model, encode_doc, encode_model, ModelDoc, FORMAT_VERSION, SCHEMA_VERSION,

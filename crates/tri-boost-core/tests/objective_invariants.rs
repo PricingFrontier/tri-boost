@@ -25,7 +25,6 @@ fn spec<'a>(loss: &'a dyn Loss, exposure: Option<&'a [f32]>) -> FitSpec<'a> {
         exposure,
         monotone: MonotoneMap::new(),
         interaction: InteractionPolicy::default(),
-        distill: None,
         seed: 0,
     }
 }

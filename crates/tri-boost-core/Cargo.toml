@@ -26,7 +26,6 @@ rand_pcg.workspace   = true
 [features]
 default = []
 arrow   = []                     # §03 zero-copy Arrow ingest (stub flag in Phase 0)
-distill = []                     # §09 CatBoost teacher DATA hooks (stub flag in Phase 0)
 nightly = []                     # §11 portable_simd path (stub flag in Phase 0)
 # NOTE: no pyo3, no numpy — verified by the NoPyo3 CI gate (§02.6).
 

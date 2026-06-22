@@ -67,13 +67,6 @@ Ordering: objectives first (they are the simpler vertical slice and the §13.1 m
 - **DoD:** §13.5 numerical units — multi-step Newton converges to the analytic leaf optimum on a Gamma fixture; **Armijo never increases loss**; the leaf clamp caps `|w*|≤δ` on a high-`F` Poisson fixture. **§13.1 invariant matrix stays green** with the clamp + multi-step path active (proving leaf-only edits keep the tree constant-per-cell → I2 intact, firewall `Exact`). `{1,2,8}`-thread determinism green (clamp is on the order-independent full-precision aggregate).
 - **Size:** M.
 
-### M2-H — `BlendedLoss` distillation adaptor (the §05 seam; §09 owns policy)
-- **§-ref:** §05.7, §13.3 (`blend=1.0` reproduces base loss).
-- **Deliverable:** `BlendedLoss { base: &dyn Loss, soft_target: &[f32], blend: f32 }`: convex `g=blend·g_true+(1−blend)·g_soft`, likewise `h`, via two `base.grad_hess` calls combined in **fixed order**, inheriting floor/clamp/`f64` guarantees and `?`-propagating the second call's `Result`. `init_score`/`deviance` delegate to `base` on the **true** `y` and forward verbatim. `blend`=true-label weight, default 0.5.
-- **Dependencies:** M2-B…M2-F (a base loss to wrap).
-- **DoD:** §13.3 **BlendedLoss test [GATE]** — `blend=1.0` reproduces the base loss's `grad_hess` bit-for-bit; `blend=0.0` is the pure-soft fit; base-loss domain error propagates as a typed `PbError` through the second call's `?` (no-panic gate). Lint/fmt/doctest green. (Teacher orchestration is §09/v1.5 — out of scope here; only the seam + polarity.)
-- **Size:** S.
-
 ### M2-I — §07 owned types: `MonotoneMap`, `InteractionPolicy`, `CredibilityFloor`, `AdmissionPrior`, `FeatureMask`
 - **§-ref:** §07.2, §2.9 (`InteractionPolicy` verbatim), §13.4 anti-HashMap determinism gate.
 - **Deliverable:** `crates/tri-boost-core/src/interaction/mod.rs`. `enum MonoSign`; `MonotoneMap(BTreeMap<String,MonoSign>)` with `resolve(&self, names) -> Result<Vec<Option<MonoSign>>, PbError>` (unknown name → `InvalidConfig`); `InteractionPolicy {max_order:u8, groups:Option<Vec<FeatureSet>>}` with `max_order∈{1,2,3}` validation (`InvalidConfig`) and `admissible(chosen, all) -> FeatureMask` (provenance-keyed, raw-feature bitset; empty ⇒ caller terminates early); `CredibilityFloor` (`min_data_in_leaf`/`min_sum_hessian_in_leaf`/`min_weight_sum_in_leaf`/`path_smooth`); `AdmissionPrior {pair, triple, heredity, table_budget_beta=0.5, budget_cells}` (config-only scratch, never serialized); `HeredityMode`; `FeatureMask` bitset alias.
@@ -111,4 +104,4 @@ Ordering: objectives first (they are the simpler vertical slice and the §13.1 m
 
 ---
 
-**Critical-path order:** M2-A → M2-B → (M2-C → M2-D → M2-E → M2-F → M2-G, M2-H) | M2-I → (M2-J, M2-L) → M2-K → M2-M. Objectives (A–H) and the §07 type/clamp foundation (I, J, L) can proceed in parallel after their roots; M2-K joins them; M2-M is the milestone gate. No task merges until its named gates are green — "done" is gates-green, not code-written. **Files:** `crates/tri-boost-core/src/loss/{mod,squared,logistic,poisson,gamma,tweedie,blended}.rs` and `src/interaction/{mod,wht8,funnel,monotone,constrain}.rs`; tests in `tests/` (proptest suites) and `tests/invariants/` (the §13.1 matrix, already wired by the foundation, extended one column/arm per task).
+**Critical-path order:** M2-A → M2-B → M2-C → M2-D → M2-E → M2-F → M2-G | M2-I → (M2-J, M2-L) → M2-K → M2-M. Objectives (A–G) and the §07 type/clamp foundation (I, J, L) can proceed in parallel after their roots; M2-K joins them; M2-M is the milestone gate. No task merges until its named gates are green — "done" is gates-green, not code-written. **Files:** `crates/tri-boost-core/src/loss/{mod,squared,logistic,poisson,gamma,tweedie}.rs` and `src/interaction/{mod,wht8,funnel,monotone,constrain}.rs`; tests in `tests/` (proptest suites) and `tests/invariants/` (the §13.1 matrix, already wired by the foundation, extended one column/arm per task).

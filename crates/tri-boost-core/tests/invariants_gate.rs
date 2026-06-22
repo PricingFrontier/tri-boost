@@ -42,7 +42,6 @@ fn fit_additive() -> (Model, ServeBinnedMatrix) {
         exposure: None,
         monotone: MonotoneMap::new(),
         interaction: InteractionPolicy::default(),
-        distill: None,
         seed: 0,
     };
     let model = Booster::with_config(Config {
