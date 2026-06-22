@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const MAX_CAT_BINS: usize = 254;
+const MAX_AUTO_SMOOTH: f64 = 1_000_000.0;
+const MIN_AUTO_VARIANCE: f64 = 1.0e-12;
 
 /// Identifier for one categorical Target-Statistic encoding (spec §04). Resolves to
 /// a concrete [`CatEncoder`] in the [`CatEncoderStore`].
@@ -502,20 +504,25 @@ pub fn fit_cat_encoder(
             &weights
         }
     };
-    let base = exposure_weighted_base_rate(y, w, spec.exposure)?;
     let row_terms = categorical_row_terms(y, w, spec.exposure)?;
-    let full = full_data_encoder(spec.raw, spec.id, levels, &row_terms, base, spec.config)?;
+    let base = exposure_weighted_base_rate(y, w, spec.exposure)?;
+    let smooth = resolve_smooth(levels, &row_terms, base, spec.config.smooth)?;
+    let mut resolved_config = spec.config.clone();
+    resolved_config.smooth = smooth;
+    let full = full_data_encoder(
+        spec.raw,
+        spec.id,
+        levels,
+        &row_terms,
+        base,
+        &resolved_config,
+    )?;
     let train = match spec.config.leakage {
-        LeakageScheme::Ordered { n_perms } => ordered_training_encodings(
-            levels,
-            &row_terms,
-            base,
-            spec.config.smooth,
-            spec.seed,
-            n_perms,
-        )?,
+        LeakageScheme::Ordered { n_perms } => {
+            ordered_training_encodings(levels, &row_terms, base, smooth, spec.seed, n_perms)?
+        }
         LeakageScheme::KFold { k } => {
-            kfold_training_encodings(levels, &row_terms, base, spec.config.smooth, spec.seed, k)?
+            kfold_training_encodings(levels, &row_terms, base, smooth, spec.seed, k)?
         }
     };
     Ok((full, train))
@@ -593,6 +600,78 @@ fn full_data_encoder(
         base,
         config: config.clone(),
     })
+}
+
+fn resolve_smooth(
+    levels: &[String],
+    rows: &[CatRowTerm],
+    base: f32,
+    smooth: Smooth,
+) -> Result<Smooth, PbError> {
+    match smooth {
+        Smooth::Fixed { m } => Ok(Smooth::Fixed { m }),
+        Smooth::Auto => {
+            let m = auto_smooth_strength(levels, rows, base)?;
+            Ok(Smooth::Fixed { m })
+        }
+    }
+}
+
+fn auto_smooth_strength(levels: &[String], rows: &[CatRowTerm], base: f32) -> Result<f32, PbError> {
+    let mut agg: BTreeMap<&str, CatRowTerm> = BTreeMap::new();
+    for (label, term) in levels.iter().zip(rows) {
+        let entry = agg.entry(label.as_str()).or_default();
+        entry.sum_y += term.sum_y;
+        entry.denom += term.denom;
+    }
+    let mut total = 0.0_f64;
+    let mut between = 0.0_f64;
+    for term in agg.values() {
+        if term.denom > 0.0 {
+            let mean = term.sum_y / term.denom;
+            let diff = mean - f64::from(base);
+            between += term.denom * diff * diff;
+            total += term.denom;
+        }
+    }
+    if total <= 0.0 {
+        return Err(PbError::InvalidInput {
+            what: "Smooth::Auto requires positive categorical weight".into(),
+        });
+    }
+    between /= total;
+
+    let mut within = 0.0_f64;
+    for (label, term) in levels.iter().zip(rows) {
+        if term.denom > 0.0 {
+            let level = agg.get(label.as_str()).ok_or_else(|| PbError::Internal {
+                what: "auto-smooth level missing from aggregate".into(),
+            })?;
+            let level_mean = level.sum_y / level.denom;
+            let row_rate = term.sum_y / term.denom;
+            let diff = row_rate - level_mean;
+            within += term.denom * diff * diff;
+        }
+    }
+    within /= total;
+
+    let m = if between <= MIN_AUTO_VARIANCE {
+        if within <= MIN_AUTO_VARIANCE {
+            0.0
+        } else {
+            MAX_AUTO_SMOOTH
+        }
+    } else {
+        (within / between).min(MAX_AUTO_SMOOTH)
+    };
+    let out = m as f32;
+    if out.is_finite() && out >= 0.0 {
+        Ok(out)
+    } else {
+        Err(PbError::InvalidInput {
+            what: "Smooth::Auto produced a non-finite shrinkage strength".into(),
+        })
+    }
 }
 
 fn assign_fisher_bins(levels: &mut [CatLevel]) -> Result<(), PbError> {
@@ -861,6 +940,38 @@ mod tests {
             shrunken_encoding(1.0, 1.0, 0.0, Smooth::Auto),
             Err(PbError::InvalidConfig { .. })
         ));
+    }
+
+    #[test]
+    fn smooth_auto_resolves_to_closed_form_variance_ratio() {
+        let levels = vec!["a", "a", "b", "b"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let y = [0.0_f32, 2.0, 4.0, 8.0];
+        let cfg = TsConfig {
+            leakage: LeakageScheme::KFold { k: 2 },
+            smooth: Smooth::Auto,
+            min_data_per_group: 0.0,
+            ..TsConfig::default()
+        };
+        let spec = CatFitSpec {
+            raw: FeatureId(5),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 3,
+        };
+        let (enc, train) = fit_cat_encoder(&levels, &y, spec).unwrap();
+        assert!(train.iter().all(|v| v.is_finite()));
+        let resolved_m = match enc.config.smooth {
+            Smooth::Fixed { m } => m,
+            Smooth::Auto => f32::NAN,
+        };
+        assert!((resolved_m - 0.4).abs() < 1e-6);
+        assert!((enc.encode_label("a") - (2.0 + 0.4 * 3.5) / 2.4).abs() < 1e-6);
+        assert!((enc.encode_label("b") - (12.0 + 0.4 * 3.5) / 2.4).abs() < 1e-6);
     }
 
     #[test]
