@@ -11,6 +11,8 @@ use crate::data::BinnedMatrix;
 use crate::engine::{Hist, Model, QuantGradHess, Split};
 use crate::error::PbError;
 use crate::loss::{GradHess, Loss};
+use rand::SeedableRng;
+use rand_pcg::Pcg64;
 
 /// Per-level constraint context passed to the split-finder (spec §06/§07). Phase-0
 /// placeholder registered here so the `Backend` trait compiles; the monotone /
@@ -175,6 +177,29 @@ pub fn pb_seed(base: u64, round: u32, stage: u32, block: u32) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// The randomized stage a re-seed belongs to — the `stage` coordinate of
+/// [`pb_seed`] (spec §1/§02.3b). The discriminants are **frozen** (part of the
+/// determinism `[GATE]` contract): never renumber an existing stage, only append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Per-feature binning subsample (§03.3).
+    Binning = 1,
+    /// Row/feature subsampling & MVS (§06.7).
+    Sample = 2,
+    /// Stochastic rounding for quantized histograms (§06/§11, v1.5).
+    Quantize = 3,
+    /// Bagged ensemble selection (§09.6).
+    Bagging = 4,
+}
+
+/// Construct the per-work-unit [`Pcg64`] from the frozen [`pb_seed`] mixer
+/// (spec §02.3b). The single canonical way the library obtains a stream, so every
+/// randomized stage is position-stable and thread-count-independent.
+#[must_use]
+pub fn pb_rng(base: u64, round: u32, stage: Stage, block: u32) -> Pcg64 {
+    Pcg64::seed_from_u64(pb_seed(base, round, stage as u32, block))
 }
 
 #[cfg(test)]

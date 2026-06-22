@@ -36,9 +36,12 @@ pub mod simd;
 
 pub use error::{Invariant, PbError};
 
-pub use backend::{pb_seed, CpuBackend};
+pub use backend::{pb_rng, pb_seed, CpuBackend, Stage};
 
-pub use data::{AxisKind, AxisProvenance, BinnedMatrix, BorderGrid, FeatureId};
+pub use data::{
+    bin, bin_columns, build_grid, compute_offset, AxisKind, AxisProvenance, BinConfig,
+    BinnedMatrix, BorderFamily, BorderGrid, FeatureId, ServeBinnedMatrix, TrainBinnedMatrix,
+};
 
 pub use cat::{CatEncoder, CatEncoderStore, TsEncodingId};
 

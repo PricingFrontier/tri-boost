@@ -44,6 +44,7 @@ numpy        = "0.29"
 # Dev-only (benches). default-features = false drops plotters/html-report to keep the
 # dependency tree small (and the cargo-deny duplicate-version surface minimal).
 criterion    = { version = "0.5", default-features = false }
+proptest     = "1"                     # dev-only: property tests (§13.3)
 
 # The shared lint table — the §1 panic GATE expressed as config, inherited by the
 # core via `[lints] workspace = true`. NOTE: `unsafe_code = "forbid"` is deliberately
