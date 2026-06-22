@@ -7,11 +7,28 @@ use crate::boosters::DistillSpec;
 use crate::cat::CatEncoderStore;
 use crate::constraints::{InteractionPolicy, MonotoneMap};
 use crate::data::{AxisKind, AxisProvenance, BinnedMatrix, BorderGrid};
-use crate::error::PbError;
+use crate::error::{Invariant, PbError};
 use crate::loss::{Link, Loss, ObjectiveTag};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 pub mod hist;
+pub mod split;
+
+/// The SINGLE canonical missing low/left bit (spec §2.5 / §06.2, R-MISSING). The
+/// reserved missing bin (bin 0) routes by its learned `missing_left`; every other
+/// bin routes `bin <= bin_le`. Written ONCE and used identically at split evaluation,
+/// the sample→leaf update ([`split::grow_oblivious_tree`]), tree scoring
+/// ([`ObliviousTree::lookup`]), and table accumulation (§08) — agreement here is what
+/// makes the tree, the purified tables, and the Shapley sum equal (I2 / ThreeWayEqual).
+#[must_use]
+pub(crate) fn low_bit(bin: u8, bin_le: u8, missing_left: bool) -> bool {
+    if bin == 0 {
+        missing_left
+    } else {
+        bin <= bin_le
+    }
+}
 
 /// The Exact / Approximate firewall (spec §3). An `Exact` model passes all five
 /// I2 checks and may export rating tables; any operation that cannot preserve them
@@ -77,12 +94,7 @@ impl ObliviousTree {
                 .ok_or_else(|| PbError::ShapeMismatch {
                     what: format!("row has no axis {} for tree lookup", split.axis),
                 })?;
-            let low = if bin == 0 {
-                split.missing_left
-            } else {
-                bin <= split.bin_le
-            };
-            let bit = usize::from(low);
+            let bit = usize::from(low_bit(bin, split.bin_le, split.missing_left));
             idx |= bit << level;
         }
         self.leaves
@@ -91,6 +103,47 @@ impl ObliviousTree {
             .ok_or_else(|| PbError::Internal {
                 what: "oblivious leaf index escaped 0..8".into(),
             })
+    }
+
+    /// Construct a tree, enforcing I1 at the type boundary (spec §2.5 / §3): `depth`
+    /// (= `splits.len()`) must be in `1..=3`, and the count of DISTINCT raw features
+    /// across the splits (via `provenance`) must equal `depth` — i.e. each level
+    /// tests a different raw feature. `leaves[depth.pow2()..]` are the unused tail.
+    ///
+    /// # Errors
+    /// [`Invariant::FeatureBudget`] (as [`PbError::InvariantViolated`]) if the depth
+    /// or distinct-raw-feature budget is violated; [`PbError::Internal`] if a split
+    /// names an axis absent from `provenance`.
+    pub fn try_new(
+        splits: Vec<Split>,
+        leaves: [f32; 8],
+        provenance: &[AxisProvenance],
+    ) -> Result<Self, PbError> {
+        let depth = splits.len();
+        if !(1..=3).contains(&depth) {
+            return Err(PbError::invariant(Invariant::FeatureBudget));
+        }
+        let mut distinct: SmallVec<[u32; 3]> = SmallVec::new();
+        for s in &splits {
+            let raw = provenance
+                .get(s.axis as usize)
+                .ok_or_else(|| PbError::Internal {
+                    what: format!("split axis {} absent from provenance", s.axis),
+                })?
+                .raw
+                .0;
+            if !distinct.contains(&raw) {
+                distinct.push(raw);
+            }
+        }
+        if distinct.len() != depth {
+            return Err(PbError::invariant(Invariant::FeatureBudget));
+        }
+        Ok(Self {
+            splits,
+            leaves,
+            depth: depth as u8,
+        })
     }
 }
 
