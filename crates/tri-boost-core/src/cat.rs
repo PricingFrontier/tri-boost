@@ -9,6 +9,8 @@ use crate::{pb_seed, Stage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+const MAX_CAT_BINS: usize = 254;
+
 /// Identifier for one categorical Target-Statistic encoding (spec §04). Resolves to
 /// a concrete [`CatEncoder`] in the [`CatEncoderStore`].
 ///
@@ -488,14 +490,6 @@ fn full_data_encoder(
         entry.sum_y += term.sum_y;
         entry.denom += term.denom;
     }
-    if agg.len() > 254 {
-        return Err(PbError::InvalidInput {
-            what: format!(
-                "categorical encoder has {} distinct levels; high-cardinality Fisher bin merging is not implemented yet",
-                agg.len()
-            ),
-        });
-    }
     let mut out = Vec::with_capacity(agg.len());
     for (label, term) in agg {
         out.push(CatLevel {
@@ -510,9 +504,12 @@ fn full_data_encoder(
             .total_cmp(&b.encoding)
             .then_with(|| a.label.cmp(&b.label))
     });
+    let n_levels = out.len();
+    let n_bins = n_levels.clamp(1, MAX_CAT_BINS);
     for (i, level) in out.iter_mut().enumerate() {
-        level.bin = u8::try_from(i + 1).map_err(|_| PbError::Internal {
-            what: "validated categorical level count exceeded u8".into(),
+        let bin = 1 + (i * n_bins / n_levels);
+        level.bin = u8::try_from(bin).map_err(|_| PbError::Internal {
+            what: "categorical Fisher bin exceeded u8".into(),
         })?;
     }
     Ok(CatEncoder {
@@ -832,6 +829,31 @@ mod tests {
             enc.levels.iter().map(|l| l.bin).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    #[test]
+    fn high_cardinality_levels_share_the_254_bin_budget() {
+        let n = 300usize;
+        let levels = (0..n).map(|i| format!("l{i:03}")).collect::<Vec<_>>();
+        let y = (0..n).map(|i| i as f32).collect::<Vec<_>>();
+        let cfg = TsConfig {
+            leakage: LeakageScheme::KFold { k: 5 },
+            smooth: Smooth::Fixed { m: 0.0 },
+            ..TsConfig::default()
+        };
+        let spec = CatFitSpec {
+            raw: FeatureId(3),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 10,
+        };
+        let (enc, _) = fit_cat_encoder(&levels, &y, spec).unwrap();
+        assert_eq!(enc.levels.len(), n);
+        assert_eq!(enc.levels.first().unwrap().bin, 1);
+        assert_eq!(enc.levels.last().unwrap().bin, 254);
+        assert!(enc.levels.windows(2).all(|w| w[0].bin <= w[1].bin));
     }
 
     #[test]
