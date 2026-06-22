@@ -35,6 +35,7 @@ rand_pcg     = "0.3"                   # Pcg64 — the named, versioned PRNG (§
 thiserror    = "1"
 num-traits   = "0.2"
 smallvec     = { version = "1", features = ["serde"] }   # FeatureSet backing (§2.7)
+itertools    = "0.13"                  # izip! for the no-indexing loss/engine hot loops (§05/§06)
 multiversion = "0.7"                   # runtime-dispatched SIMD; safe (§11)
 pulp         = "0.18"                  # safe SIMD abstraction; safe (§11)
 # pyo3/numpy 0.29 clears RUSTSEC-2026-0177 (a missing `Sync` bound on

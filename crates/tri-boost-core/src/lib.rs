@@ -45,7 +45,7 @@ pub use data::{
 
 pub use cat::{CatEncoder, CatEncoderStore, TsEncodingId};
 
-pub use loss::{GradHess, Link, Loss, LossId, Metric, ObjectiveTag};
+pub use loss::{GradHess, Link, Loss, LossId, Metric, ObjectiveTag, SquaredError};
 
 pub use engine::{
     Booster, ExactnessMode, FitSpec, GradScale, Hist, Model, ModelSchema, ObliviousTree,
