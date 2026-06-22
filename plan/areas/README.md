@@ -10,4 +10,3 @@ Granular per-area task lists behind [`../README.md`](../README.md) (the assemble
 - [M4 — predictiveness boosters](05-m4-predictiveness.md)
 - [M5 — Python, inference & performance](06-m5-python-inference-perf.md)
 - [M6 — the v1.5 benchmark gate](07-m6-benchmark-gate.md)
-- [Critic findings (record)](critique.md)

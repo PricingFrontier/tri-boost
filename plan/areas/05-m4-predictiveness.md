@@ -4,9 +4,9 @@
 
 These are the accuracy levers, and every one of them is a trap for exactness — the temptation is to bolt on a non-linear calibration, a foreign teacher margin, or a learned meta-weight, all of which silently inflate interaction order and break I2. The structural defense is that **§09 owns no tree-shape decision**: every booster touches only the *loss target*, the *leaf scalars*, the *tree alphas*, or a *convex average of banks*. So I built the sequencing around two hard rules. First, **nothing in this milestone may merge until the five Invariant gates (§13.1) and the determinism gate (§13.4) — already build-blocking from the green spine (G0–G3, §14.2) — re-pass with the booster ON.** Each task's Definition-of-Done is "those gates green with the lever enabled," not "code written." This is the §09.7 decomposition-safety property test, made the literal merge condition. Second, every booster ships **with its inert-default oracle written first**: `blend=1.0` reproduces the non-distilled fit bit-for-bit, `RefitSpec::Off` / `NesterovSpec::Off` / `EnsembleSpec::Off` are identity, so the first thing each PR proves is that the default-off path changes nothing — the firewall (§3, `ExactnessMode`) and the gate are one wall.
 
-I deliberately front-load the two **leverage primitives** the other tasks depend on: the §08 purification-linearity proptest (`purify(Σαf) = Σα·purify(f)`, Lengerich Cor 2.2) and the `wht8` Faith-Shap cross-check oracle (§13.7a). The linearity proptest is the *license* for ensemble averaging and refit; the wht8 oracle is an independent second route to the order-3 coefficient. Both are tests, both gate everything downstream, so the math identity is verified before any code leans on it. These extend a model that is already exactly decomposable (the green spine, §14.2) — I reference G3's five checks and the §13.4 determinism gate rather than re-specifying them.
+I deliberately front-load the two **leverage primitives** the other tasks depend on: the §08 purification-linearity proptest (`purify(Σαf) = Σα·purify(f)`, Lengerich Cor 2.2) and the `wht8` Faith-Shap cross-check oracle (§13.7a). The linearity proptest is the *license* for ensemble averaging and refit; the wht8 oracle is an independent second route to the order-3 coefficient. Note the two non-trivial implementations these tasks *lean on* are owned elsewhere and only **referenced** here, never re-implemented: the `BlendedLoss` soft-target adaptor is owned by M2 (M2-H, §05.7) and the `wht8` Walsh–Hadamard accumulator is owned by M2 (M2-J, §07.4a). M4-1 *uses* M2-H's `BlendedLoss`; M4-12 *uses* M2-J's `wht8`. Both primitives are tests-or-loss-code that gate everything downstream, so the math identity is verified before any code leans on it. These extend a model that is already exactly decomposable (the green spine, §14.2) — I reference G3's five checks and the §13.4 determinism gate rather than re-specifying them.
 
-Build order follows §09.8 / §14: **v1.5 = M4-1…M4-7 (distillation + ensemble)**, then **v2 = M4-8…M4-12 (refit, Nesterov, MVS-gate, DART/knobs)**. The one genuinely-open fork (refit/AGBM default-on, §14.6.1) stays off, decided only by a benchmark task at the end.
+Build order follows §09.8 / §14: **v1.5 = M4-1…M4-7 (distillation + ensemble)**, then **v2 = M4-8…M4-10 + M4-13 (refit, Nesterov, the open default-on fork)**. The §06-owned row sampler that dominates GOSS — **Minimal Variance Sampling — is a v1.5 lever, implemented in M5 (M5-MVS)**; M4-11 is the §09-side decomposition-safety *gate* pointing at that implementation (plus the v2 DART/`random_strength` knobs). The one genuinely-open fork (refit/AGBM default-on, §14.6.1) stays off, decided only by a benchmark task at the end.
 
 ---
 
@@ -19,11 +19,11 @@ Build order follows §09.8 / §14: **v1.5 = M4-1…M4-7 (distillation + ensemble
 - **DoD:** the four `proptest` properties green under `ProductMarginals` and `Uniform` (`ProptestConfig{cases:256}`, frozen seed, §13.3); `cargo clippy -D warnings`, `fmt --check`, doctests green.
 - **Size:** S
 
-### M4-1 — `BlendedLoss` soft-target adaptor + blend-polarity gate
-- **Spec:** §05.7, §09.2.
-- **Deliverable:** `BlendedLoss { base: &dyn Loss, soft_target: &[f32], blend: f32 }` in §05's module (the §09 path *uses* it): `grad_hess` calls `base.grad_hess` twice (once on true `y`, once on `teacher_raw`) and combines in fixed order `g = blend·g_true + (1−blend)·g_soft`; `deviance`/`init_score` delegate to `base` on true `y`; `?`-propagates both passes. Clamp `blend∈[0,1]`, reject NaN → `PbError::InvalidConfig`.
-- **Depends on:** v1 loss set (§14.2 P4 / G4).
-- **DoD:** §13.3 loss test green — **`blend=1.0` reproduces base `grad_hess` bit-for-bit**, `blend=0.0` is pure-soft; finite-difference g/h match (1e-3 rel); NaN/out-of-range blend → correct `PbError` variant (§13.8 per-fn variant test); no-panic lints green.
+### M4-1 — `FitSpec.distill` wiring over M2's `BlendedLoss` + distilled decomposition-safety gate
+- **Spec:** §05.7 (BlendedLoss, owned by M2-H), §09.2.
+- **Deliverable:** **Reference, do not re-implement, the `BlendedLoss { base: &dyn Loss, soft_target: &[f32], blend: f32 }` adaptor owned by M2 (M2-H, §05.7)** — the convex fixed-order `g = blend·g_true + (1−blend)·g_soft`, `?`-propagating both passes, `blend∈[0,1]` clamp, NaN→`PbError::InvalidConfig`, and the `blend=1.0`-reproduces-base bit-for-bit oracle all live there. M4-1 = the §09 *consumer*: wire the `teacher_raw`-consuming path so each boosting iteration's `grad_hess` is M2-H's `BlendedLoss` over `teacher_raw`, and stand up the **decomposition-safety gate** on the resulting distilled model (core `teacher_raw` distillation only — the engine-side path, no foreign teacher). The plumbing surface (`DistillSpec`, `FitSpec.distill`) is detailed in M4-2.
+- **Depends on:** M2-H (`BlendedLoss`, §14.2 P4 / G4).
+- **DoD:** **all five Invariant gates (§13.1) + determinism gate `{1,2,8}` (§13.4) green on a `teacher_raw`-distilled model**; model exports `Exact` tables (firewall stays `Exact`, §3); inert oracle: `distill=None` ≡ `blend=1.0` byte-identical to the non-distilled fit (§09.7); a synthetic order-3 teacher matched to float tolerance (≤3rd-order-projection property, §09.7); no re-implementation of `BlendedLoss` (the §05.7 type is M2-H's — referenced, not copied); no-panic lints green.
 - **Size:** S
 
 ### M4-2 — `DistillSpec` plumbing + distilled-fit decomposition-safety gate
@@ -33,12 +33,12 @@ Build order follows §09.8 / §14: **v1.5 = M4-1…M4-7 (distillation + ensemble
 - **DoD:** **all five Invariant gates (§13.1) + determinism gate `{1,2,8}` (§13.4) green on a distilled model**; model exports `Exact` tables (firewall stays `Exact`, §3); inert oracle: `distill=None` ≡ `blend=1.0` byte-identical to non-distilled fit (§09.7); synthetic order-3 teacher matched to float tolerance (≤3rd-order-projection property, §09.7); `ShapeMismatch` variant test.
 - **Size:** M
 
-### M4-3 — CatBoost teacher helper (Python, data-side only)
-- **Spec:** §09.2, §12 (R-DISTILL), feature-flag `distill` (skeleton §1).
-- **Deliverable:** Python-side `distill` helper in `python/`: fits CatBoost, returns `(teacher_raw in our score-space F, blend)` for `TriBoost*.fit(..., distill=)` / `teacher_raw=`. Behind the `distill` cargo/extra feature; **tri-boost-core never links CatBoost**. Caller-aligned link documented.
-- **Depends on:** M4-2; v1 Python bindings (§14.2 P7 / G7).
-- **DoD:** Python CI (§13.10) green with and without the `distill` extra; default build (no `distill`) compiles and passes all gates (feature-flag matrix, §1); a direct-vs-distilled **A/B** smoke (pytest) shows the distilled model is still `Exact` and round-trips; no pyo3/CatBoost dep leaks into core (grep gate).
-- **Size:** M
+### M4-3 — CatBoost teacher helper — MOVED to M5 (M5-TEACHER)
+- **Spec:** §12 (R-DISTILL), §09.2.
+- **Status:** **MOVED out of M4 to M5 (M5-TEACHER, §12, size S).** The Python, data-side CatBoost teacher helper (fits CatBoost, returns `teacher_raw` in our score-space `F` aligned to training rows, for `TriBoost*.fit(..., teacher_raw=)`) belongs with the M5 Python binding (it depends on M5's `PyBooster`/sklearn surface, M5-T8), not the engine milestone — so the **M5-T8 cross-milestone dependency is removed from M4 entirely**. M4 retains **only the engine-side `teacher_raw` distillation** (M4-1 / M4-2): the core consumes a row-aligned `teacher_raw` it is *handed*; it never produces one and **tri-boost-core never links CatBoost**. The direct-vs-distilled A/B harness and the teacher-helper DoD travel with M5-TEACHER.
+- **Depends on:** — (the helper's deps — M5-TEACHER → M5-T8 + M4 core distillation — are stated at M5-TEACHER).
+- **DoD:** none in M4 (see M5-TEACHER).
+- **Size:** — (moved)
 
 ### M4-4 — `average_banks` + outer-bag on-ramp (`EnsembleSpec::OuterBag`)
 - **Spec:** §09.5 (4 exact-mechanics rules), §08.2 (union grid), §13.3 linearity.
@@ -89,17 +89,17 @@ Build order follows §09.8 / §14: **v1.5 = M4-1…M4-7 (distillation + ensemble
 - **DoD:** **five Invariant gates + determinism gate green**; alpha-folded `Model.trees` scores **bit-identically** to the three-sequence accumulation (§09.7); on quadratic loss matches closed-form accelerated trajectory; `NesterovSpec::Off` byte-identical oracle.
 - **Size:** L
 
-### M4-11 — MVS decomposition-safety gate + DART/`random_strength` knobs
-- **Spec:** §09.6 (DART, `random_strength`), §06.5 (MVS sampler — owned by §06).
-- **Deliverable:** §09-side **decomposition-safety + determinism gate** for the §06-owned MVS sampler (booster-facing test, not the sampler). `DartSpec{drop_rate,normalize}` with the `1/(k+1)` / `k·(k+1)⁻¹` renormalization folded into alphas; `random_strength: f32` noise from the deterministically re-seeded `Pcg64` (§1).
-- **Depends on:** M4-7; §06 MVS (§14.3).
-- **DoD:** **five gates + determinism gate green under MVS, DART, and `random_strength`**; DART non-unit-weight fold reproduces pre-fold score exactly and renormalization preserves total contribution to tolerance (§09.7); `random_strength` noise bit-reproducible across `{1,2,8}` threads (§13.4); all default-off oracles byte-identical.
+### M4-11 — MVS decomposition-safety gate (points at M5-MVS) + DART/`random_strength` knobs
+- **Spec:** §09.6 (DART, `random_strength`), §06 (Minimal Variance Sampling — the `Sampling::Mvs` engine path **implemented in M5-MVS, v1.5**).
+- **Deliverable:** the §09-side **decomposition-safety + determinism gate** for the **M5-MVS** sampler — a booster-facing test that verifies the M5 `Sampling::Mvs` path **preserves exactness and determinism** (the sampler itself is NOT implemented here, and is NOT a v2 item; it is the v1.5 M5-MVS task). Plus the v2 knobs: `DartSpec{drop_rate,normalize}` with the `1/(k+1)` / `k·(k+1)⁻¹` renormalization folded into alphas; `random_strength: f32` noise from the deterministically re-seeded `Pcg64` (§1).
+- **Depends on:** M4-7; **M5-MVS** (the v1.5 `Sampling::Mvs` implementation this gate points at).
+- **DoD:** **five gates + determinism gate green under MVS (M5-MVS), DART, and `random_strength`**; DART non-unit-weight fold reproduces pre-fold score exactly and renormalization preserves total contribution to tolerance (§09.7); `random_strength` noise bit-reproducible across `{1,2,8}` threads (§13.4); all default-off oracles byte-identical.
 - **Size:** M
 
-### M4-12 — `wht8` ↔ purification Faith-Shap cross-check oracle
-- **Spec:** §13.7a, §07 (`wht8`), §08.5 (Faith-Shap), §09 intro.
-- **Deliverable:** `fn assert_wht8_triple_matches_purified(tree, w, tol)` — `proptest` over random depth-3 leaf vectors and random positive per-cut `w`-marginals asserting the `wht8` order-3 coefficient `c_123` equals the per-tree order-3 Faith-Shap from §08's mass-moving path, to a derived `wht8_tol`; all eight coefficients checked. **Single-tree only** (coefficients never summed across trees).
-- **Depends on:** M4-0; §07 `wht8` (§14.2 P5).
+### M4-12 — `wht8` ↔ purification Faith-Shap cross-check ORACLE test (over M2's `wht8`)
+- **Spec:** §13.7a, §07.4a (`wht8`, owned by M2-J), §08.5 (Faith-Shap), §09 intro.
+- **Deliverable:** **the cross-check oracle TEST only — references, does not re-implement, the `wht8` Walsh–Hadamard/Möbius transform owned by M2 (M2-J, §07.4a).** `fn assert_wht8_triple_matches_purified(tree, w, tol)` — a `proptest` over random depth-3 leaf vectors and random positive per-cut `w`-marginals asserting M2-J's `wht8` order-3 coefficient `c_123` equals the per-tree order-3 Faith-Shap from §08's mass-moving path, to a derived `wht8_tol`; all eight coefficients checked. **Single-tree only** (coefficients never summed across trees). No accumulator code lives here; this is the independent second route that gates the order-3 coefficient M2-J produces.
+- **Depends on:** M4-0; **M2-J** (`wht8`, §14.2 P5).
 - **DoD:** oracle **[GATE]** green under `ProductMarginals`/`Uniform`; `Joint` arm **[CHECK]** (looser tol, non-blocking) per §13.7a; negative property — no `wht8` accumulator element is read by `assert_exact_decomposition` (§13.1).
 - **Size:** M
 
@@ -112,4 +112,4 @@ Build order follows §09.8 / §14: **v1.5 = M4-1…M4-7 (distillation + ensemble
 
 ---
 
-**Sequencing rationale:** M4-0 (linearity proptest) and the inert-oracle discipline gate everything — no booster builds on an unverified identity. v1.5 ships M4-1…M4-7 (distillation, ensemble on-ramp, full selection, config wiring) + M4-8 (`reanchor`, trivially exact). v2 ships M4-9…M4-11 (refit, Nesterov, MVS-gate/DART/knobs), M4-12 (the cross-check oracle, which can land any time after M4-0 + §07 `wht8`), and M4-13 resolves the lone open default-on fork last, behind a benchmark. Every task's "done" is gates-green-with-the-lever-on, so exactness and reproducibility are a byproduct of the merge condition, never an audit.
+**Sequencing rationale:** M4-0 (linearity proptest) and the inert-oracle discipline gate everything — no booster builds on an unverified identity. v1.5 ships M4-1…M4-7 (distillation over M2-H's `BlendedLoss`, ensemble on-ramp, full selection, config wiring) + M4-8 (`reanchor`, trivially exact). **Minimal Variance Sampling is a v1.5 lever, implemented in M5 (M5-MVS); it is not pushed to v2.** v2 ships M4-9, M4-10 (refit, Nesterov), the v2 DART/`random_strength` knobs (the rest of M4-11), and M4-13 resolves the lone open default-on fork last, behind a benchmark. M4-11's MVS-side work is the §09 *decomposition-safety gate* pointing at M5-MVS (it can land once M5-MVS exists); M4-12 (the cross-check oracle over M2-J's `wht8`) can land any time after M4-0 + M2-J. Every task's "done" is gates-green-with-the-lever-on, so exactness and reproducibility are a byproduct of the merge condition, never an audit.
