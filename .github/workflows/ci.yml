@@ -1,0 +1,124 @@
+name: Correctness CI
+
+# The build-blocking gate set (spec §02.7 / §13, plan F3). Every gate runs on every
+# PR and on pushes to main, over the PURE core (no Python toolchain in the loop). The
+# first line of feature code physically cannot merge if it panics, is unformatted,
+# leaks a non-typed error, breaks reproducibility, or violates an invariant.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- Format + lint + the no-panic deny set + grep-gates ----------------
+  lint:
+    name: fmt + clippy + grep-gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Fmt
+        run: cargo fmt --all --check
+      - name: Clippy (no-panic deny set, all targets, all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Grep-gates (no-box-dyn / justified / wire-width / no-hashmap)
+        run: cargo run -p xtask -- check-all
+
+  # ---- Tests + doctests + the invariant & determinism harnesses ----------
+  test:
+    name: test + doctests + invariants + determinism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (all features)
+        run: cargo test -p tri-boost-core --all-features
+      - name: Test (no default features)
+        run: cargo test -p tri-boost-core --no-default-features
+      - name: Doctests
+        run: cargo test -p tri-boost-core --doc
+      - name: Determinism gate ({1,2,8}-thread byte-equality)
+        run: cargo test -p tri-boost-core --test determinism
+      - name: Invariant gate (G0 five checks + feature budget)
+        run: cargo test -p tri-boost-core --test invariants_gate
+      - name: Overflow-checks liveness
+        run: cargo test -p tri-boost-core --test overflow_trap
+
+  # ---- MSRV: build + test on exactly the pinned floor --------------------
+  msrv:
+    name: MSRV (1.74)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # MSRV bumped from the spec's original 1.64: the `[workspace.lints]` table this
+      # workspace relies on was stabilised in Rust 1.74, so 1.64 was never achievable
+      # alongside lint inheritance. FLAG: reconcile spec §1/§02 MSRV 1.64 -> 1.74.
+      - uses: dtolnay/rust-toolchain@1.74.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build + test on MSRV
+        run: |
+          cargo build -p tri-boost-core --all-features
+          cargo test -p tri-boost-core --all-features
+
+  # ---- Feature-matrix builds (each flag composes independently) ----------
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build each feature combination
+        run: |
+          cargo build -p tri-boost-core --no-default-features
+          cargo build -p tri-boost-core --no-default-features --features arrow
+          cargo build -p tri-boost-core --no-default-features --features distill
+          cargo build -p tri-boost-core --no-default-features --features nightly
+          cargo build -p tri-boost-core --all-features
+      - name: Benches compile
+        run: cargo bench -p tri-boost-core --no-run
+
+  # ---- No-pyo3-in-core + wasm32 smoke build (the no-Python guarantee) ----
+  portability:
+    name: NoPyo3 + wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: NoPyo3 (pyo3/numpy must be absent from the core dep graph)
+        run: |
+          if cargo tree -p tri-boost-core --all-features -e normal | grep -E 'pyo3|numpy'; then
+            echo "::error::pyo3/numpy leaked into tri-boost-core"; exit 1
+          fi
+      - name: Wasm32 smoke build (fixed-width index fields, no usize on the wire)
+        run: cargo build -p tri-boost-core --target wasm32-unknown-unknown
+
+  # ---- Supply chain: licenses, advisories, bans, sources -----------------
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

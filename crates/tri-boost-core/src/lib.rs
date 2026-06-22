@@ -1,0 +1,65 @@
+//! # tri-boost-core
+//!
+//! A depth-3 **oblivious** gradient boosting machine that is *exactly* decomposable
+//! into ≤3rd-order functional-ANOVA tables — the "rating tables" — without
+//! sacrificing speed or accuracy. Every tree is a depth-`1..=3` symmetric tree with
+//! one shared `(feature, threshold)` test per level and at most three distinct raw
+//! features, so the trained ensemble truncates exactly at the 3rd interaction order.
+//!
+//! This crate is **pure Rust** (no Python; verified by the `NoPyo3` CI gate) and is
+//! built to a high engineering standard enforced *structurally*:
+//!
+//! * `#![forbid(unsafe_code)]` on the whole core (SIMD arrives via safe wrappers).
+//! * The no-panic gate — `unwrap`/`expect`/`panic`/`unreachable`/`indexing_slicing`
+//!   are denied — so the single [`PbError`] enum is the only way to surface failure.
+//! * `#![deny(missing_docs)]` — every public item is documented.
+//! * The five lossless I2 invariants + the I1 feature budget are *real,
+//!   build-blocking checks* ([`explain`]), live from the first commit.
+//!
+//! Module layout is 1:1 with the spec's section-ownership map (§4).
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+pub mod backend;
+pub mod boosters;
+pub mod cat;
+pub mod constraints;
+pub mod data;
+pub mod engine;
+pub mod error;
+pub mod explain;
+pub mod loss;
+pub mod serialize;
+pub mod simd;
+
+// --- Canonical re-exports (spec §2 single source of truth). ---------------
+
+pub use error::{Invariant, PbError};
+
+pub use backend::{pb_seed, CpuBackend};
+
+pub use data::{AxisKind, AxisProvenance, BinnedMatrix, BorderGrid, FeatureId};
+
+pub use cat::{CatEncoder, CatEncoderStore, TsEncodingId};
+
+pub use loss::{GradHess, Link, Loss, LossId, Metric, ObjectiveTag};
+
+pub use engine::{
+    Booster, ExactnessMode, FitSpec, GradScale, Hist, Model, ModelSchema, ObliviousTree,
+    QuantGradHess, Split,
+};
+
+pub use constraints::{InteractionPolicy, MonoSign, MonotoneMap};
+
+pub use explain::{
+    assert_exact_decomposition, check_feature_budget, AxisId, EffectTable, ExactTol, FeatureSet,
+    RefMeasure, TableBank, Tensor,
+};
+
+pub use boosters::{DistillSpec, TeacherKind};
+
+pub use serialize::{
+    decode_doc, decode_model, encode_doc, encode_model, ModelDoc, FORMAT_VERSION, SCHEMA_VERSION,
+};
+
+pub use simd::CHUNK_ROWS;

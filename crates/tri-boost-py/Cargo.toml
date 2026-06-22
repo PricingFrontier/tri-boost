@@ -1,0 +1,23 @@
+[package]
+name = "tri-boost-py"
+description = "PyO3 bindings for tri-boost (builds as a Python extension via maturin; not published to crates.io)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Deliberately does NOT inherit `[lints] workspace = true`: the workspace forbids
+# nothing unsafe (that is a core-only crate attribute), and this thin binding is a
+# §12 / Release-CI concern, built via maturin — not by the core's default-member
+# Correctness gates. Lint hardening lands with §12.
+
+[lib]
+name       = "_tri_boost"          # the compiled module is `tri_boost._tri_boost` (§02.7)
+crate-type = ["cdylib"]
+
+[dependencies]
+tri-boost-core = { path = "../tri-boost-core", version = "0.1.0" }
+pyo3  = { workspace = true, features = ["extension-module", "abi3-py310"] }
+numpy = { workspace = true }

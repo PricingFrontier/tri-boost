@@ -1,0 +1,27 @@
+# Python packaging for tri-boost (spec §02.2 / §12). maturin "separated" layout:
+# the Rust extension is built from crates/tri-boost-py and merged with the pure-Python
+# sklearn wrappers under python/tri_boost/. Phase-0 skeleton — the estimators land
+# with §12.
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tri-boost"
+description = "A depth-3 oblivious GBM that is exactly decomposable into ≤3rd-order fANOVA tables."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+# Separated layout: pure-Python sources here, the compiled module built from the py crate.
+python-source = "python"
+module-name = "tri_boost._tri_boost"
+manifest-path = "crates/tri-boost-py/Cargo.toml"
+# abi3 → one wheel per platform, not per interpreter.
+features = ["pyo3/extension-module"]
