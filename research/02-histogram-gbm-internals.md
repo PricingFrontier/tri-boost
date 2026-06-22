@@ -1,6 +1,6 @@
 # Histogram-Based Gradient Boosting Internals — Research Report
 
-This report covers the engineering behind LightGBM/XGBoost/scikit-learn HistGradientBoosting, with exact formulas, and a final section adapting it to `pattern-boost`'s depth-3 oblivious-tree constraint.
+This report covers the engineering behind LightGBM/XGBoost/scikit-learn HistGradientBoosting, with exact formulas, and a final section adapting it to `tri-boost`'s depth-3 oblivious-tree constraint.
 
 ---
 
@@ -96,7 +96,7 @@ Gain  =  ──── ⎢ ───────  +  ───────  −  
 
 ## 4. Parallelism (and mapping to Rust/rayon, SIMD)
 
-**Within a node (single machine — the case that matters for `pattern-boost`):**
+**Within a node (single machine — the case that matters for `tri-boost`):**
 - **Feature-parallel histogram build.** Each thread owns a disjoint subset of features and builds those features' histograms over all instances independently — embarrassingly parallel, no shared mutable state. This is the natural rayon mapping: `features.par_iter().for_each(|f| build_hist(f))` or `par_chunks` over the feature block. Histogram subtraction is done per feature after, also parallelizable.
 - **Data-parallel histogram build** (alternative): partition rows across threads, each builds partial histograms over all features, then reduce-sum. Needs a per-thread histogram buffer + a final reduction; more memory but better load balance when feature count is low. rayon `fold`/`reduce` fits this.
 - LightGBM uses **both**, and across a single machine relies on feature-parallel + the subtraction trick.
@@ -127,7 +127,7 @@ Net: train on ~`(a+b)·n ≈ 30%` of rows per tree with near-unbiased gain estim
 2. Greedy graph-coloring assigns features to bundles, allowing a small **conflict tolerance** (`max_conflict_rate`) of overlapping nonzeros.
 3. Merge by **offsetting bin ranges**: feature `j` with `k_j` bins gets bins `[offset_j, offset_j + k_j)` where offsets are cumulative; the bundle's bin value disambiguates which original feature was nonzero. Optimal bundling is NP-hard; greedy gives a good approximation.
 
-**Worth implementing?** Low priority for `pattern-boost` unless you target high-cardinality sparse/categorical data. It only helps when features are sparse and exclusive (one-hot encodings); on dense numeric data it does nothing. Skip for v1.
+**Worth implementing?** Low priority for `tri-boost` unless you target high-cardinality sparse/categorical data. It only helps when features are sparse and exclusive (one-hot encodings); on dense numeric data it does nothing. Skip for v1.
 
 ---
 
@@ -137,7 +137,7 @@ Net: train on ~`(a+b)·n ≈ 30%` of rows per tree with near-unbiased gain estim
 
 **Dedicated missing bin.** scikit-learn HistGradientBoosting puts NaNs in a **reserved bin** (`missing_values_bin_idx_ = n_bins - 1`). During the split scan it tries assigning that bin to left vs right and keeps the better — equivalent to a learned default direction, integrated into the histogram with no special-casing.
 
-**Sparse / zero handling.** Implicit zeros are treated as a value (often binned with the default direction = the zero side), so sparse matrices need not be densified. EFB (Section 5) further exploits sparsity. For `pattern-boost`: implement the **reserved-missing-bin + try-both-directions** approach — it's the simplest, matches sklearn, and composes cleanly with histograms.
+**Sparse / zero handling.** Implicit zeros are treated as a value (often binned with the default direction = the zero side), so sparse matrices need not be densified. EFB (Section 5) further exploits sparsity. For `tri-boost`: implement the **reserved-missing-bin + try-both-directions** approach — it's the simplest, matches sklearn, and composes cleanly with histograms.
 
 ---
 
@@ -170,15 +170,15 @@ Because the left subtree is capped at `m` and the right subtree floored at `m`, 
 | `learning_rate` (`eta`) | Shrinkage: `ŷ ← ŷ + η·f_t`; the single most important accuracy knob | applied to leaf outputs |
 | `subsample` (`bagging_fraction`) | Row sampling per tree; variance reduction / speed | rows used per tree |
 | `colsample_bytree`/`bylevel`/`bynode` (`feature_fraction`) | Column sampling; decorrelates trees | features considered |
-| `max_depth` / `num_leaves` | Tree capacity (for `pattern-boost`, depth is fixed at 3) | structure size |
+| `max_depth` / `num_leaves` | Tree capacity (for `tri-boost`, depth is fixed at 3) | structure size |
 
-Priority for `pattern-boost` v1: `learning_rate`, `lambda`, `min_sum_hessian_in_leaf` (= `min_child_weight`), `min_data_in_leaf`, `max_bin`, plus `subsample`/`colsample`. `gamma` and `alpha` are secondary.
+Priority for `tri-boost` v1: `learning_rate`, `lambda`, `min_sum_hessian_in_leaf` (= `min_child_weight`), `min_data_in_leaf`, `max_bin`, plus `subsample`/`colsample`. `gamma` and `alpha` are secondary.
 
 ---
 
-## Design implications for `pattern-boost`
+## Design implications for `tri-boost`
 
-`pattern-boost` builds **depth-3 symmetric/oblivious trees**: at each level *all* nodes share **one** `(feature, threshold)` split (CatBoost-style). This changes split-finding fundamentally — the split must be chosen **jointly across all current leaves at that level**, not greedily per node.
+`tri-boost` builds **depth-3 symmetric/oblivious trees**: at each level *all* nodes share **one** `(feature, threshold)` split (CatBoost-style). This changes split-finding fundamentally — the split must be chosen **jointly across all current leaves at that level**, not greedily per node.
 
 **1. Gain is summed over all leaves at the level.** At level `d`, the tree currently has `2^d` leaves (level 0: 1 leaf; level 1: 2; level 2: 4). For a single candidate `(feature k, threshold v)` applied to *every* leaf simultaneously, each leaf `ℓ` splits into `ℓ_L, ℓ_R`. The level gain is the **sum over leaves** of the per-leaf split gains:
 ```
@@ -227,4 +227,4 @@ This applies independently to each of the parent's leaves, so at every level you
 - Structure score: `Obj* = -½ Σ_j G_j²/(H_j+λ) + γT`
 - Histogram subtraction: `Hist_R = Hist_P − Hist_L`
 - GOSS amplification: small-gradient sampled instances scaled by `(1−a)/b`
-- **Oblivious level gain (pattern-boost): `Σ_{leaves ℓ} [per-leaf split gain at (k,v)] − γ`, maximized jointly over `(feature k, threshold v)`**
+- **Oblivious level gain (tri-boost): `Σ_{leaves ℓ} [per-leaf split gain at (k,v)] − γ`, maximized jointly over `(feature k, threshold v)`**

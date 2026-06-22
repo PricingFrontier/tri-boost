@@ -17,34 +17,34 @@ Reference projects converge on: **a pure-Rust core crate (no Python deps) + a th
 **Recommended tree (the maturin "separated" layout):**
 
 ```
-pattern-boost/
+tri-boost/
 ├── Cargo.toml                       # [workspace]; pins pyo3 + shared version at root
 ├── pyproject.toml                   # build-backend="maturin"; python-source, module-name, manifest-path
 ├── rust-toolchain.toml              # pin stable toolchain (MSRV >= 1.64 for manylinux)
 ├── python/
-│   └── pattern_boost/
-│       ├── __init__.py              # re-export from ._pattern_boost; sklearn wrappers live here
-│       ├── _pattern_boost.pyi       # type stubs
+│   └── tri_boost/
+│       ├── __init__.py              # re-export from ._tri_boost; sklearn wrappers live here
+│       ├── _tri_boost.pyi       # type stubs
 │       ├── py.typed
-│       └── sklearn.py               # PatternBoostClassifier/Regressor (thin wrappers)
+│       └── sklearn.py               # TriBoostClassifier/Regressor (thin wrappers)
 ├── crates/
-│   ├── pattern-boost-core/          # (a) PURE Rust: model structs, serde, train/predict, histogram
+│   ├── tri-boost-core/          # (a) PURE Rust: model structs, serde, train/predict, histogram
 │   │   ├── Cargo.toml               #     NO pyo3 dep; crates.io-publishable; Backend trait lives here
 │   │   └── src/{lib,tree,hist,loss,bin,predict,serialize,backend}.rs
-│   └── pattern-boost-py/            # (b) thin pyo3 binding, crate-type=["cdylib"]
-│       ├── Cargo.toml               #     pattern-boost-core = { path=..., version=... } + pyo3
-│       └── src/lib.rs               #     #[pymodule] _pattern_boost
+│   └── tri-boost-py/            # (b) thin pyo3 binding, crate-type=["cdylib"]
+│       ├── Cargo.toml               #     tri-boost-core = { path=..., version=... } + pyo3
+│       └── src/lib.rs               #     #[pymodule] _tri_boost
 ├── tests/                           # python tests (pytest)
 └── benches/                         # criterion benches against the core
 ```
 
-`[tool.maturin]`: `python-source="python"`, `module-name="pattern_boost._pattern_boost"`, `manifest-path="crates/pattern-boost-py/Cargo.toml"`, `features=["pyo3/extension-module"]`.
+`[tool.maturin]`: `python-source="python"`, `module-name="tri_boost._tri_boost"`, `manifest-path="crates/tri-boost-py/Cargo.toml"`, `features=["pyo3/extension-module"]`.
 
 ---
 
 ## 2. PyO3 + maturin
 
-**Exposing Rust to Python.** `#[pyfunction]` for free functions; `#[pyclass]` + `#[pymethods]` (with `#[new]`, `#[pyo3(get,set)]`, `#[getter]`/`#[setter]`); `#[pymodule]` for the module. The module fn name **must equal the last segment of `module-name`** (`_pattern_boost`).
+**Exposing Rust to Python.** `#[pyfunction]` for free functions; `#[pyclass]` + `#[pymethods]` (with `#[new]`, `#[pyo3(get,set)]`, `#[getter]`/`#[setter]`); `#[pymodule]` for the module. The module fn name **must equal the last segment of `module-name`** (`_tri_boost`).
 
 **abi3 / stable ABI.** `pyo3 = { features=["abi3-py310"] }` → wheel `cp310-abi3-…` runs on CPython 3.10 **and every later 3.x** → one wheel per platform. polars and tokenizers both do this. **Limitations:** some features gated (class `text_signature` ≥3.10; buffer API ≥3.11; native subclassing ≥3.12); marginally slower than version-specific builds (why pydantic-core opts out). abi3 does **not** cover free-threaded CPython — PEP 803's `abi3t` is separate.
 
@@ -110,7 +110,7 @@ Expose `n_threads`/`n_jobs` (map `-1`/`None`→all cores, sklearn-style).
 
 **manylinux ↔ Rust.** **Rust ≥1.64 requires glibc ≥2.17**, so **manylinux2014 (glibc 2.17) is the oldest targetable tag**; aarch64 effectively needs **manylinux_2_28**. Keep **MSRV ≥1.64**, pin the toolchain in CI.
 
-**Keep the core crates.io-publishable.** PyO3 lives **only** in `pattern-boost-py`; `pattern-boost-core` has **zero pyo3 dep**. crates.io rejects path-only deps → use both `path` + `version`. **Publish order:** `cargo publish -p pattern-boost-core`, wait for indexing, then the py crate. Share the version via `[workspace.package]`.
+**Keep the core crates.io-publishable.** PyO3 lives **only** in `tri-boost-py`; `tri-boost-core` has **zero pyo3 dep**. crates.io rejects path-only deps → use both `path` + `version`. **Publish order:** `cargo publish -p tri-boost-core`, wait for indexing, then the py crate. Share the version via `[workspace.package]`.
 
 ---
 
@@ -156,23 +156,23 @@ Expose `n_threads`/`n_jobs` (map `-1`/`None`→all cores, sklearn-style).
 - **Tangram** — **dead as an ML project**, but its blog **"Writing the fastest GBDT library in Rust"** remains excellent performance-engineering reading.
 - **Bindings** (not pure Rust): `rust-xgboost`, `xgb`, `lightgbm3-rs` — useful only as benchmark baselines.
 
-**Verdict:** a **clean, fast, well-documented, idiomatic pure-Rust GBM with first-class Polars/Arrow, modern histogram method, monotonic constraints, sklearn-compatible API, and a clean backend abstraction is not a saturated niche.** Perpetual is the incumbent (idiosyncratic); forust + Tangram's blog are the best learning references. **The niche pattern-boost targets is real.**
+**Verdict:** a **clean, fast, well-documented, idiomatic pure-Rust GBM with first-class Polars/Arrow, modern histogram method, monotonic constraints, sklearn-compatible API, and a clean backend abstraction is not a saturated niche.** Perpetual is the incumbent (idiosyncratic); forust + Tangram's blog are the best learning references. **The niche tri-boost targets is real.**
 
 ---
 
-## Design Implications for pattern-boost
+## Design Implications for tri-boost
 
-**Repo layout.** Cargo workspace, maturin "separated" layout: `crates/pattern-boost-core` (pure Rust, **no pyo3**, crates.io-publishable) + `crates/pattern-boost-py` (`cdylib`, thin pyo3 glue) + `python/pattern_boost/` (re-exports compiled `_pattern_boost` + sklearn wrappers + `.pyi`/`py.typed`). pyo3 pinned at the workspace root.
+**Repo layout.** Cargo workspace, maturin "separated" layout: `crates/tri-boost-core` (pure Rust, **no pyo3**, crates.io-publishable) + `crates/tri-boost-py` (`cdylib`, thin pyo3 glue) + `python/tri_boost/` (re-exports compiled `_tri_boost` + sklearn wrappers + `.pyi`/`py.typed`). pyo3 pinned at the workspace root.
 
 **Binding strategy.** PyO3 with **abi3-py310** (one wheel per platform; follow polars/tokenizers). NumPy is the primary I/O: `PyReadonlyArray2<f32>` + `.as_array()` in, `into_pyarray` out (zero-copy); offer `PyArrayLike2<f32, AllowTypeChange>` for ergonomic f64 acceptance. Add an **optional zero-copy Arrow/polars path via pyo3-arrow**. **Release the GIL with `py.detach`** around every compute path.
 
 **Parallelism + SIMD plan.** rayon with a **per-call scoped `ThreadPoolBuilder`** (`pool.install` inside `py.detach`); expose `n_threads`/`n_jobs`. Histograms: **per-thread private buffers via `fold`/`reduce`** (no `Mutex`), cache-line padded, on a **column-major pre-binned `u8`/`u16` store**. Adopt **quantized integer gradients** (autovectorizes, reproducible, halves memory traffic). SIMD: rely on **stable autovectorization + cache layout + `_mm_prefetch`** for the histogram path; **runtime-dispatched intrinsics via `multiversion`** for prediction/loss/gradient kernels. **No nightly `portable_simd` in the shipping core.** Offer a deterministic mode.
 
-**Build/CI plan.** **maturin-action**, tag-triggered matrix; **abi3 → one wheel per (os,arch)**; sdist job; **OIDC Trusted Publishing**. Target **manylinux2014** (x86_64) / **manylinux_2_28** (aarch64); **MSRV ≥1.64**. Build wheels with a **portable AVX2 baseline (`x86-64-v3`)**, lift to AVX-512 at runtime. Publish `pattern-boost-core` to crates.io independently.
+**Build/CI plan.** **maturin-action**, tag-triggered matrix; **abi3 → one wheel per (os,arch)**; sdist job; **OIDC Trusted Publishing**. Target **manylinux2014** (x86_64) / **manylinux_2_28** (aarch64); **MSRV ≥1.64**. Build wheels with a **portable AVX2 baseline (`x86-64-v3`)**, lift to AVX-512 at runtime. Publish `tri-boost-core` to crates.io independently.
 
 **Serialization choice.** **Versioned serde model in the core crate** (`format_version`, `#[serde(default)]`/`alias`, enum-tagged migrations). **Default on-disk format = stable JSON**, with MessagePack as a compact option. **No pickle.**
 
-**Python API.** Native `Booster`-style API in Rust + thin **sklearn wrappers** (`PatternBoostClassifier`/`Regressor`). Implement the **practical sklearn contract** so it works in Pipeline/GridSearchCV/cross_val_score; defer full `check_estimator`.
+**Python API.** Native `Booster`-style API in Rust + thin **sklearn wrappers** (`TriBoostClassifier`/`Regressor`). Implement the **practical sklearn contract** so it works in Pipeline/GridSearchCV/cross_val_score; defer full `check_estimator`.
 
 **GPU recommendation.** **Defer to post-v1.** Ship a fast CPU `hist` GBM; keep the door open via a **`Backend` trait** and a GPU-ready pre-binned columnar layout.
 

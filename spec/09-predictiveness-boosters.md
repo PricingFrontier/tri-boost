@@ -1,4 +1,4 @@
-# pattern-boost — SPEC §09: Predictiveness boosters
+# tri-boost — SPEC §09: Predictiveness boosters
 
 > 2026-06-21. Conforms to `spec/00-spec-skeleton.md` (§1 engineering standards, §2 shared types, §3 invariant contract, §4 ownership). This section OWNS: teacher-distillation training mode; fully-corrective leaf refit; Nesterov/accelerated boosting; bagged greedy ensemble selection (and its outer-bag table-average on-ramp); the residual optional knobs (DART, `random_strength`). It USES `Model.trees` alphas (§06), the `Loss` trait (§05), purification linearity (§08), and the firewall (§3). Single quotes mark inline Rust identifiers.
 
@@ -29,7 +29,7 @@ pub struct BoosterConfig {
 
 ### 09.2 Teacher-distillation training mode
 
-**Decision.** Ship a distillation training mode (v1.5, default off): the booster fits against a teacher's soft score blended with true labels. The distillation target lives in **`FitSpec.distill: Option<DistillSpec>`** (skeleton §2.9), NOT in `BoosterConfig` — it is a per-row-data field (the per-row `teacher_raw` scores), so it belongs with `weight`/`exposure` at `fit` time. **Teacher default is CatBoost** — itself an oblivious-tree ensemble, so distilling takes the ≤3rd-order projection of the *same tree family*, and it carries best-in-class ordered-TS categorical signal matching our Fisher-TS axes (§04). The teacher is consumed data-side only (pattern-boost never links CatBoost; the user, or the optional `distill` Python helper §12, supplies per-row soft scores).
+**Decision.** Ship a distillation training mode (v1.5, default off): the booster fits against a teacher's soft score blended with true labels. The distillation target lives in **`FitSpec.distill: Option<DistillSpec>`** (skeleton §2.9), NOT in `BoosterConfig` — it is a per-row-data field (the per-row `teacher_raw` scores), so it belongs with `weight`/`exposure` at `fit` time. **Teacher default is CatBoost** — itself an oblivious-tree ensemble, so distilling takes the ≤3rd-order projection of the *same tree family*, and it carries best-in-class ordered-TS categorical signal matching our Fisher-TS axes (§04). The teacher is consumed data-side only (tri-boost never links CatBoost; the user, or the optional `distill` Python helper §12, supplies per-row soft scores).
 
 **What changes — only the target.** A `Loss`-target substitution; never the split-finder, histogram engine, or tree shape. Given teacher raw scores `t` (in *our* score space `F`, pre-link — caller aligns the link) and labels `y`, each iteration fits gradients against a blended target
 

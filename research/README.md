@@ -1,11 +1,11 @@
-# pattern-boost — Research
+# tri-boost — Research
 
 This folder is the research record behind [`../AIM.md`](../AIM.md). It comes in two rounds, both produced by parallel research agents (2026-06-21) instructed to verify claims against **primary sources** (the CatBoost / LightGBM / XGBoost papers, docs and source code, the fANOVA / purification / EBM literature, the actuarial-pricing literature, and the PyO3 / maturin / rust-numpy / rayon docs and reference repos). Formulas and citations are preserved as returned.
 
 - **Round 1 — the pillars (`01`–`05`):** five deep dives into the core technical foundations.
-- **Round 2 — the technique inventory ([`06-techniques/`](06-techniques/)):** an exhaustive sweep of **229** techniques across all three libraries *and* the current GBM research frontier, each adversarially assessed against pattern-boost's two hard invariants (depth-3 oblivious structure + exact ≤3rd-order fANOVA tables) and prioritized v1 / v1.5 / v2 / research / skip.
+- **Round 2 — the technique inventory ([`06-techniques/`](06-techniques/)):** an exhaustive sweep of **229** techniques across all three libraries *and* the current GBM research frontier, each adversarially assessed against tri-boost's two hard invariants (depth-3 oblivious structure + exact ≤3rd-order fANOVA tables) and prioritized v1 / v1.5 / v2 / research / skip.
 
-These documents are **research, not decisions**. Each ends with a "Design implications for pattern-boost" section (round 1) or a per-technique verdict + priority (round 2) that proposes a direction; those proposals feed the spec but are not yet committed.
+These documents are **research, not decisions**. Each ends with a "Design implications for tri-boost" section (round 1) or a per-technique verdict + priority (round 2) that proposes a direction; those proposals feed the spec but are not yet committed.
 
 ## Contents
 

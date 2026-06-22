@@ -1,6 +1,6 @@
 # SPEC-README
 
-pattern-boost is a gradient boosting machine library (pure-Rust core `pattern-boost-core` + Python bindings `pattern_boost`) whose defining property is that **the trained model is exactly explainable by construction**. This `spec/` directory is the binding contract: the canonical skeleton (`00-spec-skeleton.md`) plus 14 numbered sections (`01`–`14`). This README is the index, decision log, glossary, and the pre-final fix list.
+tri-boost is a gradient boosting machine library (pure-Rust core `tri-boost-core` + Python bindings `tri_boost`) whose defining property is that **the trained model is exactly explainable by construction**. This `spec/` directory is the binding contract: the canonical skeleton (`00-spec-skeleton.md`) plus 14 numbered sections (`01`–`14`). This README is the index, decision log, glossary, and the pre-final fix list.
 
 ## The three aims (every decision serves these, in tension-managed balance)
 

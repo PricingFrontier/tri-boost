@@ -1,4 +1,4 @@
-# pattern-boost — Brainstorm from the Explainability Purist (fANOVA / Identifiability) Lens
+# tri-boost — Brainstorm from the Explainability Purist (fANOVA / Identifiability) Lens
 
 ## 1. Thesis / the bet
 
@@ -12,7 +12,7 @@ My bet is that "perfect explainability" is not a property of the *trees* — it 
 
 - **Raw accumulation then high→low purification cascade** [EXPLAINABILITY]. Expand each tree onto its feature-set grid, sum into `T^raw_u`, then `PURIFY` 3-way→2-way→1-way→intercept (Lengerich Alg. 2). Mechanism: mass-moving subtracts a slice mean from `T_u` and adds it to `T_{u\i}`, conserving the prediction sum exactly while driving every slice to zero-mean. Tradeoff: none structurally (linearity, Cor. 2.2, means purify-per-tree-and-sum ≡ sum-then-purify, so it can even stream); the only cost is the measure choice it forces us to make explicit.
 
-- **The decomposition is COMPLETE, not truncated** [EXPLAINABILITY]. Because every tree has ≤3 features, there are *provably no* order-≥4 components to discard. State this loudly: pattern-boost's tables are exhaustive, unlike EBM (caps at 2) or any post-hoc fANOVA on a black box (truncates and approximates).
+- **The decomposition is COMPLETE, not truncated** [EXPLAINABILITY]. Because every tree has ≤3 features, there are *provably no* order-≥4 components to discard. State this loudly: tri-boost's tables are exhaustive, unlike EBM (caps at 2) or any post-hoc fANOVA on a black box (truncates and approximates).
 
 ### B. The reference-measure decision (the most consequential call)
 

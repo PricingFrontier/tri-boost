@@ -14,7 +14,7 @@ Any square-integrable function `F(X)`, `X = (X_1, ..., X_d)`, can be written as 
 F(X) = f_0 + Σ_i f_i(X_i) + Σ_{i<j} f_ij(X_i, X_j) + Σ_{i<j<k} f_ijk(...) + ...
 ```
 
-(Lengerich Eq. 4; Hutter §3.1). For `pattern-boost`, because every tree depends on ≤3 features, all components with `|u| > 3` are identically zero, so the sum **truncates exactly at 3rd order** — this is the structural fact the whole design exploits.
+(Lengerich Eq. 4; Hutter §3.1). For `tri-boost`, because every tree depends on ≤3 features, all components with `|u| > 3` are identically zero, so the sum **truncates exactly at 3rd order** — this is the structural fact the whole design exploits.
 
 ### 1.2 Recursive (centering) formula for components
 
@@ -132,7 +132,7 @@ PURIFY(T, w, Ω):
 
 Mass cascades **down the order lattice**: triples → pairs → mains → intercept. Processing strictly from high to low order guarantees that once `T_u` is purified, later operations on its sub-tensors do not re-pollute it. At convergence `{T_u}` is exactly the fANOVA decomposition (unique under non-degenerate `w`).
 
-### 2.5 Key properties (operationally important for `pattern-boost`)
+### 2.5 Key properties (operationally important for `tri-boost`)
 
 - **Convergence.** Define unpurified mass `M_t = Σ_{i,j} w_{ij}(|r_i| + |c_j|)` where `r_i, c_j` are weighted row/column sums.
   - *Uniform (or any axis-constant) weight:* converges in a **single pass** per axis — `M_t = 0 ∀ t ≥ 2` (Theorem 1). This is ordinary "double-centering."
@@ -185,7 +185,7 @@ Restrict to ≤2-D terms; cap the number of pairwise terms (user-controlled); us
 
 ## 4. Accumulating an oblivious-tree ensemble into fANOVA tables
 
-This is the heart of `pattern-boost`. An oblivious (symmetric) depth-`D` tree uses the **same split (feature, threshold) at every node of a given level**, so it is a single multilinear lookup: depth-3 ⇒ at most 3 distinct split features, `2³ = 8` leaves indexed by the bit pattern of the 3 binary tests. Such a tree is *exactly* a piecewise-constant function over its ≤3 features — the ideal input to purification.
+This is the heart of `tri-boost`. An oblivious (symmetric) depth-`D` tree uses the **same split (feature, threshold) at every node of a given level**, so it is a single multilinear lookup: depth-3 ⇒ at most 3 distinct split features, `2³ = 8` leaves indexed by the bit pattern of the 3 binary tests. Such a tree is *exactly* a piecewise-constant function over its ≤3 features — the ideal input to purification.
 
 ### 4.1 Per-tree contribution as a tensor
 
@@ -242,7 +242,7 @@ This holds *exactly* (to floating point) because:
 1. **Accumulation is exact:** the merged-threshold grid (§4.2) represents each tree's piecewise-constant function with zero approximation error, so `Σ_u T^raw_u(x) = F(x)` identically.
 2. **Purification conserves mass:** every mass-move subtracts `m0` from one tensor and adds the *same* `m0` to another (Alg. 1 lines 9–10), so `Σ_u T_u(x)` is invariant under purification. Hence `Σ_u f_u(x) = Σ_u T^raw_u(x) = F(x)`.
 
-**Practical verification protocol for `pattern-boost`:**
+**Practical verification protocol for `tri-boost`:**
 - *Algebraic check:* assert `max_x | F_ensemble(x) − Σ_u f_u(x_u) | < tol` over (a) all training rows and (b) a random sample of grid-cell corners (the worst case, since the function is constant within cells). Because the function is piecewise-constant on the merged grid, checking one interior point per cell is exhaustive.
 - *Mass-conservation check:* track total signed mass before/after purify; it must be unchanged.
 - *Purity check:* assert every 1-D slice weighted mean `m(T_u,i,·) ≈ 0` for all `u` with `|u|≥1` (the fANOVA zero-mean condition) — this confirms canonical form, not just losslessness.
@@ -259,7 +259,7 @@ This holds *exactly* (to floating point) because:
 
 ---
 
-## Design implications for `pattern-boost`
+## Design implications for `tri-boost`
 
 **Recommended decomposition + purification pipeline**
 

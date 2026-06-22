@@ -1,12 +1,12 @@
 ## 12 — Python API & interop
 
-> Owns: the PyO3 binding crate `pattern-boost-py` (compiled module `pattern_boost._pattern_boost`), the maturin layout, the sklearn-compatible estimators, the native `Booster` Python surface (custom objectives, callbacks, early stopping), the explanation/table-export API, NumPy zero-copy + the optional Arrow path, GIL release, `.pyi` stubs, and the `PbError`→Python-exception mapping. Uses (does not own): `Booster`/`FitSpec`/`Model`/`PbError` (§02, §06), `Loss` (§05), `TableBank` (§08), serde (§10), the scoped rayon pool (§11). I1/I2 are upheld here purely by *delegation* — the binding never constructs trees or tables, it only marshals into the core, which enforces the invariants.
+> Owns: the PyO3 binding crate `tri-boost-py` (compiled module `tri_boost._tri_boost`), the maturin layout, the sklearn-compatible estimators, the native `Booster` Python surface (custom objectives, callbacks, early stopping), the explanation/table-export API, NumPy zero-copy + the optional Arrow path, GIL release, `.pyi` stubs, and the `PbError`→Python-exception mapping. Uses (does not own): `Booster`/`FitSpec`/`Model`/`PbError` (§02, §06), `Loss` (§05), `TableBank` (§08), serde (§10), the scoped rayon pool (§11). I1/I2 are upheld here purely by *delegation* — the binding never constructs trees or tables, it only marshals into the core, which enforces the invariants.
 
 ### 12.1 Decisions (with defaults)
 
-1. **Binding shape: `cdylib` + abi3-py310.** `pattern-boost-py` is `crate-type=["cdylib"]`, `pyo3 = { features=["extension-module","abi3-py310"] }`, one wheel per `(os,arch)` across CPython ≥3.10 (polars/tokenizers pattern). The `#[pymodule]` fn is named `_pattern_boost`. `pattern-boost-core` carries **zero** pyo3 dependency.
-2. **Two-layer API, native-in-Rust + sklearn-in-Python.** The `#[pyclass]` layer (`_Booster`, `_Model`, `_TableBank`) is a thin marshalling shell around the core handles. The sklearn estimators (`PatternBoostRegressor`, `PatternBoostClassifier`) are **pure Python** in `python/pattern_boost/sklearn.py` wrapping `_Booster` — keeping the 1:1 `__init__`↔attribute mirror that `get_params`/`set_params`/`clone` require out of Rust, where it is awkward.
-3. **f32 core, f64-tolerant edge.** The native zero-copy path is `PyReadonlyArray2<'py, f32>`. The sklearn layer additionally accepts float64 (the numpy/pandas default) via an explicit, *copying* `f64→f32` cast at the Python boundary with a one-time `RuntimeWarning` (`pattern_boost.PrecisionWarning`), never a silent native-side cast.
+1. **Binding shape: `cdylib` + abi3-py310.** `tri-boost-py` is `crate-type=["cdylib"]`, `pyo3 = { features=["extension-module","abi3-py310"] }`, one wheel per `(os,arch)` across CPython ≥3.10 (polars/tokenizers pattern). The `#[pymodule]` fn is named `_tri_boost`. `tri-boost-core` carries **zero** pyo3 dependency.
+2. **Two-layer API, native-in-Rust + sklearn-in-Python.** The `#[pyclass]` layer (`_Booster`, `_Model`, `_TableBank`) is a thin marshalling shell around the core handles. The sklearn estimators (`TriBoostRegressor`, `TriBoostClassifier`) are **pure Python** in `python/tri_boost/sklearn.py` wrapping `_Booster` — keeping the 1:1 `__init__`↔attribute mirror that `get_params`/`set_params`/`clone` require out of Rust, where it is awkward.
+3. **f32 core, f64-tolerant edge.** The native zero-copy path is `PyReadonlyArray2<'py, f32>`. The sklearn layer additionally accepts float64 (the numpy/pandas default) via an explicit, *copying* `f64→f32` cast at the Python boundary with a one-time `RuntimeWarning` (`tri_boost.PrecisionWarning`), never a silent native-side cast.
 4. **NumPy is primary; Arrow is optional.** numpy in/out is always available. The Arrow PyCapsule path (`from_arrow`) is gated behind the core `arrow` cargo feature and the `pyo3-arrow` dep; absent the feature, `from_arrow` raises `NotImplementedError`.
 5. **GIL released around all compute** via `py.detach`, with a per-call scoped rayon pool sized by `n_jobs` (sklearn convention: `-1`/`None`→all cores).
 6. **sklearn surface for v1 = the practical contract, not full `check_estimator`.** `fit→self`, `predict`, `predict_proba`/`decision_function` (classifier), `score` (mixin), `get_params`/`set_params`, `n_features_in_`, `feature_names_in_`, `classes_`, `NotFittedError`. This makes `Pipeline`/`GridSearchCV`/`cross_val_score`/stacking work — ~95% of the value — without chasing every `check_estimator` corner.
@@ -17,7 +17,7 @@
 The binding holds owned core values and never re-implements algorithms. `_Booster` stores a `Booster` plus a parsed config; `fit` marshals arrays, builds a `FitSpec`, calls `Booster::fit`, and wraps the resulting `Model`.
 
 ```rust
-#[pyclass(name = "Booster", module = "pattern_boost._pattern_boost")]
+#[pyclass(name = "Booster", module = "tri_boost._tri_boost")]
 pub struct PyBooster { inner: pb_core::Booster, cfg: Config }
 
 #[pymethods]
@@ -193,7 +193,7 @@ impl Loss for PyLoss {
 
 A custom-objective model is `Approximate` only if its declared `link` is non-canonical for table reading; with a declared standard link it stays `Exact` (objective is orthogonal to tree shape — I1/I2 untouched, §3).
 
-**Distillation (R-DISTILL).** Distillation is a `FitSpec` field, not a `BoosterConfig` knob — the per-row teacher scores belong with `weight`/`exposure` in `FitSpec`. The native surface exposes it as `fit(..., teacher_raw=<float32[n_rows]>, blend=0.5, teacher=None)`: when `teacher_raw` is present the binding moves it into a `DistillSpec { teacher_raw, blend, teacher }` (§09) and sets `FitSpec.distill = Some(..)`; `None` ⇒ no distillation (train on `y`). `teacher_raw` is in *our* score space `F` (pre-link, caller-aligned), `blend` is the true-label weight (default 0.5; §09 clamps to `[0,1]` and rejects NaN), and `teacher` is a provenance tag (`"catboost"`/`"lightgbm"`/`"xgboost"`/other → `TeacherKind`, default `Other`) for the model card. The sklearn/Python layer offers a convenience `distill=` argument (or the §12 distill helper) that **fits a CatBoost teacher and supplies `teacher_raw` + `blend`** — pattern-boost never links CatBoost (data-side only, behind the `distill` feature). The binding adds no blending math; `BlendedLoss` (§05) does the gradient blend in core. A distilled model stays `Exact` (only the loss target changes — I1/I2 untouched, §3/§09).
+**Distillation (R-DISTILL).** Distillation is a `FitSpec` field, not a `BoosterConfig` knob — the per-row teacher scores belong with `weight`/`exposure` in `FitSpec`. The native surface exposes it as `fit(..., teacher_raw=<float32[n_rows]>, blend=0.5, teacher=None)`: when `teacher_raw` is present the binding moves it into a `DistillSpec { teacher_raw, blend, teacher }` (§09) and sets `FitSpec.distill = Some(..)`; `None` ⇒ no distillation (train on `y`). `teacher_raw` is in *our* score space `F` (pre-link, caller-aligned), `blend` is the true-label weight (default 0.5; §09 clamps to `[0,1]` and rejects NaN), and `teacher` is a provenance tag (`"catboost"`/`"lightgbm"`/`"xgboost"`/other → `TeacherKind`, default `Other`) for the model card. The sklearn/Python layer offers a convenience `distill=` argument (or the §12 distill helper) that **fits a CatBoost teacher and supplies `teacher_raw` + `blend`** — tri-boost never links CatBoost (data-side only, behind the `distill` feature). The binding adds no blending math; `BlendedLoss` (§05) does the gradient blend in core. A distilled model stays `Exact` (only the loss target changes — I1/I2 untouched, §3/§09).
 
 **Callbacks + early stopping.** A `callbacks=` list of Python callables receives a per-iteration `CallbackEnv` (`{iteration, train_metric, valid_metrics, model_proxy}`); a callback returning `True` requests a stop. `CallbackHost` owns the `Py` handles and, inside the detached training loop, re-acquires the GIL **only at the callback fire point** (end of each round), so the heavy histogram/split work runs GIL-free:
 
@@ -209,7 +209,7 @@ Early stopping itself is a **built-in callback** (`early_stopping(rounds, metric
 
 ### 12.5 The explanation / table-export API
 
-`model.tables(w=None)` returns a read-only `_TableBank` (the §08 `TableBank`, default `RefMeasure::ProductMarginals{laplace}`); passing a different `w` recomputes the bank **without retraining** (exactness-preserving, §3). The firewall is surfaced directly: if the model is `Approximate`, `tables()` raises `pattern_boost.ExactnessError` ("model carries non-decomposable structure; export is tables + residual model, not exact rating tables").
+`model.tables(w=None)` returns a read-only `_TableBank` (the §08 `TableBank`, default `RefMeasure::ProductMarginals{laplace}`); passing a different `w` recomputes the bank **without retraining** (exactness-preserving, §3). The firewall is surfaced directly: if the model is `Approximate`, `tables()` raises `tri_boost.ExactnessError` ("model carries non-decomposable structure; export is tables + residual model, not exact rating tables").
 
 ```python
 bank = model.tables()                      # complete, lossless support
@@ -227,7 +227,7 @@ Key API rules: (1) `to_json()` with no `top_k` emits the **complete** support (t
 ### 12.6 sklearn estimators (pure Python, v1 surface)
 
 ```python
-class PatternBoostRegressor(RegressorMixin, BaseEstimator):
+class TriBoostRegressor(RegressorMixin, BaseEstimator):
     # Defaults MIRROR the core Config (§06) — single source of truth; the wrapper forwards, never re-decides.
     def __init__(self, *, objective="squared_error", n_estimators=1000, learning_rate=0.05,
                  max_bin=254, reg_lambda=1.0, max_interaction_order=3, interaction_groups=None,
@@ -256,7 +256,7 @@ class PatternBoostRegressor(RegressorMixin, BaseEstimator):
 
 The `feature_names_in_` / `n_features_in_` set by `_validate` are also forwarded into the native `fit` so they land in `Model.schema` (`ModelSchema.feature_names`, §2.6 / R-SCHEMA) and **survive serialization** — `from_bytes(to_bytes(m))` round-trips them; on `predict` the schema's frozen `cat_encoders` re-encode raw categoricals (audit-on-serve, R-CATSERVE), so naming is exact and leakage-free. The `distill=` argument feeds the §12 distill helper (R-DISTILL).
 
-`PatternBoostClassifier` adds `classes_` (label encoding from `schema.class_labels`; binary only in v1, Logistic loss), `predict_proba` (columns ordered to `classes_`), `decision_function` (raw score), and `__sklearn_tags__` overrides (sklearn ≥1.6). On fit it passes the encoded label set as `class_labels=` so it persists in `Model.schema.class_labels` (R-SCHEMA); `classes_` and `predict_proba`'s column order are reconstructed from the schema after a serialize/deserialize round-trip (so a reloaded classifier predicts probabilities with the original label ordering, not a re-inferred one). Monotone constraints are **name-keyed** (`{"age": +1}`) and resolved against `feature_names_in_` into the §07 `MonotoneMap` (a `BTreeMap<String, MonoSign>` — ordered, config-only, never serialized, so it cannot perturb the determinism [GATE], §13.4), never positional — the §02 invariant. Fitted attributes carry the trailing underscore (`n_features_in_`, `feature_names_in_`, `classes_`, `_model_`). `set_params` clears any fitted state.
+`TriBoostClassifier` adds `classes_` (label encoding from `schema.class_labels`; binary only in v1, Logistic loss), `predict_proba` (columns ordered to `classes_`), `decision_function` (raw score), and `__sklearn_tags__` overrides (sklearn ≥1.6). On fit it passes the encoded label set as `class_labels=` so it persists in `Model.schema.class_labels` (R-SCHEMA); `classes_` and `predict_proba`'s column order are reconstructed from the schema after a serialize/deserialize round-trip (so a reloaded classifier predicts probabilities with the original label ordering, not a re-inferred one). Monotone constraints are **name-keyed** (`{"age": +1}`) and resolved against `feature_names_in_` into the §07 `MonotoneMap` (a `BTreeMap<String, MonoSign>` — ordered, config-only, never serialized, so it cannot perturb the determinism [GATE], §13.4), never positional — the §02 invariant. Fitted attributes carry the trailing underscore (`n_features_in_`, `feature_names_in_`, `classes_`, `_model_`). `set_params` clears any fitted state.
 
 **Determinism contract surfaced in Python:** identical `random_state` + identical config ⇒ bit-identical `model.to_bytes()` regardless of `n_jobs` (the §1 [GATE], delegated to core). `n_jobs` changes only wall-clock, never the result — a property a Python test asserts (§12.8).
 
@@ -269,12 +269,12 @@ The `feature_names_in_` / `n_features_in_` set by `_validate` are also forwarded
 | `InvalidInput`, `ShapeMismatch` | `ValueError` |
 | `DtypeMismatch` | `TypeError` |
 | `InvalidConfig` | `ValueError` (config) |
-| `InvariantViolated{..}` | `pattern_boost.InvariantError` |
-| `ExactnessFirewall(..)` | `pattern_boost.ExactnessError` |
-| `Serialization(..)` | `pattern_boost.SerializationError` |
-| `Internal{..}` | `pattern_boost.InternalError` (a bug; degrades to a typed exception, never an interpreter crash) |
+| `InvariantViolated{..}` | `tri_boost.InvariantError` |
+| `ExactnessFirewall(..)` | `tri_boost.ExactnessError` |
+| `Serialization(..)` | `tri_boost.SerializationError` |
+| `Internal{..}` | `tri_boost.InternalError` (a bug; degrades to a typed exception, never an interpreter crash) |
 
-All four custom exceptions derive a package base `PatternBoostError`. The compiled module ships `py.typed` and hand-written `_pattern_boost.pyi` stubs (abi3 `text_signature` is available ≥3.10); the sklearn wrappers are typed inline. No panic ever crosses the FFI boundary — the no-panic policy (§1) plus the `Internal` funnel guarantee a Python exception instead of an abort.
+All four custom exceptions derive a package base `TriBoostError`. The compiled module ships `py.typed` and hand-written `_tri_boost.pyi` stubs (abi3 `text_signature` is available ≥3.10); the sklearn wrappers are typed inline. No panic ever crosses the FFI boundary — the no-panic policy (§1) plus the `Internal` funnel guarantee a Python exception instead of an abort.
 
 ### 12.8 Testing
 

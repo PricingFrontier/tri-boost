@@ -1,6 +1,6 @@
-# pattern-boost — GBM Technique Inventory (research round 2)
+# tri-boost — GBM Technique Inventory (research round 2)
 
-> 2026-06-21. An exhaustive sweep of every technique in **CatBoost, LightGBM, XGBoost** and the **current GBM research frontier**, each assessed for what it buys (speed / accuracy / memory / uncertainty / calibration / robustness / usability / interpretability) and — the part that decides everything for us — whether it survives pattern-boost's two hard invariants:
+> 2026-06-21. An exhaustive sweep of every technique in **CatBoost, LightGBM, XGBoost** and the **current GBM research frontier**, each assessed for what it buys (speed / accuracy / memory / uncertainty / calibration / robustness / usability / interpretability) and — the part that decides everything for us — whether it survives tri-boost's two hard invariants:
 > **(I1)** depth-3 **oblivious** structure (one shared split per level, ≤3 features per tree); **(I2)** exact **≤3rd-order fANOVA** decomposition into lossless lookup / rating tables.
 >
 > **Method.** 10 parallel inventory agents (3 libraries + 7 research-frontier areas) → dedup → **174 consequential techniques adversarially re-judged** by independent skeptics against I1/I2 → 7 synthesis sections + a 2024–2026 completeness critic. 192 agents total. **The adversarial verdicts override the finders' (often optimistic) self-ratings** — that pass is what produced the "incompatible / breaks-exactness" boundary below.
@@ -100,7 +100,7 @@ These are `native` (or cleanly `adaptable`), `preserves_exactness`, and high-pay
 - **Model compilation for deployment — Treelite** (Treelite) — Verdict upheld as SKIP; downgrading the finder's compat from "adaptable" to "incompatible". (1) OBLIVIOUS FIT — fails. …
 - **NODE — Neural Oblivious Decision Ensembles (soft entmax o…** (Research: Popov, Morozov &) — Verified against the primary source (Popov/Morozov/Babenko, ICLR 2020, arXiv:1909.06312; full text at ar5iv.labs.arxiv.…
 - **NODE-GAM (neural oblivious GAM/GA2M)** (Research: Chang, Caruana, ) — Verified against the full paper (arXiv:2106.01613) and the zzzace2000/nodegam repo. NODE-GAM is a SOFT, differentiable …
-- **Order-limited additive boosting (EBM cyclic round-robin) …** (Research: Lou, Caruana, Ge) — VERDICT: reject. The finder's claims (oblivious=adaptable, fanova=none, v1.5) are both wrong FROM pattern-boost's persp…
+- **Order-limited additive boosting (EBM cyclic round-robin) …** (Research: Lou, Caruana, Ge) — VERDICT: reject. The finder's claims (oblivious=adaptable, fanova=none, v1.5) are both wrong FROM tri-boost's persp…
 - **QuickScorer / V-QuickScorer / RapidScorer interleaved bit…** (Research: Lucchese et al. ) — CONFIRMED INCOMPATIBLE — mechanism is redundant/inverted for depth-3 oblivious trees, payoff is ~zero, finder's verdict…
 - **Soft decision trees (Frosst–Hinton) — sigmoid-gated hiera…** (Research: Frosst & Hinton,) — VERIFIED against the primary source (Frosst & Hinton 2017, arXiv:1711.09784; full PDF read, Eqs. 1-5). The finder's cla…
 - **Tree Ensemble Layer (TEL) — smooth-step routing with EXAC…** (Research: Hazimeh, Ponomar) — Verified against the primary source (Hazimeh, Ponomareva, Mol, Tan, Mazumder, ICML 2020, arXiv:2002.07772, full text at…
@@ -126,7 +126,7 @@ These are `native` (or cleanly `adaptable`), `preserves_exactness`, and high-pay
 - **Multicalibration / multibalance for protected subgroups** (Research: Hebert-Johnson, ) — VERIFIED both primary sources. Hebert-Johnson/Kim/Reingold/Rothblum (ICML 2018, arXiv:1711.08513) and Denuit/Michaelide…
 - **NODE — Neural Oblivious Decision Ensembles (soft entmax o…** (Research: Popov, Morozov &) — Verified against the primary source (Popov/Morozov/Babenko, ICLR 2020, arXiv:1909.06312; full text at ar5iv.labs.arxiv.…
 - **NODE-GAM (neural oblivious GAM/GA2M)** (Research: Chang, Caruana, ) — Verified against the full paper (arXiv:2106.01613) and the zzzace2000/nodegam repo. NODE-GAM is a SOFT, differentiable …
-- **Order-limited additive boosting (EBM cyclic round-robin) …** (Research: Lou, Caruana, Ge) — VERDICT: reject. The finder's claims (oblivious=adaptable, fanova=none, v1.5) are both wrong FROM pattern-boost's persp…
+- **Order-limited additive boosting (EBM cyclic round-robin) …** (Research: Lou, Caruana, Ge) — VERDICT: reject. The finder's claims (oblivious=adaptable, fanova=none, v1.5) are both wrong FROM tri-boost's persp…
 - **Post-hoc Whittaker-Henderson table graduation (smoothness…** (Research: Whittaker-Hender) — INVARIANT 1 (oblivious/depth-3): native, but VACUOUSLY. WH graduation runs entirely downstream on already-extracted 1-D…
 - **SGLB virtual ensembles (epistemic uncertainty from one mo…** (CatBoost: Ustimenko & Prok) — VERIFIED AGAINST PRIMARY SOURCES. This is really TWO separable things, and the finder conflated them. (1) OBLIVIOUS COM…
 - **Soft decision trees (Frosst–Hinton) — sigmoid-gated hiera…** (Research: Frosst & Hinton,) — VERIFIED against the primary source (Frosst & Hinton 2017, arXiv:1711.09784; full PDF read, Eqs. 1-5). The finder's cla…
@@ -232,7 +232,7 @@ These are `native` (or cleanly `adaptable`), `preserves_exactness`, and high-pay
 | v1.5 | Discrimination-free pricing (marginaliz… | Research: Lindholm, R… | fairness/robustness/usability: provably removes proxy discr… | native | preserves_exactness | medium |
 | v1.5 | Heredity / strong-hierarchy constraint … | Research: GAMI-Net (Y… | interpretability + memory: fewer, hierarchically-coherent t… | adaptable | preserves_exactness | low |
 | v1.5 | Branch-free SIMD-across-rows oblivious … | CatBoost (SSE/AVX eva… | inference latency/throughput: branch-free, vectorizes acros… | native | preserves_exactness | medium |
-| v1.5 | LUT-sum inference (predict directly fro… | pattern-boost-specifi… | inference: collapses an M-tree ensemble into O(#nonempty-ta… | native | preserves_exactness | medium |
+| v1.5 | LUT-sum inference (predict directly fro… | tri-boost-specifi… | inference: collapses an M-tree ensemble into O(#nonempty-ta… | native | preserves_exactness | medium |
 | v1.5 | Feature importances: PredictionValuesCh… | CatBoost | interpretability - and several map DIRECTLY onto pattern-bo… | native | preserves_exactness | medium |
 | v1.5 | SHAP from the exact fANOVA decompositio… | Research: Bordt & von… | interpretability + speed: turns local SHAP into a handful o… | native | preserves_exactness | low |
 | v1.5 | Partial Dependence Plots (PDP) — exact … | Research: Friedman (2… | interpretability: global feature-effect curves/surfaces for… | native | preserves_exactness | low |
@@ -256,7 +256,7 @@ These are `native` (or cleanly `adaptable`), `preserves_exactness`, and high-pay
 | v1.5 | Inner/outer bagging for smoothing + err… | EBM / InterpretML (in… | smoother, more stable tables + per-table-entry uncertainty/… | native | preserves_exactness | medium |
 | v1.5 | Conformalized prediction intervals for … | Research: 'Conformal … | uncertainty/usability: valid coverage without distributiona… | native | preserves_exactness | low |
 | v1.5 | refit / continued training (init_model,… | LightGBM | usability/maintainability: periodic recalibration of an in-… | native | preserves_exactness | medium |
-| v1.5 | Warm-start / base_margin offset / init_… | XGBoost (base_margin,… | usability + accuracy: lets pattern-boost (a) blend on top o… | native | breaks_exactness | low |
+| v1.5 | Warm-start / base_margin offset / init_… | XGBoost (base_margin,… | usability + accuracy: lets tri-boost (a) blend on top o… | native | breaks_exactness | low |
 | v2 | Stochastic Gradient Langevin Boosting (… | Research: Ustimenko &… | accuracy/robustness on multimodal losses (e.g. 0-1 loss); g… | native | none | medium |
 | v2 | leaf_estimation_backtracking (No / AnyI… | CatBoost | robustness/accuracy on hard losses (e.g. Tweedie with small… | native | none | low |
 | v2 | DART (Dropouts meet Multiple Additive R… | LightGBM | accuracy/robustness: 'significant margin' over MART in the … | native | none | medium |
@@ -384,7 +384,7 @@ These are `native` (or cleanly `adaptable`), `preserves_exactness`, and high-pay
 | skip | Model compilation via LLVM — lleaves | lleaves (Sebastian Bo… | inference 10-30x vs interpreted LightGBM (e.g. 9.7s -> 0.4s… | native | preserves_exactness | medium |
 | skip | QuickScorer / V-QuickScorer / RapidScor… | Research: Lucchese et… | inference 2-25x vs naive traversal on DEEP forests (LtR, hu… | incompatible | preserves_exactness | high |
 | skip | Tensor/matrix-compiled forest inference… | Research: Nakandala e… | inference: big batch throughput on GPU/SIMD; but introduces… | adaptable | preserves_exactness | high |
-| skip | Prediction caching / memoization on the… | pattern-boost-specifi… | inference: avoids recomputation for repeated/segmented inpu… | native | preserves_exactness | low |
+| skip | Prediction caching / memoization on the… | tri-boost-specifi… | inference: avoids recomputation for repeated/segmented inpu… | native | preserves_exactness | low |
 | skip | linear_tree (piecewise-linear leaves) | LightGBM | accuracy: small but real on smooth/extrapolating targets (n… | adaptable | changes_table_form | high |
 | skip | Soft decision trees (Frosst–Hinton) — s… | Research: Frosst & Hi… | interpretability: distillation yields a soft tree that gene… | incompatible | breaks_exactness | medium |
 | skip | Order-limited additive boosting (EBM cy… | Research: Lou, Caruan… | interpretability + calibration + accuracy-stability: order-… | incompatible | breaks_exactness | medium |

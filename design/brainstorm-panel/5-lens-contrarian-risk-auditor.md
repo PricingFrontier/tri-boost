@@ -1,8 +1,8 @@
-# pattern-boost — Contrarian / Risk-Auditor Brainstorm
+# tri-boost — Contrarian / Risk-Auditor Brainstorm
 
 ## 1. Thesis / the bet
 
-The dual aim is **not a free lunch — it is a frontier**, and the most dangerous failure mode is pretending otherwise. My bet: for *insurance rating* specifically, the depth-3/order-3 cap costs you almost nothing in deployable predictiveness, because pricing signal is overwhelmingly main-effect + low-order interaction, regulators *forbid* the high-order interactions black-boxes find, and what little 4-way+ signal exists is usually noise, leakage, or a proxy you'd be sued for using. So I'd build pattern-boost to *win on the pricing frontier* and **instrument it to prove where it sits on the accuracy curve** rather than hide it. The whole architecture should be organized around one discipline: every component is either *inside the exact-table contract* (default audited path) or *outside it and loudly labelled* (opt-in). The biggest risk isn't the order-3 ceiling — it's **silent exactness erosion** (a calibration warp, a linear leaf, an ordered-TS axis) creeping onto the default path and quietly turning "the tables ARE the model" into "the tables approximately resemble the model." Guard that boundary obsessively and the rest is engineering.
+The dual aim is **not a free lunch — it is a frontier**, and the most dangerous failure mode is pretending otherwise. My bet: for *insurance rating* specifically, the depth-3/order-3 cap costs you almost nothing in deployable predictiveness, because pricing signal is overwhelmingly main-effect + low-order interaction, regulators *forbid* the high-order interactions black-boxes find, and what little 4-way+ signal exists is usually noise, leakage, or a proxy you'd be sued for using. So I'd build tri-boost to *win on the pricing frontier* and **instrument it to prove where it sits on the accuracy curve** rather than hide it. The whole architecture should be organized around one discipline: every component is either *inside the exact-table contract* (default audited path) or *outside it and loudly labelled* (opt-in). The biggest risk isn't the order-3 ceiling — it's **silent exactness erosion** (a calibration warp, a linear leaf, an ordered-TS axis) creeping onto the default path and quietly turning "the tables ARE the model" into "the tables approximately resemble the model." Guard that boundary obsessively and the rest is engineering.
 
 ## 2. Components
 
@@ -37,7 +37,7 @@ Thin rating cells are where this whole thing breaks in production. **Mechanism:*
 
 4. **Heredity-first, FAST-as-prior, variance-as-judge** for interaction selection — never let FAST hard-gate. This is the de-risked version of the screening pipeline that avoids both C(n,3) explosion and the GAMI-Tree mis-convergence trap (joint boost on realized supports + single purification pass, not EBM-style staging).
 
-5. **A GA2M-style additive-first hybrid as the conservative default mode.** Offer `max_interaction_order ∈ {1,2,3}`. Order-1 = a pure GAM (gold-standard intelligibility, regulatory safe harbor); order-2 = matches EBM; order-3 = the differentiator. Start each fit additive, admit pairs, then triples by heredity. This makes pattern-boost *strictly dominate* EBM on its own turf and gives nervous insurers a dial they understand.
+5. **A GA2M-style additive-first hybrid as the conservative default mode.** Offer `max_interaction_order ∈ {1,2,3}`. Order-1 = a pure GAM (gold-standard intelligibility, regulatory safe harbor); order-2 = matches EBM; order-3 = the differentiator. Start each fit additive, admit pairs, then triples by heredity. This makes tri-boost *strictly dominate* EBM on its own turf and gives nervous insurers a dial they understand.
 
 ## 4. What I would explicitly NOT do
 

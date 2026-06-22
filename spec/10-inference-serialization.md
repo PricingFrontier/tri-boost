@@ -169,7 +169,7 @@ impl TableBank {
 
 ### 10.5 Serde model format
 
-The serde impl lives in `pattern-boost-core` (zero pyo3), so bytes written from Python deserialize identically in any pure-Rust consumer — one impl, no drift. The wire struct wraps the in-memory `Model` as a **plain nested field** — `#[serde(flatten)]` is *not* used, because flatten relies on self-describing formats and would break the required `bincode` (non-self-describing) round-trip:
+The serde impl lives in `tri-boost-core` (zero pyo3), so bytes written from Python deserialize identically in any pure-Rust consumer — one impl, no drift. The wire struct wraps the in-memory `Model` as a **plain nested field** — `#[serde(flatten)]` is *not* used, because flatten relies on self-describing formats and would break the required `bincode` (non-self-describing) round-trip:
 
 ```rust
 #[derive(serde::Serialize, serde::Deserialize)]

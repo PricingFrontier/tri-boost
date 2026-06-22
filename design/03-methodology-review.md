@@ -1,4 +1,4 @@
-# pattern-boost — Methodology Review (is the spec the best approach for the aims?)
+# tri-boost — Methodology Review (is the spec the best approach for the aims?)
 
 > 2026-06-22. An adversarial review of the spec: 6 first-principles red-team attacks on the load-bearing methodology decisions, a defender forced to steelman the status quo, and an adjudicated verdict. Question: does the spec lead to the BEST methodology for {most accurate, fully ≤3rd-order decomposable, fast}? The six red-team reports and the defense are in [`methodology-review/`](methodology-review/).
 >

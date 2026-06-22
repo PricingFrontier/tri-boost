@@ -1,6 +1,6 @@
 # Oblivious / Symmetric Decision Trees in Gradient Boosting — Research Report
 
-Research feeding the design spec of `pattern-boost` (depth-3 symmetric/oblivious trees, Rust core + Python bindings). All factual claims below were fetched from primary sources (CatBoost NeurIPS 2018 paper, official CatBoost docs, CatBoost source) and verified; a few flagged numbers come from secondary benchmarks and are marked as such.
+Research feeding the design spec of `tri-boost` (depth-3 symmetric/oblivious trees, Rust core + Python bindings). All factual claims below were fetched from primary sources (CatBoost NeurIPS 2018 paper, official CatBoost docs, CatBoost source) and verified; a few flagged numbers come from secondary benchmarks and are marked as such.
 
 > Two corrections folded in from source verification: CatBoost's default split objective is the **Cosine** score function (default `score_function=Cosine`), and `boosting_type` defaults to **Plain on CPU** (Ordered only for small GPU datasets).
 
@@ -16,7 +16,7 @@ Research feeding the design spec of `pattern-boost` (depth-3 symmetric/oblivious
 Cosine = (Σ_i w_i · a_i · g_i) / ( sqrt(Σ_i w_i a_i²) · sqrt(Σ_i w_i g_i²) )
 ```
 
-CatBoost also offers `L2`, `NewtonL2`, `NewtonCosine` (Newton variants use 2nd derivatives; CPU supports only `Cosine`/`L2`). This differs from XGBoost/LightGBM, whose canonical split gain is the **Hessian-based** form (the reference formula `pattern-boost` will most likely want):
+CatBoost also offers `L2`, `NewtonL2`, `NewtonCosine` (Newton variants use 2nd derivatives; CPU supports only `Cosine`/`L2`). This differs from XGBoost/LightGBM, whose canonical split gain is the **Hessian-based** form (the reference formula `tri-boost` will most likely want):
 
 ```
 Gain = ½ [ G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ) ] − γ
@@ -84,7 +84,7 @@ x̂_k^i = (Σ_{x_j∈D_k} 𝟙{x_j^i = x_k^i}·y_j + a·p) / (Σ_{x_j∈D_k} �
 
 **Ordered boosting** attacks the same prediction shift in the gradient step: standard GBDT estimates gradients on the same data used to fit the model → biased base learner → worse generalization. Ordered boosting maintains supporting models `M_i` trained on the first `i` examples in σ; the gradient for example `j` uses `M_{j−1}` (a model that never saw `j`). CatBoost uses **s+1 permutations** (σ₁…σ_s for split evaluation, σ₀ for leaf values), resampled per tree to reduce variance.
 
-**Separability (critical for `pattern-boost`): YES, fully orthogonal.**
+**Separability (critical for `tri-boost`): YES, fully orthogonal.**
 - Ordered boosting / ordered TS = *how gradients and categorical encodings are computed* (permutation-based bias correction).
 - Oblivious trees = *the base-predictor structure*.
 - The paper treats them as distinct components, and CatBoost proves independence operationally via `boosting_type`: **`Plain` = standard non-ordered GBDT but still uses symmetric oblivious trees** (and still uses ordered TS for categoricals). Verbatim docs default is **Plain on CPU** (Ordered only for GPU with ≤50k objects). So you can have oblivious trees without ordered boosting. Conversely, ordered boosting/TS are general schemes that could wrap any base learner.
@@ -121,7 +121,7 @@ x̂_k^i = (Σ_{x_j∈D_k} 𝟙{x_j^i = x_k^i}·y_j + a·p) / (Σ_{x_j∈D_k} �
 
 ---
 
-## Design implications for pattern-boost
+## Design implications for tri-boost
 
 **The depth-3 oblivious choice is well-founded and uniquely synergistic with your fANOVA goal.** Each oblivious tree of depth 3 depends on ≤3 features, so the *whole ensemble* is a sum of ≤3-feature functions → its fANOVA decomposition truncates exactly at 3rd order. No other GBM growth policy gives you this guarantee (leaf-wise/level-wise trees touch arbitrarily many features per tree). The literature confirms the structure is fast and self-regularizing — both align with your goals.
 
@@ -149,7 +149,7 @@ x̂_k^i = (Σ_{x_j∈D_k} 𝟙{x_j^i = x_k^i}·y_j + a·p) / (Σ_{x_j∈D_k} �
 **What to avoid / de-scope:**
 - **Skip ordered boosting** initially. It is fully separable from oblivious trees, costs ~1.7× training time, needs lots of memory (per-permutation supporting models), and helps mainly on small datasets. CatBoost itself defaults to `Plain` (non-ordered) on CPU. Ship Plain boosting first; ordered boosting is a later, optional accuracy knob.
 - **Don't adopt Cosine as the default split score** — use the Hessian/Newton gain for parity with XGBoost/LightGBM accuracy and to get exact leaf values.
-- **Don't offer non-symmetric grow policies** — they'd break your ≤3-feature/fANOVA invariant. The whole point of pattern-boost is the oblivious constraint; keep it mandatory.
+- **Don't offer non-symmetric grow policies** — they'd break your ≤3-feature/fANOVA invariant. The whole point of tri-boost is the oblivious constraint; keep it mandatory.
 - **Expect to need more, lower-lr trees** than a leaf-wise library for the same accuracy (the per-tree weakness), and budget benchmark tuning accordingly. The depth-3 cap is more aggressive than CatBoost's depth-6 default, so the per-tree weakness is *stronger* — compensate with more iterations and careful learning-rate/L2 tuning, and verify on interaction-heavy datasets where 3rd-order truncation could bite.
 - **Failure mode to watch:** datasets with genuine >3rd-order interactions cannot be represented at all (by design). This is a hard expressiveness ceiling, not just a regularization bias — flag it clearly in your docs and consider it when benchmarking against unrestricted GBMs on synthetic high-order-interaction data.
 

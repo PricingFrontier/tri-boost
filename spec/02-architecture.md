@@ -1,14 +1,14 @@
 ## 02 — Architecture & project layout
 
-> Owner section per the §4 ownership map. This section OWNS: the Cargo workspace layout (core / py / python / benches); the module boundaries inside `pattern-boost-core`; the `PbError` + `Invariant` **definition** (the enum bodies live here, every other section maps its failures onto a variant); the `Backend` trait seam (CPU now, GPU-shaped later); the feature-flag matrix; and the `schema_version` policy. It USES every §2 shared type but defines none of them except `PbError`/`Invariant`. Grounded in research/05 (the polars/tokenizers dual-crate shape, abi3-py310, MSRV 1.64, quantized-reproducibility, defer-GPU-behind-a-`Backend`-trait) and the skeleton's engineering checklist (§1).
+> Owner section per the §4 ownership map. This section OWNS: the Cargo workspace layout (core / py / python / benches); the module boundaries inside `tri-boost-core`; the `PbError` + `Invariant` **definition** (the enum bodies live here, every other section maps its failures onto a variant); the `Backend` trait seam (CPU now, GPU-shaped later); the feature-flag matrix; and the `schema_version` policy. It USES every §2 shared type but defines none of them except `PbError`/`Invariant`. Grounded in research/05 (the polars/tokenizers dual-crate shape, abi3-py310, MSRV 1.64, quantized-reproducibility, defer-GPU-behind-a-`Backend`-trait) and the skeleton's engineering checklist (§1).
 
 ### 02.1 — Decision summary
 
 | Decision | Choice | Why (which aim) |
 |---|---|---|
-| Workspace shape | maturin "separated": pure-Rust `pattern-boost-core` + thin `pattern-boost-py` (`cdylib`) + `python/` source + `benches/` | core is crates.io-publishable; pyo3 quarantined; FAST/DECOMPOSABLE machinery testable with zero Python in the loop |
+| Workspace shape | maturin "separated": pure-Rust `tri-boost-core` + thin `tri-boost-py` (`cdylib`) + `python/` source + `benches/` | core is crates.io-publishable; pyo3 quarantined; FAST/DECOMPOSABLE machinery testable with zero Python in the loop |
 | Crate count | two crates in one workspace (not a polars-style 40-crate split) | the core is one cohesive algorithm; over-splitting buys nothing and fragments the invariant gates |
-| pyo3 location | ONLY `pattern-boost-py`; `pattern-boost-core` has zero pyo3 dependency, even optional | crates.io-publishable core; `cargo test` on the core never pulls a Python toolchain |
+| pyo3 location | ONLY `tri-boost-py`; `tri-boost-core` has zero pyo3 dependency, even optional | crates.io-publishable core; `cargo test` on the core never pulls a Python toolchain |
 | Compute seam | a `Backend` trait in the core (CPU impl only in v1), GPU-shaped | keeps the door open without speculative GPU code; the pre-binned `u8` columnar layout is already GPU-friendly |
 | Binding ABI | abi3-py310 (one wheel per `(os, arch)`) | matches polars/tokenizers; smaller release matrix |
 | MSRV | 1.64, pinned in `rust-toolchain.toml` | manylinux2014/glibc 2.17 floor (Rust ≥1.64 needs glibc ≥2.17) |
@@ -16,24 +16,24 @@
 | Error model | one `PbError` enum (defined here), `Result<T, PbError>` on every fallible public fn | typed errors, no panics in library code |
 | `schema_version` | a single monotone `u32` on `Model`/`TableBank`, owned here, bumped on any wire-incompatible change | reproducible, auditable, cross-language load |
 
-**Open fork (recommended default):** crate granularity. Recommended default is the **two-crate** workspace above. If, post-v1, the explainability engine (§08) or the distillation data hooks (§09) grow heavy optional dependency trees, split them into `pattern-boost-explain` / `pattern-boost-distill` sub-crates behind cargo features rather than feature-gating one fat crate. Not v1; flagged so the module boundaries below are drawn to make that split mechanical (each owns a top-level module already).
+**Open fork (recommended default):** crate granularity. Recommended default is the **two-crate** workspace above. If, post-v1, the explainability engine (§08) or the distillation data hooks (§09) grow heavy optional dependency trees, split them into `tri-boost-explain` / `tri-boost-distill` sub-crates behind cargo features rather than feature-gating one fat crate. Not v1; flagged so the module boundaries below are drawn to make that split mechanical (each owns a top-level module already).
 
 ### 02.2 — Workspace & directory tree
 
 ```
-pattern-boost/
+tri-boost/
 ├── Cargo.toml                      # [workspace]; pins pyo3 + shared version + shared lint table at root
 ├── pyproject.toml                  # build-backend="maturin"; python-source/module-name/manifest-path
 ├── rust-toolchain.toml             # channel="1.64" (MSRV pin); components rustfmt, clippy
 ├── deny.toml                       # cargo-deny: licenses, advisories, bans  [GATE]
 ├── python/
-│   └── pattern_boost/
-│       ├── __init__.py             # re-export from ._pattern_boost; sklearn wrappers (§12)
-│       ├── _pattern_boost.pyi      # type stubs (§12)
+│   └── tri_boost/
+│       ├── __init__.py             # re-export from ._tri_boost; sklearn wrappers (§12)
+│       ├── _tri_boost.pyi      # type stubs (§12)
 │       ├── py.typed
-│       └── sklearn.py              # PatternBoostRegressor / Classifier (§12)
+│       └── sklearn.py              # TriBoostRegressor / Classifier (§12)
 ├── crates/
-│   ├── pattern-boost-core/         # PURE Rust. NO pyo3. crates.io-publishable.
+│   ├── tri-boost-core/         # PURE Rust. NO pyo3. crates.io-publishable.
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs              # #![forbid(unsafe_code)] #![deny(missing_docs)]; pub re-exports; PbError/Invariant (§02)
@@ -48,9 +48,9 @@ pattern-boost/
 │   │       ├── boosters/           # §09: distillation target, corrective refit, Nesterov, ensemble selection
 │   │       ├── serialize/          # §10: serde_json + bincode, schema_version round-trip, scoring
 │   │       └── simd/               # §11: multiversion/pulp/wide dense kernels (safe wrappers only)
-│   └── pattern-boost-py/           # THIN pyo3 binding. crate-type=["cdylib"].
-│       ├── Cargo.toml              # pattern-boost-core { path, version } + pyo3 + numpy
-│       └── src/lib.rs              # #[pymodule] _pattern_boost  (§12)
+│   └── tri-boost-py/           # THIN pyo3 binding. crate-type=["cdylib"].
+│       ├── Cargo.toml              # tri-boost-core { path, version } + pyo3 + numpy
+│       └── src/lib.rs              # #[pymodule] _tri_boost  (§12)
 ├── tests/                          # python integration tests (pytest, §13)
 └── benches/                        # criterion benches + the bit-reproducibility harness (§11)
 ```
@@ -61,7 +61,7 @@ Module-to-section mapping is 1:1 with the §4 ownership table: each owning secti
 
 ```toml
 [workspace]
-members = ["crates/pattern-boost-core", "crates/pattern-boost-py"]
+members = ["crates/tri-boost-core", "crates/tri-boost-py"]
 resolver = "2"
 
 [workspace.package]
@@ -69,7 +69,7 @@ version = "0.1.0"                 # shared; the wire schema_version is separate 
 edition = "2021"
 rust-version = "1.64"            # MSRV  [GATE: CI builds on exactly this]
 license = "Apache-2.0"
-repository = "https://github.com/.../pattern-boost"
+repository = "https://github.com/.../tri-boost"
 
 [workspace.dependencies]
 # pinned ONCE here; each crate opts in. (research/05: pin pyo3 at the root.)
@@ -143,11 +143,11 @@ fn pb_seed(base: u64, round: u32, stage: u32, block: u32) -> u64 {
 
 Because the stream for any `(round, stage, block)` is a pure function of the base seed and the work-unit coordinates, draws are position-stable and **independent of thread count** — the basis of the §1 determinism `[GATE]`. The same scheme is referenced by §03.3 (binning subsample), §06.7 (MVS/split sampling), §09.6 (bagging), and §11. (`.wrapping_mul`/`>>`/`^` here are the documented exception to the integer-overflow trap: wrapping is intentional in the mixer.)
 
-`pattern-boost-core/Cargo.toml`:
+`tri-boost-core/Cargo.toml`:
 
 ```toml
 [package]
-name = "pattern-boost-core"
+name = "tri-boost-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -187,14 +187,14 @@ distill = []                     # CatBoost teacher DATA hooks only (§09); no F
 nightly = []                     # portable_simd path; off the default/shipping wheel (§11)
 ```
 
-`pattern-boost-py/Cargo.toml` adds `pyo3 = { workspace = true, features = ["extension-module", "abi3-py310"] }`, `numpy.workspace = true`, the path+version dep on the core, and `crate-type = ["cdylib"]`. It is the ONLY crate where `extension-module`/`abi3` appear. Its `lib.rs` carries a module-local `#![allow(unsafe_code)]` because the pyo3 procedural macros expand to `unsafe`; this is the single, justified, encapsulated exception to the workspace `forbid` (research/05 §2).
+`tri-boost-py/Cargo.toml` adds `pyo3 = { workspace = true, features = ["extension-module", "abi3-py310"] }`, `numpy.workspace = true`, the path+version dep on the core, and `crate-type = ["cdylib"]`. It is the ONLY crate where `extension-module`/`abi3` appear. Its `lib.rs` carries a module-local `#![allow(unsafe_code)]` because the pyo3 procedural macros expand to `unsafe`; this is the single, justified, encapsulated exception to the workspace `forbid` (research/05 §2).
 
 ### 02.4 — `PbError` + `Invariant` (OWNED HERE — defined verbatim from §2.8)
 
 The error enum is the one defined in the skeleton (§2.8) and is reproduced here as its canonical home; no other section may redefine it. Every fallible public function in the workspace returns `Result<T, PbError>`; no public signature uses `Box<dyn Error>`.
 
 ```rust
-/// The single crate error type. Defined in `pattern-boost-core::error`.
+/// The single crate error type. Defined in `tri-boost-core::error`.
 #[derive(thiserror::Error, Debug)]
 pub enum PbError {
     #[error("invalid input: {what}")]               InvalidInput { what: String },
@@ -280,20 +280,20 @@ How the seam serves the three aims: (FAST) the four kernels are exactly the spee
 
 | Feature | Crate | Default | Effect |
 |---|---|---|---|
-| (base) | `pattern-boost-core` | — | numpy-free, pyo3-free, pure-Rust train/predict/explain on `f32` |
+| (base) | `tri-boost-core` | — | numpy-free, pyo3-free, pure-Rust train/predict/explain on `f32` |
 | `arrow` | core | off | optional zero-copy Arrow/PyCapsule column ingest (§03) |
 | `distill` | core | off | CatBoost-teacher DATA hooks (soft-target ingestion only; no native FFI) (§09) |
 | `nightly` | core | off | `portable_simd` kernels; never on the shipping wheel (§11) |
-| `extension-module` | `pattern-boost-py` | on for wheels, off for `cargo test` | pyo3 builds a `cdylib` Python extension |
-| `abi3-py310` | `pattern-boost-py` | on | stable-ABI: one wheel per `(os, arch)` for CPython ≥3.10 |
+| `extension-module` | `tri-boost-py` | on for wheels, off for `cargo test` | pyo3 builds a `cdylib` Python extension |
+| `abi3-py310` | `tri-boost-py` | on | stable-ABI: one wheel per `(os, arch)` for CPython ≥3.10 |
 
-Rules (build `[GATE]`s): (1) **default features of the core must compile and pass all five Invariant gates on stable Rust** — no optional feature is load-bearing for correctness; (2) `cargo tree -p pattern-boost-core | grep -q pyo3` must return non-zero in CI — pyo3 in the core fails the build; (3) the core must build for a non-Python target (e.g. `cargo build -p pattern-boost-core --target wasm32-unknown-unknown` smoke-builds the no-Python guarantee — which is exactly why all serialized index fields are fixed-width, never `usize`, see 02.8); (4) `extension-module` is OFF during `cargo test` so the core's unit/invariant tests run without a Python interpreter (research/05 §2). `arrow`/`distill`/`nightly` are additive and independently composable.
+Rules (build `[GATE]`s): (1) **default features of the core must compile and pass all five Invariant gates on stable Rust** — no optional feature is load-bearing for correctness; (2) `cargo tree -p tri-boost-core | grep -q pyo3` must return non-zero in CI — pyo3 in the core fails the build; (3) the core must build for a non-Python target (e.g. `cargo build -p tri-boost-core --target wasm32-unknown-unknown` smoke-builds the no-Python guarantee — which is exactly why all serialized index fields are fixed-width, never `usize`, see 02.8); (4) `extension-module` is OFF during `cargo test` so the core's unit/invariant tests run without a Python interpreter (research/05 §2). `arrow`/`distill`/`nightly` are additive and independently composable.
 
 ### 02.7 — Build, CI matrix & distribution
 
-`pyproject.toml` `[tool.maturin]`: `python-source = "python"`, `module-name = "pattern_boost._pattern_boost"`, `manifest-path = "crates/pattern-boost-py/Cargo.toml"` (essential in a workspace), `features = ["pyo3/extension-module"]`, `strip = true`, plus `include` for `py.typed`/`.pyi`. `[build-system]` is `requires = ["maturin>=1.9,<2"]`, `build-backend = "maturin"`.
+`pyproject.toml` `[tool.maturin]`: `python-source = "python"`, `module-name = "tri_boost._tri_boost"`, `manifest-path = "crates/tri-boost-py/Cargo.toml"` (essential in a workspace), `features = ["pyo3/extension-module"]`, `strip = true`, plus `include` for `py.typed`/`.pyi`. `[build-system]` is `requires = ["maturin>=1.9,<2"]`, `build-backend = "maturin"`.
 
-CI is two pipelines. **Correctness CI** (every PR, the build `[GATE]`s) runs on the core: `cargo fmt --check`, `cargo clippy -- -D warnings` (with the workspace lint table + the scoped `arithmetic_side_effects` of 02.3a), `cargo test` (unit + the five Invariant gates + proptest purification identities), `cargo deny check`, the bit-reproducibility harness at `n_threads ∈ {1,2,8}`, doctests, and a Miri run over any `unsafe`-adjacent code. Builds use `overflow-checks = true` in every profile (02.3a). MSRV is verified by building the core on exactly Rust 1.64. **Release CI** (tag-triggered) uses `maturin-action` to build wheels per `(os, arch)`: linux x86_64/aarch64 + musllinux, macOS x86_64/aarch64, Windows x64; with abi3 that is one wheel per platform, not per interpreter. Targets manylinux2014 (x86_64) / manylinux_2_28 (aarch64); wheels build with a portable `-C target-cpu=x86-64-v3` baseline (AVX2), lifting to AVX-512 at runtime via `multiversion` — never `target-cpu=native`. Publishing is OIDC Trusted Publishing to PyPI; `pattern-boost-core` is published to crates.io first (`cargo publish -p pattern-boost-core`, wait for indexing, then the py crate is not published to crates.io — it ships only as a wheel).
+CI is two pipelines. **Correctness CI** (every PR, the build `[GATE]`s) runs on the core: `cargo fmt --check`, `cargo clippy -- -D warnings` (with the workspace lint table + the scoped `arithmetic_side_effects` of 02.3a), `cargo test` (unit + the five Invariant gates + proptest purification identities), `cargo deny check`, the bit-reproducibility harness at `n_threads ∈ {1,2,8}`, doctests, and a Miri run over any `unsafe`-adjacent code. Builds use `overflow-checks = true` in every profile (02.3a). MSRV is verified by building the core on exactly Rust 1.64. **Release CI** (tag-triggered) uses `maturin-action` to build wheels per `(os, arch)`: linux x86_64/aarch64 + musllinux, macOS x86_64/aarch64, Windows x64; with abi3 that is one wheel per platform, not per interpreter. Targets manylinux2014 (x86_64) / manylinux_2_28 (aarch64); wheels build with a portable `-C target-cpu=x86-64-v3` baseline (AVX2), lifting to AVX-512 at runtime via `multiversion` — never `target-cpu=native`. Publishing is OIDC Trusted Publishing to PyPI; `tri-boost-core` is published to crates.io first (`cargo publish -p tri-boost-core`, wait for indexing, then the py crate is not published to crates.io — it ships only as a wheel).
 
 ### 02.8 — `schema_version` policy (OWNED HERE)
 
@@ -313,4 +313,4 @@ CI is two pipelines. **Correctness CI** (every PR, the build `[GATE]`s) runs on 
 
 ### 02.10 — Testing approach for this section
 
-The architecture's own correctness is testable independently of the learner: (1) **a no-pyo3-in-core test** — a CI step asserting `cargo tree -p pattern-boost-core` contains no `pyo3`/`numpy`, plus a non-Python-target (`wasm32`) build of the core; (2) **a `Backend` reproducibility test** — `CpuBackend { n_threads }` for `n ∈ {1,2,8}` over the same fixed inputs must yield byte-identical `Hist` and `predict_block` output (the §1 `[GATE]`); (3) **an error-mapping completeness test** — every `Invariant` variant is reachable and maps to exactly one `PbError::InvariantViolated`, and every public fallible fn in the core returns `Result<_, PbError>` (enforced by clippy + a doc-test convention); (4) **a serde round-trip + `schema_version` test** — `Model`/`TableBank` round-trip through both serde_json and bincode (2.x, frozen `config::standard()`) bit-identically, the `ModelDoc` nested (non-`flatten`) form round-trips through bincode, a bumped-version blob is rejected with `PbError::Serialization`, an aliased old field still loads, and a fixed-width-index model serialized on the host deserializes byte-identically against a `wasm32`-built schema (the `usize`→`u32` guard, §10 owns the format); (5) **a feature-matrix build test** — the core builds and passes the Invariant gates under each combination of `{arrow, distill, nightly}` and with default features only on stable; (6) **a no-panic hot-loop boundary test** — every proven-unchecked `#[allow(clippy::indexing_slicing)]` site of 02.4 (the 8-cell leaf index, `predict_block` bin reads, `Hist` accumulation) has a unit test exercising the extreme indices, and an overflow-trap test confirms `overflow-checks` is live in the test profile (02.3a). These are unit/integration tests in the core plus CI config; none require the Python toolchain, which is itself the point.
+The architecture's own correctness is testable independently of the learner: (1) **a no-pyo3-in-core test** — a CI step asserting `cargo tree -p tri-boost-core` contains no `pyo3`/`numpy`, plus a non-Python-target (`wasm32`) build of the core; (2) **a `Backend` reproducibility test** — `CpuBackend { n_threads }` for `n ∈ {1,2,8}` over the same fixed inputs must yield byte-identical `Hist` and `predict_block` output (the §1 `[GATE]`); (3) **an error-mapping completeness test** — every `Invariant` variant is reachable and maps to exactly one `PbError::InvariantViolated`, and every public fallible fn in the core returns `Result<_, PbError>` (enforced by clippy + a doc-test convention); (4) **a serde round-trip + `schema_version` test** — `Model`/`TableBank` round-trip through both serde_json and bincode (2.x, frozen `config::standard()`) bit-identically, the `ModelDoc` nested (non-`flatten`) form round-trips through bincode, a bumped-version blob is rejected with `PbError::Serialization`, an aliased old field still loads, and a fixed-width-index model serialized on the host deserializes byte-identically against a `wasm32`-built schema (the `usize`→`u32` guard, §10 owns the format); (5) **a feature-matrix build test** — the core builds and passes the Invariant gates under each combination of `{arrow, distill, nightly}` and with default features only on stable; (6) **a no-panic hot-loop boundary test** — every proven-unchecked `#[allow(clippy::indexing_slicing)]` site of 02.4 (the 8-cell leaf index, `predict_block` bin reads, `Hist` accumulation) has a unit test exercising the extreme indices, and an overflow-trap test confirms `overflow-checks` is live in the test profile (02.3a). These are unit/integration tests in the core plus CI config; none require the Python toolchain, which is itself the point.

@@ -117,7 +117,7 @@ pub(crate) fn quantize_gh(g: &[f32], h: &[f32], scale: GradScale, rng: &mut Pcg6
 §12 owns the binding; this section owns the *performance* contract it must honor. All heavy compute runs inside `py.detach` with a **per-call scoped** rayon pool, never the global one:
 
 ```rust
-// In pattern-boost-py (§12), but the perf contract is specified here.
+// In tri-boost-py (§12), but the perf contract is specified here.
 let view = x.as_array();                 // zero-copy ArrayView, GIL held, NOT Send
 let pool = rayon::ThreadPoolBuilder::new().num_threads(n).build()?;
 let model = py.detach(|| pool.install(|| booster.fit(&binned, &y, &spec)))?;  // GIL released
@@ -159,7 +159,7 @@ fn model_is_bit_reproducible_across_thread_counts() -> Result<(), PbError> {
 
 This trains the same fixture at `n_threads ∈ {1, 2, 8}` and asserts byte-equality of the `bincode`-serialized `Model` — the build-blocking determinism gate. Byte-equality holds across platforms because the serialized index fields are fixed-width (`Split.axis: u32`, `BinnedMatrix.n_rows: u32`; §02/§10), never platform-dependent `usize`, and the `bincode::config::standard()` config is frozen (§10). A companion test forces the SIMD dispatch low (SSE2) vs high (AVX-512, where available) and asserts the same byte-equality, proving the dispatched ISA does not perturb the bits. A third runs under `proptest` over random fixtures (sizes, feature counts, seeds) so reproducibility is a property, not a single golden.
 
-**Microbenchmarks (`criterion`, in `benches/`, dev-only — never shipped in the wheel).** One bench per hot kernel: `build_level_hists` (vs `n_rows`, `n_features`, `n_threads`), `quantize_gh`, the prefix-sum gain scan, and prediction throughput (rows/s). These guard against constant-factor regressions and verify the histogram search is `O(1)` in `n_rows` after binning. Benches live behind the workspace's dev-deps and are excluded from `pattern-boost-core`'s published artifact.
+**Microbenchmarks (`criterion`, in `benches/`, dev-only — never shipped in the wheel).** One bench per hot kernel: `build_level_hists` (vs `n_rows`, `n_features`, `n_threads`), `quantize_gh`, the prefix-sum gain scan, and prediction throughput (rows/s). These guard against constant-factor regressions and verify the histogram search is `O(1)` in `n_rows` after binning. Benches live behind the workspace's dev-deps and are excluded from `tri-boost-core`'s published artifact.
 
 **The internal accuracy/speed yardstick (NOT shipped).** Per the AIM and §01, we use **TabArena** with **EBM/GA2M as the headline rival** and unconstrained XGBoost/LightGBM/CatBoost as the accuracy ceiling, purely as a *development* measurement to prove the §01 milestone ("beat EBM, near-parity, all-exact"). It is a script in the repo's dev tooling, run by us; **no benchmarking, model-comparison, or "cost-of-the-cap" tooling ships in the library** (§06 of the brainstorm boundary). Training-speed comparisons here are the evidence base for the honest "parity, not a win" claim — measured, not asserted — and the bagged-vs-bagged comparison against EBM (which itself bags internally) is the fair framing.
 

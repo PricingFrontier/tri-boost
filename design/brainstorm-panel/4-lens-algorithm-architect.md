@@ -1,4 +1,4 @@
-# pattern-boost — The Engine: Core Algorithm & Methodology (Architect's Brainstorm)
+# tri-boost — The Engine: Core Algorithm & Methodology (Architect's Brainstorm)
 
 ## 1. Thesis / the bet
 

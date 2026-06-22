@@ -160,7 +160,7 @@ A depth-3 oblivious tree may split on **up to 3 distinct categorical TS axes**, 
 
 ### 04.7 Forbidding combination CTRs — the load-bearing prohibition
 
-CatBoost's greedy **combinations** concatenate categoricals already in the current tree with each remaining one and CTR-encode the cross (e.g. `city × product`). A combination column packs a multi-feature interaction into **one axis the tree treats as one feature**: a tree splitting on a 2-categorical combination plus two other features depends on **four** raw features — silently breaking the `≤3 raw features ⇒ exact ≤3rd-order fANOVA` invariant that is pattern-boost's reason to exist.
+CatBoost's greedy **combinations** concatenate categoricals already in the current tree with each remaining one and CTR-encode the cross (e.g. `city × product`). A combination column packs a multi-feature interaction into **one axis the tree treats as one feature**: a tree splitting on a 2-categorical combination plus two other features depends on **four** raw features — silently breaking the `≤3 raw features ⇒ exact ≤3rd-order fANOVA` invariant that is tri-boost's reason to exist.
 
 **Decision: combination CTRs are hard-forbidden** — no config flag enables them. Structural enforcement: the encoder only ever emits an axis whose `AxisProvenance.raw` is a **single** `FeatureId`; no code path produces a multi-raw axis, so the §2.5 budget check is a redundant second line of defence, not the only one. `model_size_reg` (which only bites once combinations exist) is therefore a no-op and not implemented. The constructive replacement is §04.6 — strictly better for the explainable-table product, with no opaque crossed axis.
 

@@ -1,6 +1,6 @@
 # Objective Functions for Explainable GBM in Insurance Pricing — Research Report
 
-**Scope note.** `pattern-boost` builds depth-3 symmetric/oblivious trees (each tree = an 8-entry lookup table indexed by 3 binary splits), so the explainable table decomposition maps directly onto a deployable rating-table structure. Throughout, the **raw score** (model output before the inverse link) is denoted `F`; the **prediction on the response scale** is `μ`; for log-link objectives `μ = exp(F)`. Gradient `g = ∂L/∂F` and hessian `h = ∂²L/∂F²` are always taken **with respect to the raw score `F`** — this is the convention every boosting library (XGBoost, LightGBM, sklearn HGBT) uses, and the one the `Loss` trait must implement. All formulas below were verified against library source code (XGBoost `regression_obj.cu`/`elementwise_metric.cu`, LightGBM `regression_objective.hpp`, sklearn `_regression.py`/`_loss`) and the actuarial literature (Wüthrich & Merz; CAS Monograph 5).
+**Scope note.** `tri-boost` builds depth-3 symmetric/oblivious trees (each tree = an 8-entry lookup table indexed by 3 binary splits), so the explainable table decomposition maps directly onto a deployable rating-table structure. Throughout, the **raw score** (model output before the inverse link) is denoted `F`; the **prediction on the response scale** is `μ`; for log-link objectives `μ = exp(F)`. Gradient `g = ∂L/∂F` and hessian `h = ∂²L/∂F²` are always taken **with respect to the raw score `F`** — this is the convention every boosting library (XGBoost, LightGBM, sklearn HGBT) uses, and the one the `Loss` trait must implement. All formulas below were verified against library source code (XGBoost `regression_obj.cu`/`elementwise_metric.cu`, LightGBM `regression_objective.hpp`, sklearn `_regression.py`/`_loss`) and the actuarial literature (Wüthrich & Merz; CAS Monograph 5).
 
 ---
 
@@ -132,9 +132,9 @@ Pure premium = frequency × severity. Two modelling routes:
 
 **Single Tweedie pure-premium model** — one model, `Var ∝ μ^p`. Pros: simplest pipeline; robust; preferred under data/time constraints. Cons — the structural limitation: holding `ϕ` and `p` constant while only `μ` varies bakes in that **frequency and severity move in the same direction**; a factor with opposite-signed effects on frequency vs severity shows up as **insignificant** and "go[es] completely unnoticed."
 
-**Separate frequency (Poisson) + severity (Gamma) models** — Pros: each effect is isolated (cuts through severity noise), counteracting effects are visible, and — critically for `pattern-boost`'s explainability mission — you get **two interpretable rating tables**, one per peril component, exactly how traditional rating plans are structured. Cons: two models to build/validate/combine; needs the freq/sev data split.
+**Separate frequency (Poisson) + severity (Gamma) models** — Pros: each effect is isolated (cuts through severity noise), counteracting effects are visible, and — critically for `tri-boost`'s explainability mission — you get **two interpretable rating tables**, one per peril component, exactly how traditional rating plans are structured. Cons: two models to build/validate/combine; needs the freq/sev data split.
 
-**Implication for `pattern-boost`:** ship **all of** Poisson, Gamma, and Tweedie so users can run either workflow. The frequency-severity route aligns best with the explainable-rating-table goal; Tweedie is the pragmatic single-model fallback.
+**Implication for `tri-boost`:** ship **all of** Poisson, Gamma, and Tweedie so users can run either workflow. The frequency-severity route aligns best with the explainable-rating-table goal; Tweedie is the pragmatic single-model fallback.
 
 ---
 
@@ -190,7 +190,7 @@ Two families:
 **Correctness on average (calibration):**
 - **Deviance** (Poisson / Gamma / Tweedie) — the **default training metric per objective**; a strictly proper scoring rule for the mean under the right variance law (MSE is not, for these). Supports nested-model tests; AIC/BIC for selection.
 - **Actual-vs-Expected (A/E):** `A/E = Σ actual / Σ (exposure × predicted rate)`; closer to 100% = better.
-- **Calibration / auto-calibration:** `E[Y | μ̂(X)] = μ̂(X)`. GLMs with canonical link + intercept guarantee balance `Σμ̂ = Σy`; **GBMs/NNs minimizing deviance often violate total balance** (Denuit et al. 2021) — so `pattern-boost` should report a balance/calibration check and consider an auto-calibration post-step.
+- **Calibration / auto-calibration:** `E[Y | μ̂(X)] = μ̂(X)`. GLMs with canonical link + intercept guarantee balance `Σμ̂ = Σy`; **GBMs/NNs minimizing deviance often violate total balance** (Denuit et al. 2021) — so `tri-boost` should report a balance/calibration check and consider an auto-calibration post-step.
 
 Recommend shipping per-objective deviance as default eval metric, plus Gini (and ordered Gini), lift/quantile plots, and an A-vs-E / balance report.
 
@@ -202,8 +202,8 @@ Recommend shipping per-objective deviance as default eval metric, plus Gini (and
 
 - **GLM** (industry standard) — the linear, **log-link** special case `g(μ) = β₀ + Σβⱼxⱼ`. Log link gives a **multiplicative** tariff: `μ = e^{β₀}·∏ⱼ e^{βⱼxⱼ}`. Exponentiated coefficients **are** the rating relativities.
 - **GAM** — replaces linear terms with smooth shape functions; more flexible, still interpretable.
-- **GBM** — flexible, accurate, but non-additive and discontinuous; needs constraints + post-hoc tools (PDP/ICE/ALE, SHAP) to be deployable. **This is `pattern-boost`'s target gap.**
-- **EBM / GA2M** (InterpretML) — "a tree-based, cyclic gradient-boosting GAM with automatic interaction detection." Directly applied to insurance frequency/severity (Krùpovà et al. 2025). **The closest existing analogue to `pattern-boost`'s goal** — and the bar to clear on interpretability.
+- **GBM** — flexible, accurate, but non-additive and discontinuous; needs constraints + post-hoc tools (PDP/ICE/ALE, SHAP) to be deployable. **This is `tri-boost`'s target gap.**
+- **EBM / GA2M** (InterpretML) — "a tree-based, cyclic gradient-boosting GAM with automatic interaction detection." Directly applied to insurance frequency/severity (Krùpovà et al. 2025). **The closest existing analogue to `tri-boost`'s goal** — and the bar to clear on interpretability.
 - **LocalGLMnet** (Richman & Wüthrich) — interpretable-by-design NN with feature-dependent GLM coefficients; the "interpretability as a model assumption" philosophy to emulate.
 
 **Rating-table / rating-factor deployment** (Werner & Modlin):
@@ -218,11 +218,11 @@ Each categorical variable has a **base level** with relativity `1.000 (= e⁰)`;
 - **EU AI Act (2024/1689)** — Annex III(5)(c) makes **risk assessment & pricing in life/health insurance high-risk**; transparency/data-governance/documentation/human-oversight obligations from **2 Aug 2026**.
 - **US** — ASOP 12 (risk classification), ASOP 56 (Modeling), NAIC Model Bulletin on AI (Dec 2023; no "unfairly discriminatory" outcomes; interpretability + bias testing), Colorado SB21-169 (proxy/disparate-impact testing). Filed rates must not be "excessive, inadequate, or unfairly discriminatory."
 - **UK** — FCA Consumer Duty (price-and-value); IFoA/RSS ethics.
-- **Proxy discrimination** (Prince & Schwarcz 2020) — feature-level interpretability is the principal tool to detect proxies a model constructed. A primary commercial argument for `pattern-boost`'s transparent tables.
+- **Proxy discrimination** (Prince & Schwarcz 2020) — feature-level interpretability is the principal tool to detect proxies a model constructed. A primary commercial argument for `tri-boost`'s transparent tables.
 
 ---
 
-## Design implications for `pattern-boost`
+## Design implications for `tri-boost`
 
 ### Recommended `Loss` trait API
 

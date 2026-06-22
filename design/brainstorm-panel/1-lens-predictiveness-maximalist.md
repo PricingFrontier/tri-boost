@@ -1,4 +1,4 @@
-# pattern-boost — Predictiveness Maximalist Brainstorm
+# tri-boost — Predictiveness Maximalist Brainstorm
 
 *Lens: claw back every drop of accuracy lost to the depth-3 oblivious + order-3 cap, without ever breaking exact ≤3rd-order decomposition.*
 
@@ -40,7 +40,7 @@ The cage (depth-3 oblivious, ≤3 features/tree, additive-across-trees) costs us
 
 ### G. Ensembling
 
-- **EBM-style outer-bag table averaging (linear blend only)** [PREDICTIVENESS + uncertainty]. A linear blend of pattern-boost models is itself exact (sum of scaled ≤3-feature tables). Bag N oblivious ensembles, average their tables on a common merged-threshold union grid → smoother tables + per-cell credibility error bars. Tradeoff: ~8–25× training cost threatens the speed bar and the accuracy lift is marginal — **opt-in, default off, sold on credibility not accuracy.** The cheap half (inner row-subsample bags) ships independently. **Hard rule:** any non-linear meta-learner or black-box base flips to breaks_exactness — reject sklearn's default `StackingRegressor` (RF final estimator).
+- **EBM-style outer-bag table averaging (linear blend only)** [PREDICTIVENESS + uncertainty]. A linear blend of tri-boost models is itself exact (sum of scaled ≤3-feature tables). Bag N oblivious ensembles, average their tables on a common merged-threshold union grid → smoother tables + per-cell credibility error bars. Tradeoff: ~8–25× training cost threatens the speed bar and the accuracy lift is marginal — **opt-in, default off, sold on credibility not accuracy.** The cheap half (inner row-subsample bags) ships independently. **Hard rule:** any non-linear meta-learner or black-box base flips to breaks_exactness — reject sklearn's default `StackingRegressor` (RF final estimator).
 
 ## 3. The 3–5 highest-leverage ideas (my lens)
 

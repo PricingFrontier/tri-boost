@@ -1,4 +1,4 @@
-# pattern-boost — Project Aim
+# tri-boost — Project Aim
 
 > Status: **pre-spec / vision**. This document states *what* we are building and *why*. It deliberately does **not** specify APIs, algorithms, or file layouts — that is the job of the spec, which comes later. The research backing every claim here lives in [`research/`](research/).
 
@@ -6,7 +6,7 @@
 
 ## In one sentence
 
-**pattern-boost is a gradient boosting machine that is completely explainable by construction** — it builds **depth-3 symmetric (oblivious) trees** so the trained ensemble decomposes *losslessly* into a small set of lookup tables (an *exact* functional-ANOVA decomposition, not an approximation) — **while matching the speed and accuracy of XGBoost, LightGBM, and CatBoost** by taking the best engineering from each.
+**tri-boost is a gradient boosting machine that is completely explainable by construction** — it builds **depth-3 symmetric (oblivious) trees** so the trained ensemble decomposes *losslessly* into a small set of lookup tables (an *exact* functional-ANOVA decomposition, not an approximation) — **while matching the speed and accuracy of XGBoost, LightGBM, and CatBoost** by taking the best engineering from each.
 
 ---
 
@@ -22,7 +22,7 @@
 
   a constant + 1-D main-effect tables + 2-D pairwise tables + 3-D triple tables. Each table is human-readable and auditable; prediction is a sum of table lookups that equals the tree ensemble **bit-for-bit**.
 
-This is the load-bearing fact of the whole project. The depth-3 oblivious constraint is usually treated only as a regularizer / inference-speed trick (that is how CatBoost uses it). **pattern-boost treats it as the mechanism for exact explainability** — it is the unique growth policy under which a boosted ensemble has a *finite, exact* decomposition into tables — and optimizes the entire methodology around that property *without paying for it in speed or accuracy*.
+This is the load-bearing fact of the whole project. The depth-3 oblivious constraint is usually treated only as a regularizer / inference-speed trick (that is how CatBoost uses it). **tri-boost treats it as the mechanism for exact explainability** — it is the unique growth policy under which a boosted ensemble has a *finite, exact* decomposition into tables — and optimizes the entire methodology around that property *without paying for it in speed or accuracy*.
 
 ---
 
@@ -33,7 +33,7 @@ Explainable boosting is, today, a trade-off:
 - **EBM / GA2M** (InterpretML) are intelligible but cap interactions at **pairwise (2nd order)**.
 - **XGBoost / LightGBM / CatBoost** are accurate but are black boxes that need post-hoc tools (SHAP, PDP/ICE) to interpret — tools that are themselves approximate and can disagree.
 
-pattern-boost aims for **GBM accuracy with GAM-grade interpretability, extended to exact 3rd-order interactions** — and it gets there by *construction*, not by post-hoc explanation.
+tri-boost aims for **GBM accuracy with GAM-grade interpretability, extended to exact 3rd-order interactions** — and it gets there by *construction*, not by post-hoc explanation.
 
 For **insurance / actuarial pricing** in particular, the table decomposition *is* a deployable **rating-table structure**: with a log link, leaf values exponentiate to multiplicative **relativities**, the base score maps to the base rate, and each oblivious tree reads as a small, auditable interaction-rating cell. It directly supports the **Poisson / Gamma / Tweedie** objectives, **exposure offsets**, and **monotonicity / interaction constraints** that pricing demands — and meets the explainability expectations of GDPR, the EU AI Act, NAIC and the actuarial standards.
 
