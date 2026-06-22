@@ -70,6 +70,20 @@ pub enum PbError {
     #[error("exactness firewall: {0}")]
     ExactnessFirewall(String),
 
+    /// A `TableBank` table (or the whole bank) would exceed its cell budget (§08.10).
+    /// The memory firewall: rather than silently truncate or coarsen a table — which
+    /// would break Reconstruction — the build fails loudly. `what` names the offending
+    /// support, `cells` is its projected `Π cells_i`, and `budget` is the ceiling hit.
+    #[error("table budget exceeded: {what} would materialize {cells} cells (budget {budget})")]
+    TableBudget {
+        /// Which support (or "bank") overflowed.
+        what: String,
+        /// The projected cell count that exceeded the budget.
+        cells: u64,
+        /// The ceiling that was exceeded.
+        budget: u64,
+    },
+
     /// Serialization or deserialization failed, including a `schema_version` /
     /// `format_version` mismatch on load.
     #[error("serialization: {0}")]

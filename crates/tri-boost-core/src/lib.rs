@@ -56,7 +56,7 @@ pub use constraints::{InteractionPolicy, MonoSign, MonotoneMap};
 
 pub use explain::{
     assert_exact_decomposition, check_feature_budget, AxisId, EffectTable, ExactTol, FeatureSet,
-    RefMeasure, TableBank, Tensor,
+    OverflowPolicy, PurifyMode, RefMeasure, TableBank, TableBudget, Tensor,
 };
 
 pub use boosters::{DistillSpec, TeacherKind};
