@@ -61,7 +61,9 @@ pub use engine::{
     ObliviousTree, QuantGradHess, Sampling, Split,
 };
 
-pub use constraints::{InteractionPolicy, MonoSign, MonotoneMap};
+pub use constraints::{
+    inverse_wht8_uniform, wht8_uniform, InteractionPolicy, MonoSign, MonotoneMap, Wht8,
+};
 
 pub use explain::{
     assert_exact_decomposition, check_feature_budget, AxisId, EffectTable, ExactTol, FeatureSet,

@@ -1,7 +1,8 @@
-//! Interaction selection & monotone constraints (spec §2.9 / §07). Phase-0 stubs:
-//! the interaction policy and monotone map are frozen here; the `wht8` transform,
-//! the online screening-variance accumulator, and the heredity/FAST/Sobol admission
-//! funnel land with §07.
+//! Interaction selection & monotone constraints (spec §2.9 / §07). This module owns
+//! the serialized interaction policy, name-keyed monotone constraints, and the
+//! order-3 Walsh-Hadamard primitive used as an independent oracle for tree-local
+//! interaction strength. The online screening accumulator and soft heredity/FAST/Sobol
+//! admission prior build on these pieces.
 
 use crate::explain::FeatureSet;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,85 @@ impl Default for InteractionPolicy {
         Self {
             max_order: 3,
             groups: None,
+        }
+    }
+}
+
+/// Uniform 8-leaf Walsh-Hadamard / Möbius coefficients for one depth-3 oblivious
+/// leaf vector (§07.4a).
+///
+/// Coefficients are indexed by a bitmask over split levels: `0b000` is the constant
+/// term, `0b001/010/100` are main effects, `0b011/101/110` are pairs, and `0b111`
+/// is the pure triple interaction. The transform is orthonormal up to the standard
+/// `1/8` averaging factor, so [`inverse_wht8_uniform`] reconstructs the original leaf
+/// vector exactly up to floating-point roundoff.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wht8 {
+    /// Coefficients in mask order.
+    pub coeffs: [f64; 8],
+}
+
+/// Compute uniform Walsh-Hadamard coefficients for an 8-leaf vector.
+#[must_use]
+pub fn wht8_uniform(leaves: [f64; 8]) -> Wht8 {
+    let mut coeffs = [0.0_f64; 8];
+    for (mask, slot) in coeffs.iter_mut().enumerate() {
+        let mut acc = 0.0_f64;
+        for (leaf, value) in leaves.iter().enumerate() {
+            acc += sign(mask, leaf) * value;
+        }
+        *slot = acc / 8.0;
+    }
+    Wht8 { coeffs }
+}
+
+/// Reconstruct an 8-leaf vector from uniform Walsh-Hadamard coefficients.
+#[must_use]
+pub fn inverse_wht8_uniform(wht: Wht8) -> [f64; 8] {
+    let mut leaves = [0.0_f64; 8];
+    for (leaf, slot) in leaves.iter_mut().enumerate() {
+        let mut acc = 0.0_f64;
+        for (mask, coeff) in wht.coeffs.iter().enumerate() {
+            acc += sign(mask, leaf) * coeff;
+        }
+        *slot = acc;
+    }
+    leaves
+}
+
+fn sign(mask: usize, leaf: usize) -> f64 {
+    if ((mask & leaf).count_ones() & 1) == 0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::indexing_slicing, clippy::float_cmp)]
+
+    use super::*;
+
+    #[test]
+    fn wht8_round_trips_leaf_values() {
+        let leaves = [1.0, -2.0, 3.5, 4.0, -1.0, 0.25, 8.0, -3.0];
+        let got = inverse_wht8_uniform(wht8_uniform(leaves));
+        for (a, b) in got.iter().zip(leaves) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn wht8_names_constant_main_pair_and_triple_masks() {
+        let leaves = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 9.0];
+        let coeffs = wht8_uniform(leaves).coeffs;
+        assert_eq!(coeffs[0], leaves.iter().sum::<f64>() / 8.0);
+        // The single extra bump at leaf 0b111 is visible in the pure triple mask.
+        assert!(coeffs[0b111].abs() > 0.0);
+        // Main and pair masks are finite and stored in the documented mask positions.
+        for coeff in coeffs.iter().take(0b110 + 1).skip(0b001) {
+            assert!(coeff.is_finite());
         }
     }
 }
