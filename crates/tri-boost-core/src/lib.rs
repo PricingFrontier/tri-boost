@@ -40,8 +40,10 @@ pub use error::{Invariant, PbError};
 pub use backend::{pb_rng, pb_seed, CpuBackend, Stage};
 
 pub use data::{
-    bin, bin_columns, build_grid, compute_offset, AxisKind, AxisProvenance, BinConfig,
-    BinnedMatrix, BorderFamily, BorderGrid, FeatureId, ServeBinnedMatrix, TrainBinnedMatrix,
+    bin, bin_columns, bin_serve_columns, bin_train_columns, build_grid, compute_offset, AxisKind,
+    AxisProvenance, BinConfig, BinnedMatrix, BorderFamily, BorderGrid, CategoricalColumn,
+    FeatureId, FittedBinnedData, NumericColumn, ServeBinnedMatrix, ServeCategoricalColumn,
+    TrainBinnedMatrix,
 };
 
 pub use cat::{

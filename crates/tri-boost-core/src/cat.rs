@@ -3,7 +3,7 @@
 //! algorithms land on top of these types; the store and lookup semantics are already
 //! deterministic and total.
 
-use crate::data::FeatureId;
+use crate::data::{BorderGrid, FeatureId};
 use crate::error::PbError;
 use crate::{pb_seed, Stage};
 use serde::{Deserialize, Serialize};
@@ -176,6 +176,92 @@ impl CatEncoder {
             .iter()
             .find(|level| level.label == label)
             .map_or(self.base, |level| level.encoding)
+    }
+
+    /// Reconstruct the ordinal Fisher [`BorderGrid`] for this encoder.
+    ///
+    /// The grid is derived from the stored level encodings and their frozen bin ids,
+    /// so it round-trips with the model schema without persisting duplicate border
+    /// state. Unseen levels are encoded as [`CatEncoder::base`] and then binned
+    /// against this same grid.
+    ///
+    /// # Errors
+    /// [`PbError::InvalidInput`] if the stored encoder has non-finite encodings or
+    /// inconsistent bin ordering; [`PbError::Internal`] on impossible width casts.
+    pub fn border_grid(&self) -> Result<BorderGrid, PbError> {
+        let mut levels = self.levels.clone();
+        levels.sort_by(|a, b| {
+            a.encoding
+                .total_cmp(&b.encoding)
+                .then_with(|| a.label.cmp(&b.label))
+        });
+
+        let mut borders = Vec::new();
+        let mut prev: Option<(u8, f32)> = None;
+        for level in &levels {
+            if !level.encoding.is_finite() {
+                return Err(PbError::InvalidInput {
+                    what: format!(
+                        "categorical encoder {:?}/{:?} has non-finite encoding for `{}`",
+                        self.raw, self.id, level.label
+                    ),
+                });
+            }
+            if level.bin == 0 {
+                return Err(PbError::InvalidInput {
+                    what: format!(
+                        "categorical encoder {:?}/{:?} assigned reserved bin 0 to `{}`",
+                        self.raw, self.id, level.label
+                    ),
+                });
+            }
+            if let Some((prev_bin, prev_encoding)) = prev {
+                if level.bin < prev_bin {
+                    return Err(PbError::InvalidInput {
+                        what: "categorical encoder bins must be non-decreasing in encoding order"
+                            .into(),
+                    });
+                }
+                if level.bin > prev_bin {
+                    if level.encoding <= prev_encoding {
+                        return Err(PbError::InvalidInput {
+                            what: "categorical encoder split tied encodings across bins".into(),
+                        });
+                    }
+                    let border =
+                        ((f64::from(prev_encoding) + f64::from(level.encoding)) / 2.0) as f32;
+                    if !border.is_finite() {
+                        return Err(PbError::InvalidInput {
+                            what: "categorical Fisher border is not finite".into(),
+                        });
+                    }
+                    if borders.last().is_some_and(|last| *last >= border) {
+                        return Err(PbError::InvalidInput {
+                            what: "categorical Fisher borders must be strictly ascending".into(),
+                        });
+                    }
+                    borders.push(border);
+                }
+            }
+            prev = Some((level.bin, level.encoding));
+        }
+        let n_bins =
+            u16::try_from(
+                borders
+                    .len()
+                    .checked_add(2)
+                    .ok_or_else(|| PbError::Internal {
+                        what: "categorical border count overflow".into(),
+                    })?,
+            )
+            .map_err(|_| PbError::Internal {
+                what: "categorical n_bins exceeded u16".into(),
+            })?;
+        Ok(BorderGrid {
+            borders,
+            n_bins,
+            missing_bin: 0,
+        })
     }
 }
 
@@ -499,19 +585,7 @@ fn full_data_encoder(
             weight: term.denom as f32,
         });
     }
-    out.sort_by(|a, b| {
-        a.encoding
-            .total_cmp(&b.encoding)
-            .then_with(|| a.label.cmp(&b.label))
-    });
-    let n_levels = out.len();
-    let n_bins = n_levels.clamp(1, MAX_CAT_BINS);
-    for (i, level) in out.iter_mut().enumerate() {
-        let bin = 1 + (i * n_bins / n_levels);
-        level.bin = u8::try_from(bin).map_err(|_| PbError::Internal {
-            what: "categorical Fisher bin exceeded u8".into(),
-        })?;
-    }
+    assign_fisher_bins(&mut out)?;
     Ok(CatEncoder {
         raw,
         id,
@@ -519,6 +593,50 @@ fn full_data_encoder(
         base,
         config: config.clone(),
     })
+}
+
+fn assign_fisher_bins(levels: &mut [CatLevel]) -> Result<(), PbError> {
+    levels.sort_by(|a, b| {
+        a.encoding
+            .total_cmp(&b.encoding)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    let mut distinct = Vec::<f32>::new();
+    for level in levels.iter() {
+        if !level.encoding.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: format!(
+                    "categorical level `{}` has non-finite encoding",
+                    level.label
+                ),
+            });
+        }
+        if distinct.last() != Some(&level.encoding) {
+            distinct.push(level.encoding);
+        }
+    }
+    let n_distinct = distinct.len();
+    if n_distinct == 0 {
+        return Ok(());
+    }
+    let n_bins = n_distinct.clamp(1, MAX_CAT_BINS);
+    let mut rank = 0usize;
+    let mut prev_encoding: Option<f32> = None;
+    for level in levels.iter_mut() {
+        if let Some(prev) = prev_encoding {
+            if level.encoding != prev {
+                rank = rank.checked_add(1).ok_or_else(|| PbError::Internal {
+                    what: "categorical rank overflow".into(),
+                })?;
+            }
+        }
+        let bin = 1 + (rank * n_bins / n_distinct);
+        level.bin = u8::try_from(bin).map_err(|_| PbError::Internal {
+            what: "categorical Fisher bin exceeded u8".into(),
+        })?;
+        prev_encoding = Some(level.encoding);
+    }
+    Ok(())
 }
 
 fn ordered_training_encodings(
@@ -854,6 +972,33 @@ mod tests {
         assert_eq!(enc.levels.first().unwrap().bin, 1);
         assert_eq!(enc.levels.last().unwrap().bin, 254);
         assert!(enc.levels.windows(2).all(|w| w[0].bin <= w[1].bin));
+    }
+
+    #[test]
+    fn tied_encodings_share_bins_and_reconstruct_a_grid() {
+        let levels = vec!["b", "a", "d", "c"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let y = [1.0_f32, 1.0, 1.0, 1.0];
+        let cfg = TsConfig {
+            leakage: LeakageScheme::KFold { k: 2 },
+            smooth: Smooth::Fixed { m: 0.0 },
+            ..TsConfig::default()
+        };
+        let spec = CatFitSpec {
+            raw: FeatureId(9),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 1,
+        };
+        let (enc, _) = fit_cat_encoder(&levels, &y, spec).unwrap();
+        assert!(enc.levels.iter().all(|level| level.bin == 1));
+        let grid = enc.border_grid().unwrap();
+        assert!(grid.borders.is_empty());
+        assert_eq!(grid.n_bins, 2);
     }
 
     #[test]

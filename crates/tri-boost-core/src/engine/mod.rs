@@ -5,7 +5,7 @@
 
 use crate::cat::CatEncoderStore;
 use crate::constraints::{InteractionPolicy, MonotoneMap};
-use crate::data::{AxisKind, AxisProvenance, BinnedMatrix, BorderGrid};
+use crate::data::{AxisKind, AxisProvenance, BinnedMatrix, BorderGrid, TrainBinnedMatrix};
 use crate::error::{Invariant, PbError};
 use crate::loss::{Link, Loss, ObjectiveTag};
 use serde::{Deserialize, Serialize};
@@ -391,6 +391,31 @@ impl Model {
             return Err(PbError::InvalidInput {
                 what: "schema objective link does not match model link".into(),
             });
+        }
+        for (axis, (prov, kind)) in self
+            .provenance
+            .iter()
+            .zip(&self.schema.feature_kinds)
+            .enumerate()
+        {
+            if prov.kind != *kind {
+                return Err(PbError::ShapeMismatch {
+                    what: format!(
+                        "schema feature_kinds[{axis}] {:?} != provenance kind {:?}",
+                        kind, prov.kind
+                    ),
+                });
+            }
+            if let AxisKind::CategoricalTS { encoding } = prov.kind {
+                if self.schema.cat_encoders.get(encoding, prov.raw).is_err() {
+                    return Err(PbError::InvalidInput {
+                        what: format!(
+                            "categorical axis {axis} references missing encoder {:?}/{:?}",
+                            prov.raw, encoding
+                        ),
+                    });
+                }
+            }
         }
         for (axis, grid) in self.grids.iter().enumerate() {
             if grid.missing_bin != 0 {
@@ -811,6 +836,29 @@ impl Booster {
     /// length mismatch; plus any propagated [`Loss`]/binning/grow error.
     pub fn fit(&self, x: &BinnedMatrix, y: &[f32], spec: &FitSpec) -> Result<Model, PbError> {
         boost::fit(&self.config, x, y, spec)
+    }
+
+    /// Fit from the explicit training-matrix role and persist its frozen
+    /// categorical encoder store into the emitted [`ModelSchema`].
+    ///
+    /// This is the §03.2a/§04 audit seam: tree growth may use leakage-free
+    /// categorical train bins, while the resulting model carries the full-data
+    /// encoders needed to rebuild serve/audit bins after serialization.
+    ///
+    /// # Errors
+    /// Same as [`Booster::fit`], plus [`PbError::InvalidInput`] if a categorical
+    /// axis names an encoder absent from `cat_encoders`.
+    pub fn fit_train(
+        &self,
+        x: &TrainBinnedMatrix,
+        y: &[f32],
+        spec: &FitSpec,
+        cat_encoders: CatEncoderStore,
+    ) -> Result<Model, PbError> {
+        let mut model = boost::fit(&self.config, &x.0, y, spec)?;
+        model.schema.cat_encoders = cat_encoders;
+        model.validate()?;
+        Ok(model)
     }
 }
 

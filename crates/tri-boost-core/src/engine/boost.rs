@@ -380,8 +380,11 @@ mod tests {
         clippy::float_cmp
     )]
     use super::*;
+    use crate::cat::{CatEncoderStore, LeakageScheme, Smooth, TsConfig, TsEncodingId};
     use crate::constraints::MonoSign;
-    use crate::data::{bin_columns, BinConfig};
+    use crate::data::{
+        bin_columns, bin_train_columns, BinConfig, CategoricalColumn, NumericColumn,
+    };
     use crate::engine::{Booster, HistPrecision};
     use crate::explain::{assert_exact_decomposition, FeatureSet, RefMeasure};
     use crate::loss::SquaredError;
@@ -706,6 +709,60 @@ mod tests {
         bad.data[0][0] = u8::MAX;
         assert!(matches!(
             booster.fit(&bad, &y, &spec(&sqe)),
+            Err(PbError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn fit_train_persists_categorical_encoder_store() {
+        let numeric = vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let levels = vec!["low", "high", "low", "high", "mid", "mid"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let y = [1.0_f32, 10.0, 2.0, 12.0, 5.0, 6.0];
+        let ts = TsConfig {
+            leakage: LeakageScheme::KFold { k: 3 },
+            smooth: Smooth::Fixed { m: 0.0 },
+            min_data_per_group: 0.0,
+            ..TsConfig::default()
+        };
+        let fitted = bin_train_columns(
+            &[NumericColumn {
+                raw: crate::data::FeatureId(0),
+                values: &numeric,
+            }],
+            &[CategoricalColumn {
+                raw: crate::data::FeatureId(1),
+                id: TsEncodingId(0),
+                levels: &levels,
+                config: &ts,
+            }],
+            &y,
+            None,
+            None,
+            &BinConfig::default(),
+            12,
+        )
+        .unwrap();
+        let sqe = SquaredError;
+        let booster = Booster::with_config(Config {
+            n_trees: 3,
+            learning_rate: 1.0,
+            lambda: 0.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+        });
+        let model = booster
+            .fit_train(&fitted.train, &y, &spec(&sqe), fitted.cat_encoders.clone())
+            .unwrap();
+        assert_eq!(model.schema.cat_encoders.len(), 1);
+        model.validate().unwrap();
+
+        assert!(matches!(
+            booster.fit_train(&fitted.train, &y, &spec(&sqe), CatEncoderStore::new()),
             Err(PbError::InvalidInput { .. })
         ));
     }

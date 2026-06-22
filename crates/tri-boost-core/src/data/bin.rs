@@ -3,10 +3,56 @@
 //! and the single `+ 1` is bounded by the cardinality invariant, so no indexing can
 //! go out of bounds and no arithmetic can overflow.
 
+use crate::cat::{fit_cat_encoder, CatEncoderStore, CatFitSpec, TsConfig, TsEncodingId};
 use crate::data::grid::build_grid;
 use crate::data::{AxisKind, AxisProvenance, BinConfig, BinnedMatrix, BorderGrid, FeatureId};
+use crate::data::{ServeBinnedMatrix, TrainBinnedMatrix};
 use crate::error::PbError;
 use rayon::prelude::*;
+
+/// One raw numeric column plus its stable raw-feature id.
+#[derive(Debug, Clone, Copy)]
+pub struct NumericColumn<'a> {
+    /// Raw feature id carried into [`AxisProvenance`].
+    pub raw: FeatureId,
+    /// Column values, one per row.
+    pub values: &'a [f32],
+}
+
+/// One raw categorical column to fit as a target-statistic axis.
+#[derive(Debug, Clone, Copy)]
+pub struct CategoricalColumn<'a> {
+    /// Raw feature id carried into [`AxisProvenance`].
+    pub raw: FeatureId,
+    /// Encoder id stamped into [`AxisKind::CategoricalTS`].
+    pub id: TsEncodingId,
+    /// Per-row labels.
+    pub levels: &'a [String],
+    /// Target-statistic configuration.
+    pub config: &'a TsConfig,
+}
+
+/// One raw categorical column to re-encode for serving/auditing.
+#[derive(Debug, Clone, Copy)]
+pub struct ServeCategoricalColumn<'a> {
+    /// Raw feature id.
+    pub raw: FeatureId,
+    /// Encoder id to resolve in the model's [`CatEncoderStore`].
+    pub id: TsEncodingId,
+    /// Per-row labels.
+    pub levels: &'a [String],
+}
+
+/// Output of fitting mixed numeric/categorical columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FittedBinnedData {
+    /// Leakage-free training matrix used to grow trees.
+    pub train: TrainBinnedMatrix,
+    /// Full-data serve/audit matrix for the same rows.
+    pub serve: ServeBinnedMatrix,
+    /// Frozen categorical encoders to persist in [`crate::ModelSchema`].
+    pub cat_encoders: CatEncoderStore,
+}
 
 /// Map a finite-or-missing value to its bin id (spec §03.4).
 ///
@@ -109,6 +155,312 @@ pub fn bin_columns(
     })
 }
 
+/// Fit and bin mixed numeric/categorical training columns.
+///
+/// Numeric columns use the ordinary §03 border builder. Categorical columns fit a
+/// frozen full-data [`CatEncoderStore`] and produce two aligned matrices: the
+/// training matrix bins leakage-free row encodings, while the serve matrix bins the
+/// frozen full-data encodings that will be used after serialization.
+///
+/// # Errors
+/// [`PbError::InvalidConfig`] for invalid bin/target-stat configs;
+/// [`PbError::ShapeMismatch`] for column length mismatches; [`PbError::InvalidInput`]
+/// for invalid row values; plus any propagated binning/encoder error.
+pub fn bin_train_columns(
+    numeric: &[NumericColumn<'_>],
+    categorical: &[CategoricalColumn<'_>],
+    y: &[f32],
+    weight: Option<&[f32]>,
+    exposure: Option<&[f32]>,
+    cfg: &BinConfig,
+    seed: u64,
+) -> Result<FittedBinnedData, PbError> {
+    cfg.validate()?;
+    validate_optional_row_data(y.len(), weight, exposure)?;
+    let n_rows_u32 = u32::try_from(y.len()).map_err(|_| PbError::InvalidInput {
+        what: "more than u32::MAX rows is out of scope for v1".into(),
+    })?;
+
+    let mut train_data = Vec::with_capacity(numeric.len() + categorical.len());
+    let mut serve_data = Vec::with_capacity(numeric.len() + categorical.len());
+    let mut grids = Vec::with_capacity(numeric.len() + categorical.len());
+    let mut provenance = Vec::with_capacity(numeric.len() + categorical.len());
+
+    for col in numeric {
+        if col.values.len() != y.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "numeric raw {:?} len {} != n_rows {}",
+                    col.raw,
+                    col.values.len(),
+                    y.len()
+                ),
+            });
+        }
+        let grid = build_grid(col.values, weight, cfg, seed, col.raw)?;
+        let binned = bin_values(col.values, &grid)?;
+        train_data.push(binned.clone());
+        serve_data.push(binned);
+        grids.push(grid);
+        provenance.push(AxisProvenance {
+            raw: col.raw,
+            kind: AxisKind::Numeric,
+        });
+    }
+
+    let mut encoders = Vec::with_capacity(categorical.len());
+    for col in categorical {
+        if col.levels.len() != y.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "categorical raw {:?} len {} != n_rows {}",
+                    col.raw,
+                    col.levels.len(),
+                    y.len()
+                ),
+            });
+        }
+        if encoders
+            .iter()
+            .any(|enc: &crate::cat::CatEncoder| enc.raw == col.raw && enc.id == col.id)
+        {
+            return Err(PbError::InvalidConfig {
+                what: format!(
+                    "duplicate categorical encoder {:?} for raw {:?}",
+                    col.id, col.raw
+                ),
+            });
+        }
+        let (encoder, train_encoded) = fit_cat_encoder(
+            col.levels,
+            y,
+            CatFitSpec {
+                raw: col.raw,
+                id: col.id,
+                weight,
+                exposure,
+                config: col.config,
+                seed,
+            },
+        )?;
+        let grid = encoder.border_grid()?;
+        let train_bins = bin_values(&train_encoded, &grid)?;
+        let serve_encoded: Vec<f32> = col
+            .levels
+            .iter()
+            .map(|level| encoder.encode_label(level))
+            .collect();
+        let serve_bins = bin_values(&serve_encoded, &grid)?;
+        train_data.push(train_bins);
+        serve_data.push(serve_bins);
+        grids.push(grid);
+        provenance.push(AxisProvenance {
+            raw: col.raw,
+            kind: AxisKind::CategoricalTS { encoding: col.id },
+        });
+        encoders.push(encoder);
+    }
+
+    let cat_encoders = CatEncoderStore::from_encoders(encoders);
+    Ok(FittedBinnedData {
+        train: TrainBinnedMatrix(BinnedMatrix {
+            data: train_data,
+            n_rows: n_rows_u32,
+            grids: grids.clone(),
+            provenance: provenance.clone(),
+        }),
+        serve: ServeBinnedMatrix(BinnedMatrix {
+            data: serve_data,
+            n_rows: n_rows_u32,
+            grids,
+            provenance,
+        }),
+        cat_encoders,
+    })
+}
+
+/// Re-bin mixed raw serve columns against a fitted model's grids/provenance.
+///
+/// Numeric values are binned through the persisted grids. Categorical labels are
+/// encoded through the frozen [`CatEncoderStore`], with unseen labels mapping to the
+/// encoder base value.
+///
+/// # Errors
+/// [`PbError::ShapeMismatch`] if inputs are missing or row counts differ;
+/// [`PbError::Internal`] if a categorical provenance references a missing encoder;
+/// plus any propagated binning error.
+pub fn bin_serve_columns(
+    numeric: &[NumericColumn<'_>],
+    categorical: &[ServeCategoricalColumn<'_>],
+    grids: &[BorderGrid],
+    provenance: &[AxisProvenance],
+    cat_encoders: &CatEncoderStore,
+) -> Result<ServeBinnedMatrix, PbError> {
+    if grids.len() != provenance.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "serve grids len {} != provenance len {}",
+                grids.len(),
+                provenance.len()
+            ),
+        });
+    }
+    let n_rows = infer_serve_n_rows(numeric, categorical)?;
+    let mut data = Vec::with_capacity(provenance.len());
+    for (axis, (prov, grid)) in provenance.iter().zip(grids).enumerate() {
+        match prov.kind {
+            AxisKind::Numeric => {
+                let values = find_numeric_column(numeric, prov.raw)?;
+                if values.len() != n_rows {
+                    return Err(PbError::ShapeMismatch {
+                        what: format!(
+                            "numeric raw {:?} len {} != n_rows {n_rows}",
+                            prov.raw,
+                            values.len()
+                        ),
+                    });
+                }
+                data.push(bin_values(values, grid)?);
+            }
+            AxisKind::CategoricalTS { encoding } => {
+                let levels = find_categorical_column(categorical, prov.raw, encoding)?;
+                if levels.len() != n_rows {
+                    return Err(PbError::ShapeMismatch {
+                        what: format!(
+                            "categorical raw {:?}/{:?} len {} != n_rows {n_rows}",
+                            prov.raw,
+                            encoding,
+                            levels.len()
+                        ),
+                    });
+                }
+                let encoder = cat_encoders.get(encoding, prov.raw)?;
+                let encoded: Vec<f32> = levels
+                    .iter()
+                    .map(|level| encoder.encode_label(level))
+                    .collect();
+                data.push(bin_values(&encoded, grid)?);
+            }
+            AxisKind::Missing => {
+                return Err(PbError::InvalidInput {
+                    what: format!(
+                        "serve axis {axis} is a standalone Missing axis; unsupported in v1"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(ServeBinnedMatrix(BinnedMatrix {
+        data,
+        n_rows: u32::try_from(n_rows).map_err(|_| PbError::InvalidInput {
+            what: "more than u32::MAX rows is out of scope for v1".into(),
+        })?,
+        grids: grids.to_vec(),
+        provenance: provenance.to_vec(),
+    }))
+}
+
+fn validate_optional_row_data(
+    n_rows: usize,
+    weight: Option<&[f32]>,
+    exposure: Option<&[f32]>,
+) -> Result<(), PbError> {
+    if let Some(w) = weight {
+        if w.len() != n_rows {
+            return Err(PbError::ShapeMismatch {
+                what: format!("weight len {} != n_rows {n_rows}", w.len()),
+            });
+        }
+    }
+    if let Some(e) = exposure {
+        if e.len() != n_rows {
+            return Err(PbError::ShapeMismatch {
+                what: format!("exposure len {} != n_rows {n_rows}", e.len()),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn bin_values(values: &[f32], grid: &BorderGrid) -> Result<Vec<u8>, PbError> {
+    let mut out = Vec::with_capacity(values.len());
+    for &value in values {
+        out.push(bin(value, grid)?);
+    }
+    Ok(out)
+}
+
+fn infer_serve_n_rows(
+    numeric: &[NumericColumn<'_>],
+    categorical: &[ServeCategoricalColumn<'_>],
+) -> Result<usize, PbError> {
+    let mut n_rows = None;
+    for col in numeric {
+        n_rows = Some(match n_rows {
+            Some(n) if n != col.values.len() => {
+                return Err(PbError::ShapeMismatch {
+                    what: "serve numeric columns have unequal lengths".into(),
+                });
+            }
+            Some(n) => n,
+            None => col.values.len(),
+        });
+    }
+    for col in categorical {
+        n_rows = Some(match n_rows {
+            Some(n) if n != col.levels.len() => {
+                return Err(PbError::ShapeMismatch {
+                    what: "serve categorical columns have unequal lengths".into(),
+                });
+            }
+            Some(n) => n,
+            None => col.levels.len(),
+        });
+    }
+    Ok(n_rows.unwrap_or(0))
+}
+
+fn find_numeric_column<'a>(
+    columns: &'a [NumericColumn<'a>],
+    raw: FeatureId,
+) -> Result<&'a [f32], PbError> {
+    let mut found = None;
+    for col in columns {
+        if col.raw == raw {
+            if found.is_some() {
+                return Err(PbError::ShapeMismatch {
+                    what: format!("duplicate numeric raw column {raw:?}"),
+                });
+            }
+            found = Some(col.values);
+        }
+    }
+    found.ok_or_else(|| PbError::ShapeMismatch {
+        what: format!("missing numeric raw column {raw:?}"),
+    })
+}
+
+fn find_categorical_column<'a>(
+    columns: &'a [ServeCategoricalColumn<'a>],
+    raw: FeatureId,
+    id: TsEncodingId,
+) -> Result<&'a [String], PbError> {
+    let mut found = None;
+    for col in columns {
+        if col.raw == raw && col.id == id {
+            if found.is_some() {
+                return Err(PbError::ShapeMismatch {
+                    what: format!("duplicate categorical raw/id column {raw:?}/{id:?}"),
+                });
+            }
+            found = Some(col.levels);
+        }
+    }
+    found.ok_or_else(|| PbError::ShapeMismatch {
+        what: format!("missing categorical raw/id column {raw:?}/{id:?}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -118,6 +470,7 @@ mod tests {
         clippy::panic
     )]
     use super::*;
+    use crate::cat::{LeakageScheme, Smooth, TsConfig, TsEncodingId};
 
     fn grid(borders: Vec<f32>) -> BorderGrid {
         let n_bins = u16::try_from(borders.len() + 2).unwrap();
@@ -195,5 +548,79 @@ mod tests {
             bin_columns(&cols, None, &BinConfig::default(), 0),
             Err(PbError::ShapeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn mixed_train_and_serve_constructors_preserve_categorical_schema() {
+        let numeric = vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let levels = vec!["low", "high", "low", "high", "mid", "mid"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let y = [1.0_f32, 10.0, 2.0, 12.0, 5.0, 6.0];
+        let ts = TsConfig {
+            leakage: LeakageScheme::KFold { k: 3 },
+            smooth: Smooth::Fixed { m: 0.0 },
+            min_data_per_group: 0.0,
+            ..TsConfig::default()
+        };
+        let fitted = bin_train_columns(
+            &[NumericColumn {
+                raw: FeatureId(0),
+                values: &numeric,
+            }],
+            &[CategoricalColumn {
+                raw: FeatureId(1),
+                id: TsEncodingId(0),
+                levels: &levels,
+                config: &ts,
+            }],
+            &y,
+            None,
+            None,
+            &BinConfig::default(),
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(fitted.cat_encoders.len(), 1);
+        assert_eq!(fitted.train.0.data.len(), 2);
+        assert_eq!(fitted.serve.0.data.len(), 2);
+        assert_eq!(fitted.train.0.data[0], fitted.serve.0.data[0]);
+        assert!(matches!(
+            fitted.serve.0.provenance[1].kind,
+            AxisKind::CategoricalTS {
+                encoding: TsEncodingId(0)
+            }
+        ));
+
+        let new_numeric = vec![1.0_f32, 2.0, 3.0];
+        let new_levels = vec!["high", "unseen", "low"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let served = bin_serve_columns(
+            &[NumericColumn {
+                raw: FeatureId(0),
+                values: &new_numeric,
+            }],
+            &[ServeCategoricalColumn {
+                raw: FeatureId(1),
+                id: TsEncodingId(0),
+                levels: &new_levels,
+            }],
+            &fitted.serve.0.grids,
+            &fitted.serve.0.provenance,
+            &fitted.cat_encoders,
+        )
+        .unwrap();
+        assert_eq!(served.0.n_rows, 3);
+        let enc = fitted
+            .cat_encoders
+            .get(TsEncodingId(0), FeatureId(1))
+            .unwrap();
+        let cat_grid = enc.border_grid().unwrap();
+        let unseen_bin = bin(enc.base, &cat_grid).unwrap();
+        assert_eq!(served.0.data[1][1], unseen_bin);
     }
 }

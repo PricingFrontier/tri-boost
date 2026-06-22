@@ -20,7 +20,10 @@ pub mod bin;
 pub mod exposure;
 pub mod grid;
 
-pub use bin::{bin, bin_columns};
+pub use bin::{
+    bin, bin_columns, bin_serve_columns, bin_train_columns, CategoricalColumn, FittedBinnedData,
+    NumericColumn, ServeCategoricalColumn,
+};
 pub use exposure::compute_offset;
 pub use grid::build_grid;
 
