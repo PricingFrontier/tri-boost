@@ -20,5 +20,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 tri-boost-core = { path = "../tri-boost-core", version = "0.1.0" }
+rayon = { workspace = true }
 pyo3  = { workspace = true, features = ["extension-module", "abi3-py310"] }
 numpy = { workspace = true }

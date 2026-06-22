@@ -1,16 +1,41 @@
-"""tri-boost — a depth-3 oblivious GBM, exactly decomposable into fANOVA tables.
-
-Phase-0 skeleton (spec §12). The sklearn-compatible estimators
-(``TriBoostRegressor`` / ``TriBoostClassifier``) and the zero-copy numpy/Arrow
-interop are wired here once the §12 binding lands; for now this package only
-re-exports the compiled extension module so the import path is stable.
-"""
+"""tri-boost: exact depth-3 oblivious boosting with fANOVA tables."""
 
 from __future__ import annotations
 
-# The compiled Rust extension (built by maturin from crates/tri-boost-py). It is an
-# empty module in Phase 0; the estimator classes attach to it in §12.
-from . import _tri_boost  # noqa: F401
+from ._tri_boost import (
+    _Booster,
+    _Model,
+    _TableBank,
+    ExactnessError,
+    InternalError,
+    InvariantError,
+    SerializationError,
+    TriBoostError,
+)
 
-__all__: list[str] = []
+__all__ = [
+    "TriBoostClassifier",
+    "TriBoostRegressor",
+    "PrecisionWarning",
+    "_Booster",
+    "_Model",
+    "_TableBank",
+    "TriBoostError",
+    "InvariantError",
+    "ExactnessError",
+    "SerializationError",
+    "InternalError",
+]
 __version__ = "0.1.0"
+
+
+def __getattr__(name: str):
+    if name in {"TriBoostClassifier", "TriBoostRegressor", "PrecisionWarning"}:
+        from .sklearn import PrecisionWarning, TriBoostClassifier, TriBoostRegressor
+
+        return {
+            "TriBoostClassifier": TriBoostClassifier,
+            "TriBoostRegressor": TriBoostRegressor,
+            "PrecisionWarning": PrecisionWarning,
+        }[name]
+    raise AttributeError(name)

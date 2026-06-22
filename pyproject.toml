@@ -11,6 +11,10 @@ name = "tri-boost"
 description = "A depth-3 oblivious GBM that is exactly decomposable into ≤3rd-order fANOVA tables."
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
+dependencies = [
+  "numpy>=1.23",
+  "scikit-learn>=1.2",
+]
 classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: 3",
