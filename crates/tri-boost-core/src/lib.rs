@@ -44,7 +44,9 @@ pub use data::{
     BinnedMatrix, BorderFamily, BorderGrid, FeatureId, ServeBinnedMatrix, TrainBinnedMatrix,
 };
 
-pub use cat::{CatEncoder, CatEncoderStore, TsEncodingId};
+pub use cat::{
+    CatEncoder, CatEncoderStore, CatLevel, LeakageScheme, Smooth, TsConfig, TsEncodingId,
+};
 
 pub use loss::{
     Gamma, GradHess, Link, Logistic, Loss, LossId, Metric, ObjectiveTag, Poisson, SquaredError,
