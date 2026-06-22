@@ -86,6 +86,53 @@ impl Default for TsConfig {
     }
 }
 
+impl TsConfig {
+    /// Validate categorical encoder configuration.
+    ///
+    /// # Errors
+    /// [`PbError::InvalidConfig`] if a count/smoothing parameter is outside its
+    /// finite domain.
+    pub fn validate(&self) -> Result<(), PbError> {
+        match self.leakage {
+            LeakageScheme::Ordered { n_perms } => {
+                if n_perms == 0 {
+                    return Err(PbError::InvalidConfig {
+                        what: "Ordered target statistics require n_perms > 0".into(),
+                    });
+                }
+            }
+            LeakageScheme::KFold { k } => {
+                if k < 2 {
+                    return Err(PbError::InvalidConfig {
+                        what: format!("KFold target statistics require k >= 2, got {k}"),
+                    });
+                }
+            }
+        }
+        if self.target_borders == 0 {
+            return Err(PbError::InvalidConfig {
+                what: "target_borders must be > 0".into(),
+            });
+        }
+        if !self.min_data_per_group.is_finite() || self.min_data_per_group < 0.0 {
+            return Err(PbError::InvalidConfig {
+                what: format!(
+                    "min_data_per_group must be finite and >= 0, got {}",
+                    self.min_data_per_group
+                ),
+            });
+        }
+        if let Smooth::Fixed { m } = self.smooth {
+            if !m.is_finite() || m < 0.0 {
+                return Err(PbError::InvalidConfig {
+                    what: format!("Smooth::Fixed m must be finite and >= 0, got {m}"),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One frozen categorical level in serve/export order (spec §04.4/§04.12).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatLevel {
@@ -173,6 +220,134 @@ impl CatEncoderStore {
     }
 }
 
+/// Exposure-weighted base rate for categorical target statistics (§04.3/§03.7):
+/// `p = Σ w_i y_i / Σ w_i e_i`, with `e_i = 1` when `exposure` is absent.
+///
+/// # Errors
+/// [`PbError::ShapeMismatch`] on length mismatch; [`PbError::InvalidInput`] on
+/// non-finite labels/weights/exposures, negative weights, non-positive exposure, or
+/// a zero denominator.
+pub fn exposure_weighted_base_rate(
+    y: &[f32],
+    weight: &[f32],
+    exposure: Option<&[f32]>,
+) -> Result<f32, PbError> {
+    if weight.len() != y.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "categorical base rate: y={}, weight={}",
+                y.len(),
+                weight.len()
+            ),
+        });
+    }
+    if let Some(e) = exposure {
+        if e.len() != y.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!("categorical base rate: y={}, exposure={}", y.len(), e.len()),
+            });
+        }
+    }
+    let mut sum_wy = 0.0_f64;
+    let mut sum_we = 0.0_f64;
+    for (i, (&yi, &wi)) in y.iter().zip(weight).enumerate() {
+        if !yi.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: format!("categorical y[{i}] must be finite, got {yi}"),
+            });
+        }
+        if !wi.is_finite() || wi < 0.0 {
+            return Err(PbError::InvalidInput {
+                what: format!("categorical weight[{i}] must be finite and >= 0, got {wi}"),
+            });
+        }
+        let e = match exposure {
+            Some(ex) => {
+                let ei = *ex.get(i).ok_or_else(|| PbError::Internal {
+                    what: "validated exposure lost a row".into(),
+                })?;
+                if !ei.is_finite() || ei <= 0.0 {
+                    return Err(PbError::InvalidInput {
+                        what: format!("categorical exposure[{i}] must be finite and > 0, got {ei}"),
+                    });
+                }
+                f64::from(ei)
+            }
+            None => 1.0,
+        };
+        let w = f64::from(wi);
+        sum_wy += w * f64::from(yi);
+        sum_we += w * e;
+    }
+    if sum_we <= 0.0 {
+        return Err(PbError::InvalidInput {
+            what: "categorical base rate denominator Σw·e must be > 0".into(),
+        });
+    }
+    let out = (sum_wy / sum_we) as f32;
+    if out.is_finite() {
+        Ok(out)
+    } else {
+        Err(PbError::InvalidInput {
+            what: format!(
+                "categorical base rate is not representable as f32: {}",
+                sum_wy / sum_we
+            ),
+        })
+    }
+}
+
+/// Closed-form target-statistic shrinkage (§04.3):
+/// `(sum_wy + m·base) / (sum_w + m)`.
+///
+/// # Errors
+/// [`PbError::InvalidInput`] if inputs are non-finite or the denominator is zero;
+/// [`PbError::InvalidConfig`] for [`Smooth::Auto`], whose variance estimator belongs
+/// to the full encoder-fit path.
+pub fn shrunken_encoding(
+    sum_wy: f64,
+    sum_w: f64,
+    base: f32,
+    smooth: Smooth,
+) -> Result<f32, PbError> {
+    if !sum_wy.is_finite() || !sum_w.is_finite() || sum_w < 0.0 || !base.is_finite() {
+        return Err(PbError::InvalidInput {
+            what: format!(
+                "invalid categorical shrinkage inputs: sum_wy={sum_wy}, sum_w={sum_w}, base={base}"
+            ),
+        });
+    }
+    let m = match smooth {
+        Smooth::Fixed { m } => {
+            if !m.is_finite() || m < 0.0 {
+                return Err(PbError::InvalidConfig {
+                    what: format!("Smooth::Fixed m must be finite and >= 0, got {m}"),
+                });
+            }
+            f64::from(m)
+        }
+        Smooth::Auto => {
+            return Err(PbError::InvalidConfig {
+                what: "Smooth::Auto requires the full encoder-fit variance estimator".into(),
+            });
+        }
+    };
+    let denom = sum_w + m;
+    if denom <= 0.0 {
+        return Err(PbError::InvalidInput {
+            what: "categorical shrinkage denominator sum_w + m must be > 0".into(),
+        });
+    }
+    let out = ((sum_wy + m * f64::from(base)) / denom) as f32;
+    if out.is_finite() {
+        Ok(out)
+    } else {
+        Err(PbError::InvalidInput {
+            what: "categorical shrinkage output is not finite".into(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -223,5 +398,63 @@ mod tests {
             bincode::serde::decode_from_slice(&a, cfg).unwrap();
         assert_eq!(len, a.len());
         assert_eq!(decoded, store);
+    }
+
+    #[test]
+    fn ts_config_validates_fail_closed() {
+        assert!(TsConfig::default().validate().is_ok());
+        assert!(matches!(
+            TsConfig {
+                leakage: LeakageScheme::Ordered { n_perms: 0 },
+                ..TsConfig::default()
+            }
+            .validate(),
+            Err(PbError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            TsConfig {
+                leakage: LeakageScheme::KFold { k: 1 },
+                ..TsConfig::default()
+            }
+            .validate(),
+            Err(PbError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            TsConfig {
+                smooth: Smooth::Fixed { m: f32::NAN },
+                ..TsConfig::default()
+            }
+            .validate(),
+            Err(PbError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn base_rate_matches_exposure_weighted_closed_form() {
+        let y = [2.0_f32, 8.0, 10.0];
+        let w = [1.0_f32, 2.0, 1.0];
+        let e = [1.0_f32, 2.0, 4.0];
+        let got = exposure_weighted_base_rate(&y, &w, Some(&e)).unwrap();
+        let want = (1.0 * 2.0 + 2.0 * 8.0 + 1.0 * 10.0) / (1.0 * 1.0 + 2.0 * 2.0 + 1.0 * 4.0);
+        assert!((got - want).abs() < 1e-6);
+        assert!(matches!(
+            exposure_weighted_base_rate(&y, &[0.0, 0.0, 0.0], None),
+            Err(PbError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn shrinkage_matches_closed_form_and_auto_fails_closed() {
+        let got = shrunken_encoding(30.0, 3.0, 5.0, Smooth::Fixed { m: 2.0 }).unwrap();
+        let want = (30.0 + 2.0 * 5.0) / (3.0 + 2.0);
+        assert!((got - want).abs() < 1e-6);
+        assert_eq!(
+            shrunken_encoding(0.0, 0.0, 7.0, Smooth::Fixed { m: 4.0 }).unwrap(),
+            7.0
+        );
+        assert!(matches!(
+            shrunken_encoding(1.0, 1.0, 0.0, Smooth::Auto),
+            Err(PbError::InvalidConfig { .. })
+        ));
     }
 }

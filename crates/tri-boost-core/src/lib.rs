@@ -45,7 +45,8 @@ pub use data::{
 };
 
 pub use cat::{
-    CatEncoder, CatEncoderStore, CatLevel, LeakageScheme, Smooth, TsConfig, TsEncodingId,
+    exposure_weighted_base_rate, shrunken_encoding, CatEncoder, CatEncoderStore, CatLevel,
+    LeakageScheme, Smooth, TsConfig, TsEncodingId,
 };
 
 pub use loss::{
