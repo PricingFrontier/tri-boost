@@ -119,9 +119,13 @@ pub struct ServeBinnedMatrix(pub BinnedMatrix);
 /// The interior-border family used by [`grid::build_grid`] (spec §03.11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BorderFamily {
-    /// Equal-count (equal-frequency) quantile borders. The v1 default.
+    /// Equal-count (equal-frequency) quantile borders. The only family implemented
+    /// in v1, and the default.
     EqualCount,
     /// Hessian-weighted (equal Newton-loss-mass) borders. A v1.5 fork (§03.11).
+    /// Named here to match the §03.2 canonical type, but **not yet implemented** —
+    /// [`BinConfig::validate`] rejects it with `InvalidConfig` so a caller can never
+    /// silently receive equal-count grids when they asked for Hessian-weighted ones.
     HessianWeighted,
 }
 
@@ -156,8 +160,10 @@ impl BinConfig {
     /// Validate the configuration.
     ///
     /// # Errors
-    /// [`crate::PbError::InvalidConfig`] if `max_bin < 2` (a grid needs at least one
-    /// data bin plus the missing bin) or `subsample_for_binning == 0`.
+    /// [`crate::PbError::InvalidConfig`] if `max_bin` is outside `2..=254`,
+    /// `subsample_for_binning == 0`, or `border_family` names an unimplemented family
+    /// ([`BorderFamily::HessianWeighted`] is a v1.5 fork — rejected so it can never
+    /// silently fall through to equal-count borders).
     pub fn validate(&self) -> Result<(), crate::PbError> {
         if self.max_bin < 2 {
             return Err(crate::PbError::InvalidConfig {
@@ -176,6 +182,66 @@ impl BinConfig {
                 what: "subsample_for_binning must be > 0".into(),
             });
         }
+        // Fail fast on an accepted-but-unimplemented border family: v1 builds only
+        // EqualCount borders (§03.11), and build_grid does not branch on this field,
+        // so accepting HessianWeighted would silently return equal-count grids.
+        if matches!(self.border_family, BorderFamily::HessianWeighted) {
+            return Err(crate::PbError::InvalidConfig {
+                what: "BorderFamily::HessianWeighted is a v1.5 fork (§03.11); v1 supports only EqualCount".into(),
+            });
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+    use super::*;
+    use crate::PbError;
+
+    #[test]
+    fn default_equal_count_config_validates() {
+        assert!(BinConfig::default().validate().is_ok());
+        assert_eq!(BinConfig::default().border_family, BorderFamily::EqualCount);
+    }
+
+    #[test]
+    fn hessian_weighted_is_rejected_in_v1() {
+        // The variant exists (matches the §03.2 canonical type) but v1 must NOT
+        // silently fall back to equal-count borders — it fails fast instead.
+        let cfg = BinConfig {
+            border_family: BorderFamily::HessianWeighted,
+            ..BinConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })));
+        // build_grid / bin_columns both call validate() first, so the rejection
+        // propagates through the whole binning entrypoint.
+        let g = grid::build_grid(&[1.0, 2.0, 3.0], None, &cfg, 0, FeatureId(0));
+        assert!(matches!(g, Err(PbError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn max_bin_must_be_in_2_254() {
+        for bad in [0u8, 1, 255] {
+            let cfg = BinConfig {
+                max_bin: bad,
+                ..BinConfig::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })),
+                "max_bin={bad} should be rejected"
+            );
+        }
+        let ok = BinConfig {
+            max_bin: 254,
+            ..BinConfig::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 }
