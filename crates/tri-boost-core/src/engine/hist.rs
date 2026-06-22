@@ -20,11 +20,21 @@
 // tests below; `dead_code` is expected until M1.4 wires them into `grow_oblivious_tree`.
 #![allow(dead_code)]
 
+use crate::backend::{pb_seed, Stage};
 use crate::data::BinnedMatrix;
-use crate::engine::Hist;
+use crate::engine::{GradScale, Hist, QuantGradHess};
 use crate::error::PbError;
 use crate::loss::GradHess;
 use rayon::prelude::*;
+
+/// Deterministic quantization re-seed coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuantizeContext {
+    /// Base model seed.
+    pub seed: u64,
+    /// Boosting round.
+    pub round: u32,
+}
 
 fn oob(what: &'static str) -> impl Fn() -> PbError {
     move || PbError::Internal { what: what.into() }
@@ -122,11 +132,191 @@ pub(crate) fn build_histogram(
     Ok(hist)
 }
 
+/// Quantize full-precision gradients/hessians for the integer histogram path
+/// (§06/§11 M5-QHIST).
+///
+/// Scale factors map the maximum absolute value to the i32 range. FLAG (spec
+/// reconciliation): M5-QHIST asks for stochastic rounding AND a `< 0.5 / scale` error
+/// bound; adjacent stochastic rounding can miss by nearly one step, so this path uses
+/// nearest rounding with deterministic randomized tie-breaking keyed by the frozen
+/// `Stage::Quantize` stream. The result is deterministic by row position, independent
+/// of thread count, and bounded by half a quantization step.
+///
+/// # Errors
+/// [`PbError::ShapeMismatch`] if `g`/`h` lengths differ; [`PbError::InvalidInput`] if
+/// any value is non-finite or if a row index exceeds the frozen re-seed coordinate.
+pub fn quantize_grad_hess(gh: &GradHess, seed: u64, round: u32) -> Result<QuantGradHess, PbError> {
+    if gh.g.len() != gh.h.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!("GradHess g len {} != h len {}", gh.g.len(), gh.h.len()),
+        });
+    }
+    let mut max_g = 0.0_f64;
+    let mut max_h = 0.0_f64;
+    for (i, (&g, &h)) in gh.g.iter().zip(&gh.h).enumerate() {
+        if !g.is_finite() || !h.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: format!("GradHess row {i} must be finite before quantization"),
+            });
+        }
+        max_g = max_g.max(f64::from(g).abs());
+        max_h = max_h.max(f64::from(h).abs());
+    }
+    let g_scale = scale_for(max_g)?;
+    let h_scale = scale_for(max_h)?;
+    let mut g_q = Vec::with_capacity(gh.g.len());
+    let mut h_q = Vec::with_capacity(gh.h.len());
+    for (i, (&g, &h)) in gh.g.iter().zip(&gh.h).enumerate() {
+        let base = u32::try_from(i).map_err(|_| PbError::InvalidInput {
+            what: "quantization supports at most u32::MAX rows".into(),
+        })?;
+        let block_g = base.checked_mul(2).ok_or_else(|| PbError::InvalidInput {
+            what: "quantization row coordinate overflowed".into(),
+        })?;
+        let block_h = block_g
+            .checked_add(1)
+            .ok_or_else(|| PbError::InvalidInput {
+                what: "quantization row coordinate overflowed".into(),
+            })?;
+        g_q.push(stochastic_round(
+            f64::from(g) * f64::from(g_scale),
+            seed,
+            round,
+            block_g,
+        )?);
+        h_q.push(stochastic_round(
+            f64::from(h) * f64::from(h_scale),
+            seed,
+            round,
+            block_h,
+        )?);
+    }
+    Ok(QuantGradHess {
+        g_q,
+        h_q,
+        scale: GradScale { g_scale, h_scale },
+    })
+}
+
+fn scale_for(max_abs: f64) -> Result<f32, PbError> {
+    let scale = if max_abs > 0.0 {
+        (f64::from(i32::MAX) * 0.5) / max_abs
+    } else {
+        1.0
+    };
+    let out = scale as f32;
+    if out.is_finite() && out > 0.0 {
+        Ok(out)
+    } else {
+        Err(PbError::InvalidInput {
+            what: format!("quantization scale is not finite: {scale}"),
+        })
+    }
+}
+
+fn stochastic_round(value: f64, seed: u64, round: u32, block: u32) -> Result<i32, PbError> {
+    let lo = value.floor();
+    let frac = value - lo;
+    let bits = pb_seed(seed, round, Stage::Quantize as u32, block);
+    let unit = ((bits >> 11) as f64 + 1.0) / ((1_u64 << 53) as f64 + 1.0);
+    let rounded = if frac > 0.5 {
+        lo + 1.0
+    } else if frac < 0.5 {
+        lo
+    } else if unit < 0.5 {
+        lo + 1.0
+    } else {
+        lo
+    };
+    if rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
+        return Err(PbError::InvalidInput {
+            what: format!("quantized value {rounded} escaped i32"),
+        });
+    }
+    Ok(rounded as i32)
+}
+
+/// Build a histogram via quantized integer accumulation, then dequantize into the
+/// canonical [`Hist`] view for the existing split scanner.
+///
+/// # Errors
+/// Propagates quantization and shape/index errors.
+pub(crate) fn build_quantized_histogram(
+    x: &BinnedMatrix,
+    gh: &GradHess,
+    rows: &[u32],
+    leaf_of_row: &[u8],
+    n_leaves: usize,
+    axes: &[u32],
+    ctx: QuantizeContext,
+) -> Result<Hist, PbError> {
+    let qgh = quantize_grad_hess(gh, ctx.seed, ctx.round)?;
+    let mut max_bins = 0usize;
+    for &a in axes {
+        let grid = x
+            .grids
+            .get(a as usize)
+            .ok_or_else(oob("axis has no grid"))?;
+        max_bins = max_bins.max(usize::from(grid.n_bins));
+    }
+    let n_axes = axes.len();
+    let subs: Result<Vec<AxisQHist>, PbError> = axes
+        .par_iter()
+        .map(|&a| accumulate_axis_quantized(x, &qgh, rows, leaf_of_row, n_leaves, a, max_bins))
+        .collect();
+    let subs = subs?;
+    let mut hist = Hist::try_zeros(n_leaves, n_axes, max_bins)?;
+    let inv_g = 1.0_f64 / f64::from(qgh.scale.g_scale);
+    let inv_h = 1.0_f64 / f64::from(qgh.scale.h_scale);
+    for (axis_pos, sub) in subs.iter().enumerate() {
+        for leaf in 0..n_leaves {
+            for bin in 0..max_bins {
+                let src = offset2(leaf, bin, max_bins, "quant axis histogram offset overflow")?;
+                let dst = offset3(
+                    leaf,
+                    axis_pos,
+                    bin,
+                    n_axes,
+                    max_bins,
+                    "quant histogram assembly offset overflow",
+                )?;
+                *hist.g.get_mut(dst).ok_or_else(oob("assemble quant g"))? =
+                    *sub.g.get(src).ok_or_else(oob("sub quant g"))? as f64 * inv_g;
+                *hist.h.get_mut(dst).ok_or_else(oob("assemble quant h"))? =
+                    *sub.h.get(src).ok_or_else(oob("sub quant h"))? as f64 * inv_h;
+                *hist
+                    .count
+                    .get_mut(dst)
+                    .ok_or_else(oob("assemble quant count"))? =
+                    *sub.count.get(src).ok_or_else(oob("sub quant count"))?;
+            }
+        }
+    }
+    Ok(hist)
+}
+
 /// One axis's `[leaf][bin]` sub-histogram (stride `max_bins`).
 struct AxisHist {
     g: Vec<f64>,
     h: Vec<f64>,
     count: Vec<u32>,
+}
+
+struct AxisQHist {
+    g: Vec<i64>,
+    h: Vec<i64>,
+    count: Vec<u32>,
+}
+
+impl AxisQHist {
+    fn try_zeros(n_leaves: usize, max_bins: usize) -> Result<Self, PbError> {
+        let size = Hist::checked_cell_count(n_leaves, 1, max_bins)?;
+        Ok(Self {
+            g: Hist::try_zeroed_vec(size, "axis quant histogram g")?,
+            h: Hist::try_zeroed_vec(size, "axis quant histogram h")?,
+            count: Hist::try_zeroed_vec(size, "axis quant histogram count")?,
+        })
+    }
 }
 
 impl AxisHist {
@@ -173,6 +363,51 @@ fn accumulate_axis(
         // count <= rows.len() <= n_rows <= u32::MAX, so this never actually overflows;
         // checked_add keeps it panic-free under overflow-checks regardless.
         *c = c.checked_add(1).ok_or_else(oob("bin count overflow"))?;
+    }
+    Ok(out)
+}
+
+fn accumulate_axis_quantized(
+    x: &BinnedMatrix,
+    qgh: &QuantGradHess,
+    rows: &[u32],
+    leaf_of_row: &[u8],
+    n_leaves: usize,
+    axis: u32,
+    max_bins: usize,
+) -> Result<AxisQHist, PbError> {
+    let col = x
+        .data
+        .get(axis as usize)
+        .ok_or_else(oob("axis has no column"))?;
+    let mut out = AxisQHist::try_zeros(n_leaves, max_bins)?;
+    for &r in rows {
+        let ru = r as usize;
+        let bin = usize::from(*col.get(ru).ok_or_else(oob("quant row out of column"))?);
+        let leaf = usize::from(
+            *leaf_of_row
+                .get(ru)
+                .ok_or_else(oob("quant row out of leaf map"))?,
+        );
+        if leaf >= n_leaves || bin >= max_bins {
+            return Err(PbError::Internal {
+                what: "leaf or bin id out of quant histogram range".into(),
+            });
+        }
+        let idx = offset2(
+            leaf,
+            bin,
+            max_bins,
+            "quant axis histogram row offset overflow",
+        )?;
+        *out.g.get_mut(idx).ok_or_else(oob("quant g cell"))? +=
+            i64::from(*qgh.g_q.get(ru).ok_or_else(oob("qgh.g"))?);
+        *out.h.get_mut(idx).ok_or_else(oob("quant h cell"))? +=
+            i64::from(*qgh.h_q.get(ru).ok_or_else(oob("qgh.h"))?);
+        let c = out.count.get_mut(idx).ok_or_else(oob("quant count cell"))?;
+        *c = c
+            .checked_add(1)
+            .ok_or_else(oob("quant bin count overflow"))?;
     }
     Ok(out)
 }
@@ -521,5 +756,47 @@ mod tests {
             .count
             .iter()
             .all(|&c| u64::from(c) <= u64::from(x.n_rows)));
+    }
+
+    #[test]
+    fn quantize_grad_hess_is_deterministic_and_half_step_bounded() {
+        let gh = gradhess(&[0.0, 0.125, -0.75, 2.5, -3.25], &[1.0, 0.5, 2.0, 4.0, 8.0]);
+        let q1 = quantize_grad_hess(&gh, 77, 3).unwrap();
+        let q2 = quantize_grad_hess(&gh, 77, 3).unwrap();
+        assert_eq!(q1, q2);
+        let g_step = 1.0_f64 / f64::from(q1.scale.g_scale);
+        let h_step = 1.0_f64 / f64::from(q1.scale.h_scale);
+        for ((&g, &gq), (&h, &hq)) in gh.g.iter().zip(&q1.g_q).zip(gh.h.iter().zip(&q1.h_q)) {
+            let dg = (f64::from(gq) * g_step - f64::from(g)).abs();
+            let dh = (f64::from(hq) * h_step - f64::from(h)).abs();
+            assert!(dg <= 0.5 * g_step + f64::EPSILON, "dg={dg}, step={g_step}");
+            assert!(dh <= 0.5 * h_step + f64::EPSILON, "dh={dh}, step={h_step}");
+        }
+    }
+
+    #[test]
+    fn quantized_histogram_is_thread_count_independent() {
+        let (x, gh, rows, leaf_of_row) = fixture();
+        let build = |threads: usize| -> Hist {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                build_quantized_histogram(
+                    &x,
+                    &gh,
+                    &rows,
+                    &leaf_of_row,
+                    4,
+                    &[0, 1],
+                    QuantizeContext { seed: 99, round: 4 },
+                )
+                .unwrap()
+            })
+        };
+        let h1 = build(1);
+        assert_eq!(h1, build(2));
+        assert_eq!(h1, build(8));
     }
 }

@@ -276,6 +276,23 @@ pub struct QuantGradHess {
     pub scale: GradScale,
 }
 
+/// Histogram accumulator precision (§06/§11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistPrecision {
+    /// Full-precision f64 histogram sums (v1 green-spine default).
+    FullF64,
+    /// Quantized i32 per-row gradients/hessians accumulated as i64, then
+    /// dequantized for the existing split scanner. Leaves are still refit from full
+    /// precision.
+    QuantizedI32,
+}
+
+impl Default for HistPrecision {
+    fn default() -> Self {
+        Self::FullF64
+    }
+}
+
 /// Model-level metadata so a `Model` can serve and export categoricals + classifiers
 /// without the caller re-supplying anything (spec §2.6, R-SCHEMA). Serialized with
 /// the `Model`; `schema_version` covers it.
@@ -680,6 +697,8 @@ pub struct Config {
     pub max_delta_step: Option<f32>,
     /// Row sampler used for split search. [`Sampling::Full`] is the inert default.
     pub sampling: Sampling,
+    /// Histogram precision used for split search.
+    pub hist_precision: HistPrecision,
 }
 
 impl Default for Config {
@@ -691,6 +710,7 @@ impl Default for Config {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Sampling::Full,
+            hist_precision: HistPrecision::FullF64,
         }
     }
 }

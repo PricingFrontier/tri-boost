@@ -52,8 +52,8 @@ pub use loss::{
 };
 
 pub use engine::{
-    Booster, Config, ExactnessMode, FitSpec, GradScale, Hist, Model, ModelSchema, ObliviousTree,
-    QuantGradHess, Sampling, Split,
+    Booster, Config, ExactnessMode, FitSpec, GradScale, Hist, HistPrecision, Model, ModelSchema,
+    ObliviousTree, QuantGradHess, Sampling, Split,
 };
 
 pub use constraints::{InteractionPolicy, MonoSign, MonotoneMap};

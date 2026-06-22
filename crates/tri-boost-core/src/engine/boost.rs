@@ -223,6 +223,9 @@ pub(crate) fn fit(
         min_split_gain: f64::from(config.min_split_gain),
         max_order: spec.interaction.max_order,
         max_delta_step,
+        hist_precision: config.hist_precision,
+        quant_seed: spec.seed,
+        round: 0,
     };
 
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
@@ -233,10 +236,12 @@ pub(crate) fn fit(
         let _round_rng = pb_rng(spec.seed, t, Stage::Sample, 0);
         spec.loss.grad_hess(y, &raw, weight, &mut gh)?;
         let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
-        match grow_oblivious_tree(x, &gh, &sampled_rows, &axes, &grow_cfg)? {
+        let mut round_grow_cfg = grow_cfg;
+        round_grow_cfg.round = t;
+        match grow_oblivious_tree(x, &gh, &sampled_rows, &axes, &round_grow_cfg)? {
             Some(mut tree) => {
                 if sampled_rows.len() != rows.len() {
-                    refit_tree_leaves(x, &gh, &rows, &mut tree, &grow_cfg)?;
+                    refit_tree_leaves(x, &gh, &rows, &mut tree, &round_grow_cfg)?;
                 }
                 update_raw(&mut raw, x, &tree)?;
                 trees.push((1.0, tree));
@@ -363,7 +368,7 @@ mod tests {
     use super::*;
     use crate::constraints::MonoSign;
     use crate::data::{bin_columns, BinConfig};
-    use crate::engine::Booster;
+    use crate::engine::{Booster, HistPrecision};
     use crate::explain::{assert_exact_decomposition, FeatureSet, RefMeasure};
     use crate::loss::SquaredError;
 
@@ -411,6 +416,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -442,6 +448,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -472,6 +479,7 @@ mod tests {
                     min_split_gain: 0.0,
                     max_delta_step: None,
                     sampling: Default::default(),
+                    hist_precision: Default::default(),
                 });
                 let sqe = SquaredError;
                 let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -500,6 +508,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -527,6 +536,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         });
 
         // (1) Constant target ⇒ no split ⇒ 0 trees ⇒ every prediction == f0 == mean.
@@ -574,6 +584,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         });
         assert!(matches!(
             bad.fit(&x, &[1.0, 2.0], &spec(&sqe)),
@@ -703,6 +714,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -733,6 +745,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -769,6 +782,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -794,6 +808,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -828,6 +843,7 @@ mod tests {
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Default::default(),
+            hist_precision: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -912,6 +928,7 @@ mod tests {
                 rate: 0.6,
                 min_rows: 40,
             },
+            hist_precision: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {
@@ -925,6 +942,47 @@ mod tests {
                     .unwrap();
                 let serve = crate::data::ServeBinnedMatrix(x.clone());
                 let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn quantized_hist_fit_stays_exact_and_thread_deterministic() {
+        let n = 160usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 8 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 6 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                (if x0[i] <= 4.0 { -2.0 } else { 3.0 }) + if x1[i] <= 3.0 { 1.0 } else { -1.0 }
+            })
+            .collect();
+        let x = binned(&[x0, x1]);
+        let cfg = Config {
+            n_trees: 30,
+            learning_rate: 0.3,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Sampling::Full,
+            hist_precision: HistPrecision::QuantizedI32,
+        };
+        let sqe = SquaredError;
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(cfg.clone())
+                    .fit(&x, &y, &spec(&sqe))
+                    .unwrap();
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::Uniform).unwrap();
                 assert_exact_decomposition(&model, &bank, &serve).unwrap();
                 crate::serialize::encode_model(&model).unwrap()
             })

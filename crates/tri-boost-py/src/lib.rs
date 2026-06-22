@@ -157,6 +157,7 @@ impl PyBooster {
             min_split_gain,
             max_delta_step,
             sampling: Sampling::Full,
+            hist_precision: Default::default(),
         };
         config.validate().map_err(py_err)?;
         let bin_config = BinConfig {

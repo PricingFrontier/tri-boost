@@ -15,8 +15,8 @@
 //! histogram build (`engine::hist`). Determinism is therefore structural.
 
 use crate::data::BinnedMatrix;
-use crate::engine::hist::build_histogram;
-use crate::engine::{low_bit, Hist, ObliviousTree, Split};
+use crate::engine::hist::{build_histogram, build_quantized_histogram, QuantizeContext};
+use crate::engine::{low_bit, Hist, HistPrecision, ObliviousTree, Split};
 use crate::error::PbError;
 use crate::loss::GradHess;
 
@@ -41,6 +41,12 @@ pub(crate) struct GrowConfig {
     /// Leaf-stage `|w*|`-clamp resolved from `Config.max_delta_step` ∨ `Loss::max_delta_step()`
     /// (§05.6). `None` = uncapped; applied on the full-precision aggregated Newton step.
     pub max_delta_step: Option<f64>,
+    /// Histogram precision for split search.
+    pub hist_precision: HistPrecision,
+    /// Base deterministic seed for quantized stochastic rounding.
+    pub quant_seed: u64,
+    /// Boosting round, used as the quantization re-seed coordinate.
+    pub round: u32,
 }
 
 /// A candidate level split with its summed Newton gain.
@@ -340,7 +346,23 @@ pub(crate) fn grow_oblivious_tree(
             .collect();
 
         let n_leaves = 1usize << level;
-        let hist = build_histogram(x, gh, rows, &leaf_of_row, n_leaves, &admissible)?;
+        let hist = match cfg.hist_precision {
+            HistPrecision::FullF64 => {
+                build_histogram(x, gh, rows, &leaf_of_row, n_leaves, &admissible)?
+            }
+            HistPrecision::QuantizedI32 => build_quantized_histogram(
+                x,
+                gh,
+                rows,
+                &leaf_of_row,
+                n_leaves,
+                &admissible,
+                QuantizeContext {
+                    seed: cfg.quant_seed,
+                    round: cfg.round,
+                },
+            )?,
+        };
         let cand = match best_level_split(
             &hist,
             &admissible,
@@ -542,6 +564,9 @@ mod tests {
             min_split_gain,
             max_order,
             max_delta_step: None,
+            hist_precision: HistPrecision::FullF64,
+            quant_seed: 0,
+            round: 0,
         }
     }
 
