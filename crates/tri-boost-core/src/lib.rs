@@ -29,6 +29,7 @@ pub mod engine;
 pub mod error;
 pub mod explain;
 pub mod loss;
+pub mod scoring;
 pub mod serialize;
 pub mod simd;
 
@@ -67,5 +68,7 @@ pub use serialize::{
     encode_model, encode_model_json, AxisExport, ModelDoc, RatingBasis, RatingExport, RatingTable,
     FORMAT_VERSION, SCHEMA_VERSION,
 };
+
+pub use scoring::{PackedTree, ScoringBank};
 
 pub use simd::CHUNK_ROWS;
