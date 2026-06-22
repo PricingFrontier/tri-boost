@@ -114,6 +114,12 @@ pub trait Loss: Send + Sync {
     /// The objective's natural early-stopping metric (deviance by default).
     fn default_metric(&self) -> Metric;
 
+    /// The trained-objective tag (link + loss id + Tweedie power) recorded in
+    /// `ModelSchema.objective` so a loaded model can reproduce link + loss for
+    /// export / `predict_proba` (R-SCHEMA). FLAG (spec §2.4/§05 trait addition): the
+    /// canonical trait did not list this; the engine needs it to populate the schema.
+    fn objective_tag(&self) -> ObjectiveTag;
+
     /// Lower clamp on the per-row hessian (numerical floor ε); default `1e-16`
     /// (NaN-guard only — stability is `λ` + `max_delta_step`'s job).
     fn hessian_floor(&self) -> f32 {
@@ -246,6 +252,14 @@ impl Loss for SquaredError {
 
     fn default_metric(&self) -> Metric {
         Metric::Rmse
+    }
+
+    fn objective_tag(&self) -> ObjectiveTag {
+        ObjectiveTag {
+            link: Link::Identity,
+            loss: LossId::SquaredError,
+            tweedie_rho: None,
+        }
     }
 }
 

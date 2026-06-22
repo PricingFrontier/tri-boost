@@ -12,6 +12,7 @@ use crate::loss::{Link, Loss, ObjectiveTag};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
+pub mod boost;
 pub mod hist;
 pub mod split;
 
@@ -333,27 +334,108 @@ impl Model {
     }
 }
 
-/// The public estimator (spec §2.9). Builder-configured, `fit → Model`,
-/// sklearn-mirrored in Python. The `fit` loop lands in M1.5.
-#[derive(Debug, Clone, Default)]
-pub struct Booster {}
+/// The optimizer configuration (spec §06.1). v1 green-spine subset: the full §06.1
+/// knob set (sampling, `colsample_*`, `hist_precision`, credibility floors, `accel`,
+/// LR schedule, early stopping) lands with its features — v1 bakes in the
+/// simplifications (no sampling, full-precision histograms, single Newton step,
+/// early stopping off). FLAG: `Config` is a subset of the §06.1 type for now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Config {
+    /// Number of boosting rounds (upper bound; growth also stops if a round can't split).
+    pub n_trees: u32,
+    /// Learning rate applied to each tree's leaf values.
+    pub learning_rate: f32,
+    /// L2 leaf regularizer `λ` (in `w* = −G/(H+λ)` and the gain).
+    pub lambda: f32,
+    /// `gamma` floor: a level terminates if the best gain is `<= min_split_gain`.
+    pub min_split_gain: f32,
+}
 
-impl Booster {
-    /// A fresh booster with default configuration.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            n_trees: 1000,
+            learning_rate: 0.05,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+        }
     }
+}
 
-    /// Fit an ensemble. Stub until the boosting loop lands (M1.5).
+impl Config {
+    /// Validate the configuration.
     ///
     /// # Errors
-    /// Always [`PbError::Internal`] until M1.5 (no boosting loop yet).
+    /// [`PbError::InvalidConfig`] if `n_trees == 0`, `learning_rate` is non-finite or
+    /// `<= 0`, `lambda` is non-finite or `< 0`, or `min_split_gain` is non-finite or `< 0`.
+    pub fn validate(&self) -> Result<(), PbError> {
+        if self.n_trees == 0 {
+            return Err(PbError::InvalidConfig {
+                what: "n_trees must be > 0".into(),
+            });
+        }
+        if !self.learning_rate.is_finite() || self.learning_rate <= 0.0 {
+            return Err(PbError::InvalidConfig {
+                what: format!(
+                    "learning_rate must be finite and > 0, got {}",
+                    self.learning_rate
+                ),
+            });
+        }
+        if !self.lambda.is_finite() || self.lambda < 0.0 {
+            return Err(PbError::InvalidConfig {
+                what: format!("lambda must be finite and >= 0, got {}", self.lambda),
+            });
+        }
+        if !self.min_split_gain.is_finite() || self.min_split_gain < 0.0 {
+            return Err(PbError::InvalidConfig {
+                what: format!(
+                    "min_split_gain must be finite and >= 0, got {}",
+                    self.min_split_gain
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The public estimator (spec §2.9). Builder-configured, `fit → Model`,
+/// sklearn-mirrored in Python.
+#[derive(Debug, Clone, Default)]
+pub struct Booster {
+    config: Config,
+}
+
+impl Booster {
+    /// A fresh booster with the default [`Config`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            config: Config::default(),
+        }
+    }
+
+    /// A booster with an explicit [`Config`].
+    #[must_use]
+    pub fn with_config(config: Config) -> Self {
+        Self { config }
+    }
+
+    /// The booster's configuration.
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Fit an ensemble (spec §06.6): `f0 = link(weighted mean)`, then per round a
+    /// full-precision `grad_hess` pass → `grow_oblivious_tree` → `update_raw`, until
+    /// `n_trees` rounds or a round cannot split. Emits an `Exact` [`Model`].
+    ///
+    /// # Errors
+    /// [`PbError::InvalidConfig`] on a bad config; [`PbError::ShapeMismatch`] on a
+    /// length mismatch; plus any propagated [`Loss`]/binning/grow error.
     pub fn fit(&self, x: &BinnedMatrix, y: &[f32], spec: &FitSpec) -> Result<Model, PbError> {
-        let _ = (x, y, spec);
-        Err(PbError::Internal {
-            what: "Booster::fit is not implemented until M1.5 (the boosting loop)".into(),
-        })
+        boost::fit(&self.config, x, y, spec)
     }
 }
 

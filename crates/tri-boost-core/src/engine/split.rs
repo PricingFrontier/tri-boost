@@ -14,11 +14,6 @@
 //! count) with a deterministic first-wins argmax; the parallelism lives in the
 //! histogram build (`engine::hist`). Determinism is therefore structural.
 
-// grow_oblivious_tree / best_level_split / leaf_values are defined ahead of their
-// consumer: the boosting loop (M1.5) drives them. They are exercised by the tests
-// below; `dead_code` is expected until M1.5 wires `fit`.
-#![allow(dead_code)]
-
 use crate::data::BinnedMatrix;
 use crate::engine::hist::build_histogram;
 use crate::engine::{low_bit, Hist, ObliviousTree, Split};
