@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 const MAX_CAT_BINS: usize = 254;
 const MAX_AUTO_SMOOTH: f64 = 1_000_000.0;
 const MIN_AUTO_VARIANCE: f64 = 1.0e-12;
+const RARE_LEVEL_LABEL: &str = "__tri_boost_rare__";
+
+type RareMembers = BTreeMap<String, Vec<String>>;
 
 /// Identifier for one categorical Target-Statistic encoding (spec §04). Resolves to
 /// a concrete [`CatEncoder`] in the [`CatEncoderStore`].
@@ -145,6 +148,9 @@ pub struct CatLevel {
     /// Human-readable level label. The reserved rare bucket is represented as its own
     /// label when rare-level collapse is active.
     pub label: String,
+    /// Original labels represented by this row. Non-rare rows contain exactly their
+    /// own label; the rare row contains all collapsed training labels.
+    pub members: Vec<String>,
     /// Full-data shrunken target-statistic value used at serve time.
     pub encoding: f32,
     /// Ordinal bin id emitted by the Fisher-sorted categorical axis.
@@ -176,7 +182,7 @@ impl CatEncoder {
     pub fn encode_label(&self, label: &str) -> f32 {
         self.levels
             .iter()
-            .find(|level| level.label == label)
+            .find(|level| level.label == label || level.members.iter().any(|m| m == label))
             .map_or(self.base, |level| level.encoding)
     }
 
@@ -505,24 +511,27 @@ pub fn fit_cat_encoder(
         }
     };
     let row_terms = categorical_row_terms(y, w, spec.exposure)?;
+    let (fit_levels, members) =
+        collapse_rare_levels(levels, &row_terms, spec.config.min_data_per_group)?;
     let base = exposure_weighted_base_rate(y, w, spec.exposure)?;
-    let smooth = resolve_smooth(levels, &row_terms, base, spec.config.smooth)?;
+    let smooth = resolve_smooth(&fit_levels, &row_terms, base, spec.config.smooth)?;
     let mut resolved_config = spec.config.clone();
     resolved_config.smooth = smooth;
     let full = full_data_encoder(
         spec.raw,
         spec.id,
-        levels,
+        &fit_levels,
         &row_terms,
         base,
         &resolved_config,
+        &members,
     )?;
     let train = match spec.config.leakage {
         LeakageScheme::Ordered { n_perms } => {
-            ordered_training_encodings(levels, &row_terms, base, smooth, spec.seed, n_perms)?
+            ordered_training_encodings(&fit_levels, &row_terms, base, smooth, spec.seed, n_perms)?
         }
         LeakageScheme::KFold { k } => {
-            kfold_training_encodings(levels, &row_terms, base, smooth, spec.seed, k)?
+            kfold_training_encodings(&fit_levels, &row_terms, base, smooth, spec.seed, k)?
         }
     };
     Ok((full, train))
@@ -576,6 +585,7 @@ fn full_data_encoder(
     rows: &[CatRowTerm],
     base: f32,
     config: &TsConfig,
+    members: &BTreeMap<String, Vec<String>>,
 ) -> Result<CatEncoder, PbError> {
     let mut agg: BTreeMap<String, CatRowTerm> = BTreeMap::new();
     for (label, term) in levels.iter().zip(rows) {
@@ -586,6 +596,10 @@ fn full_data_encoder(
     let mut out = Vec::with_capacity(agg.len());
     for (label, term) in agg {
         out.push(CatLevel {
+            members: members
+                .get(&label)
+                .cloned()
+                .unwrap_or_else(|| vec![label.clone()]),
             label,
             encoding: shrunken_encoding(term.sum_y, term.denom, base, config.smooth)?,
             bin: 0,
@@ -600,6 +614,58 @@ fn full_data_encoder(
         base,
         config: config.clone(),
     })
+}
+
+fn collapse_rare_levels(
+    levels: &[String],
+    rows: &[CatRowTerm],
+    min_data_per_group: f32,
+) -> Result<(Vec<String>, RareMembers), PbError> {
+    let mut agg: BTreeMap<&str, f64> = BTreeMap::new();
+    for (label, term) in levels.iter().zip(rows) {
+        let entry = agg.entry(label.as_str()).or_default();
+        *entry += term.denom;
+    }
+
+    if min_data_per_group <= 0.0 {
+        let mut members = BTreeMap::new();
+        for label in agg.keys() {
+            members.insert((*label).to_owned(), vec![(*label).to_owned()]);
+        }
+        return Ok((levels.to_vec(), members));
+    }
+
+    if agg.contains_key(RARE_LEVEL_LABEL) {
+        return Err(PbError::InvalidInput {
+            what: format!("categorical label `{RARE_LEVEL_LABEL}` is reserved for rare buckets"),
+        });
+    }
+
+    let min = f64::from(min_data_per_group);
+    let mut rare_members = Vec::new();
+    let mut members = BTreeMap::new();
+    for (label, denom) in &agg {
+        if *denom < min {
+            rare_members.push((*label).to_owned());
+        } else {
+            members.insert((*label).to_owned(), vec![(*label).to_owned()]);
+        }
+    }
+    if !rare_members.is_empty() {
+        members.insert(RARE_LEVEL_LABEL.to_owned(), rare_members.clone());
+    }
+
+    let collapsed = levels
+        .iter()
+        .map(|label| {
+            if rare_members.iter().any(|rare| rare == label) {
+                RARE_LEVEL_LABEL.to_owned()
+            } else {
+                label.clone()
+            }
+        })
+        .collect();
+    Ok((collapsed, members))
 }
 
 fn resolve_smooth(
@@ -844,6 +910,7 @@ mod tests {
             id: TsEncodingId(id),
             levels: vec![CatLevel {
                 label: label.into(),
+                members: vec![label.into()],
                 encoding: 1.25,
                 bin: 1,
                 weight: 10.0,
@@ -984,6 +1051,7 @@ mod tests {
         let cfg = TsConfig {
             leakage: LeakageScheme::Ordered { n_perms: 3 },
             smooth: Smooth::Fixed { m: 2.0 },
+            min_data_per_group: 0.0,
             ..TsConfig::default()
         };
         let spec = CatFitSpec {
@@ -1033,6 +1101,7 @@ mod tests {
         let cfg = TsConfig {
             leakage: LeakageScheme::KFold { k: 2 },
             smooth: Smooth::Fixed { m: 0.0 },
+            min_data_per_group: 0.0,
             ..TsConfig::default()
         };
         let spec = CatFitSpec {
@@ -1061,6 +1130,51 @@ mod tests {
     }
 
     #[test]
+    fn rare_levels_collapse_before_fisher_ordering_but_unseen_uses_base() {
+        let levels = vec!["rare_a", "common", "common", "rare_b", "common"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let y = [100.0_f32, 1.0, 3.0, 200.0, 5.0];
+        let cfg = TsConfig {
+            leakage: LeakageScheme::KFold { k: 2 },
+            smooth: Smooth::Fixed { m: 0.0 },
+            min_data_per_group: 2.0,
+            ..TsConfig::default()
+        };
+        let spec = CatFitSpec {
+            raw: FeatureId(8),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 5,
+        };
+        let (enc, train) = fit_cat_encoder(&levels, &y, spec).unwrap();
+        assert_eq!(
+            enc.levels
+                .iter()
+                .map(|level| level.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["common", RARE_LEVEL_LABEL]
+        );
+        let rare = enc
+            .levels
+            .iter()
+            .find(|level| level.label == RARE_LEVEL_LABEL)
+            .unwrap();
+        assert_eq!(
+            rare.members,
+            vec!["rare_a".to_string(), "rare_b".to_string()]
+        );
+        assert_eq!(enc.encode_label("rare_a"), rare.encoding);
+        assert_eq!(enc.encode_label("rare_b"), rare.encoding);
+        assert_eq!(enc.encode_label("brand_new"), enc.base);
+        assert_eq!(train.len(), levels.len());
+        assert!(train.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn high_cardinality_levels_share_the_254_bin_budget() {
         let n = 300usize;
         let levels = (0..n).map(|i| format!("l{i:03}")).collect::<Vec<_>>();
@@ -1068,6 +1182,7 @@ mod tests {
         let cfg = TsConfig {
             leakage: LeakageScheme::KFold { k: 5 },
             smooth: Smooth::Fixed { m: 0.0 },
+            min_data_per_group: 0.0,
             ..TsConfig::default()
         };
         let spec = CatFitSpec {
@@ -1095,6 +1210,7 @@ mod tests {
         let cfg = TsConfig {
             leakage: LeakageScheme::KFold { k: 2 },
             smooth: Smooth::Fixed { m: 0.0 },
+            min_data_per_group: 0.0,
             ..TsConfig::default()
         };
         let spec = CatFitSpec {
