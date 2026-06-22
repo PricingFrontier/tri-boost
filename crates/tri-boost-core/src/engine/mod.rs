@@ -1,7 +1,7 @@
-//! The oblivious boosting engine (spec §2.3, §2.5, §2.6, §2.9 / §06). Phase-0
-//! stubs: the tree/model/booster types are frozen here (with the *real* scoring
-//! `lookup` the invariant gates need), plus the `ExactnessMode` firewall. The
-//! summed-Newton split-finder, histogram engine, and leaf refit land with §06.
+//! The oblivious boosting engine (spec §2.3, §2.5, §2.6, §2.9 / §06). Owns the
+//! trained-model types, the histogram accumulator, the split-finder, and the
+//! boosting loop. Phase 1 (this milestone, M1.3) lands the full-precision histogram
+//! engine ([`hist`]); the split-finder and `fit` loop land in M1.4/M1.5.
 
 use crate::boosters::DistillSpec;
 use crate::cat::CatEncoderStore;
@@ -10,6 +10,8 @@ use crate::data::{AxisKind, AxisProvenance, BinnedMatrix, BorderGrid};
 use crate::error::PbError;
 use crate::loss::{Link, Loss, ObjectiveTag};
 use serde::{Deserialize, Serialize};
+
+pub mod hist;
 
 /// The Exact / Approximate firewall (spec §3). An `Exact` model passes all five
 /// I2 checks and may export rating tables; any operation that cannot preserve them
@@ -92,21 +94,81 @@ impl ObliviousTree {
     }
 }
 
-/// The per-bin gradient/hessian histogram accumulator (spec §2.3). **`i64` bin
-/// accumulators everywhere** (counts stay `u32`): summing per-row `i32` `g_q`/`h_q`
-/// over up to `n_rows` bins can exceed `i32` range, which would trap under
-/// `overflow-checks = true`. This is the SINGLE histogram accumulator type.
+/// The per-`(leaf, axis, bin)` gradient/hessian histogram accumulator (spec §06.3),
+/// struct-of-arrays in `[leaf][axis][bin]` row-major order with a **uniform `n_bins`
+/// stride** (the max grid bins over the built axes; shorter axes leave their high
+/// bins zeroed). `count` stays `u32` (a bin holds at most `n_rows <= u32::MAX` rows).
+///
+/// **v1 uses `f64` accumulators** and earns determinism from a FIXED-ORDER fold
+/// (feature-parallel, sequential within each axis — [`hist::build_histogram`]).
+/// FLAG (spec reconciliation): §2.3/§06.3 specify `i64` accumulators, but that is the
+/// *quantized* path; §14 ships full-precision `GradHess` only in v1 and defers
+/// quantized integer histograms to v1.5 (M5-QHIST), where integer associativity
+/// replaces the fixed-order fold. So the v1 accumulator is `f64`; the `i64` quantized
+/// form returns with M5-QHIST.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Hist {
-    /// Per-(axis, bin) gradient sums.
-    pub g: Vec<i64>,
-    /// Per-(axis, bin) hessian sums.
-    pub h: Vec<i64>,
-    /// Per-(axis, bin) row counts.
+    /// Per-cell gradient sums (`[leaf][axis][bin]`, row-major).
+    pub g: Vec<f64>,
+    /// Per-cell hessian sums.
+    pub h: Vec<f64>,
+    /// Per-cell row counts.
     pub count: Vec<u32>,
+    /// Number of leaves at this level (`2^depth`).
+    pub n_leaves: usize,
+    /// Number of axes (built features) in this histogram.
+    pub n_axes: usize,
+    /// Uniform per-axis bin stride (max grid bins over the built axes).
+    pub n_bins: usize,
+}
+
+impl Hist {
+    /// A zeroed histogram with the given shape. `g`/`h`/`count` each hold
+    /// `n_leaves · n_axes · n_bins` cells.
+    #[must_use]
+    pub fn zeros(n_leaves: usize, n_axes: usize, n_bins: usize) -> Self {
+        let cells = n_leaves * n_axes * n_bins;
+        Self {
+            g: vec![0.0; cells],
+            h: vec![0.0; cells],
+            count: vec![0; cells],
+            n_leaves,
+            n_axes,
+            n_bins,
+        }
+    }
+
+    /// The flat row-major offset of cell `(leaf, axis, bin)`, or `None` if any index
+    /// is out of range (so callers stay panic-free without raw indexing).
+    #[must_use]
+    pub fn offset(&self, leaf: usize, axis: usize, bin: usize) -> Option<usize> {
+        if leaf >= self.n_leaves || axis >= self.n_axes || bin >= self.n_bins {
+            return None;
+        }
+        Some((leaf * self.n_axes + axis) * self.n_bins + bin)
+    }
+
+    /// `(n_leaves, n_axes, n_bins)` — the shape triple, for equality checks.
+    #[must_use]
+    pub fn shape(&self) -> (usize, usize, usize) {
+        (self.n_leaves, self.n_axes, self.n_bins)
+    }
+
+    /// Total number of cells (`n_leaves · n_axes · n_bins`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.g.len()
+    }
+
+    /// `true` if the histogram has no cells.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.g.is_empty()
+    }
 }
 
 /// The scale factors mapping full-precision g/h onto quantized integers (spec §2.3).
+/// Registered for M5-QHIST (v1.5); unused on the v1 full-precision path.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GradScale {
     /// Multiplier applied to gradients before integer rounding.
@@ -116,9 +178,9 @@ pub struct GradScale {
 }
 
 /// Quantized integer g/h for associative, order-independent histogram sums (spec
-/// §2.3) — the bit-reproducibility AND ~2×-speed mechanism. Per-row values are
-/// `i32`; the per-bin accumulators are the `i64` [`Hist`]. Leaves are always refit
-/// from full-precision g/h, so quantization never touches table values.
+/// §2.3). Registered as the M5-QHIST (v1.5) future type — the v1 green spine
+/// accumulates full-precision [`crate::loss::GradHess`] directly, so this is unused
+/// in v1.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct QuantGradHess {
     /// Quantized per-row gradients.
@@ -187,7 +249,7 @@ impl Model {
 }
 
 /// The public estimator (spec §2.9). Builder-configured, `fit → Model`,
-/// sklearn-mirrored in Python. Phase-0 stub: `fit` is not yet implemented.
+/// sklearn-mirrored in Python. The `fit` loop lands in M1.5.
 #[derive(Debug, Clone, Default)]
 pub struct Booster {}
 
@@ -198,14 +260,14 @@ impl Booster {
         Self {}
     }
 
-    /// Fit an ensemble. Phase-0 stub: returns [`PbError::Internal`] until §06 lands.
+    /// Fit an ensemble. Stub until the boosting loop lands (M1.5).
     ///
     /// # Errors
-    /// Always [`PbError::Internal`] in Phase 0 (no learner yet).
+    /// Always [`PbError::Internal`] until M1.5 (no boosting loop yet).
     pub fn fit(&self, x: &BinnedMatrix, y: &[f32], spec: &FitSpec) -> Result<Model, PbError> {
         let _ = (x, y, spec);
         Err(PbError::Internal {
-            what: "Booster::fit is not implemented in Phase 0 (§06 lands the learner)".into(),
+            what: "Booster::fit is not implemented until M1.5 (the boosting loop)".into(),
         })
     }
 }

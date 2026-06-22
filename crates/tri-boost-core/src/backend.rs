@@ -8,7 +8,7 @@
 //! never bend I1/I2 — that is enforced by *where code is allowed to live*.
 
 use crate::data::BinnedMatrix;
-use crate::engine::{Hist, Model, QuantGradHess, Split};
+use crate::engine::{Hist, Model, Split};
 use crate::error::PbError;
 use crate::loss::{GradHess, Loss};
 use rand::SeedableRng;
@@ -25,24 +25,28 @@ pub struct LevelConstraints {}
 /// thread count (the §1 determinism `[GATE]`). `pub(crate)` — an internal seam, not
 /// a public API contract in v1.
 ///
-/// Reproducibility is a property of the impl: `build_histograms` accumulates with
-/// associative `i64` integer sums (or a fixed-order float fold on the cross-check
-/// path), never a steal-order rayon `reduce`. A `CpuBackend` built with different
-/// `n_threads` MUST produce byte-identical `Hist`s and predictions.
+/// Reproducibility is a property of the impl: in v1 `build_histograms` accumulates
+/// full-precision `GradHess` with a FIXED-ORDER float fold (feature-parallel,
+/// sequential within each axis — `engine::hist`), never a steal-order rayon
+/// `reduce`. A `CpuBackend` built with different `n_threads` MUST produce
+/// byte-identical `Hist`s and predictions. (The associative `i64`-quantized
+/// accumulation is the M5-QHIST, v1.5, alternative.)
 // The seam is deliberately defined ahead of its first consumer: the boosting loop
 // (§06, phase P1) is what calls these kernels. `CpuBackend` already implements the
 // whole trait, so the contract is frozen now; `dead_code` is expected until P1.
 #[allow(dead_code)]
 pub(crate) trait Backend: Send + Sync {
-    /// Build the integer g/h histogram for one level: per-(axis, bin) `i64` sums
-    /// into `Hist` (the single §06-owned accumulator; no `HistogramSet` alias).
+    /// Build the per-level g/h histogram: full-precision `f64` sums per
+    /// `(leaf, axis, bin)` into `Hist` (the single §06-owned accumulator; the v1
+    /// green spine accumulates `GradHess` directly — the quantized `QuantGradHess`
+    /// input is the M5-QHIST/v1.5 variant).
     ///
     /// # Errors
     /// [`PbError`] on shape mismatch or an unimplemented backend (Phase 0).
     fn build_histograms(
         &self,
         x: &BinnedMatrix,
-        gh: &QuantGradHess,
+        gh: &GradHess,
         rows: &[u32],
         hist: &mut Hist,
     ) -> Result<(), PbError>;
@@ -109,7 +113,7 @@ impl Backend for CpuBackend {
     fn build_histograms(
         &self,
         x: &BinnedMatrix,
-        gh: &QuantGradHess,
+        gh: &GradHess,
         rows: &[u32],
         hist: &mut Hist,
     ) -> Result<(), PbError> {
