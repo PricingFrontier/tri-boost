@@ -14,7 +14,7 @@ use pyo3::types::PyBytes;
 use std::sync::Arc;
 use tri_boost_core::constraints::{InteractionPolicy, MonotoneMap};
 use tri_boost_core::data::{bin, bin_columns, BinConfig, BinnedMatrix};
-use tri_boost_core::engine::{Booster, Config, FitSpec, Model};
+use tri_boost_core::engine::{Booster, Config, FitSpec, Model, Sampling};
 use tri_boost_core::error::{Invariant, PbError};
 use tri_boost_core::explain::{RefMeasure, TableBank};
 use tri_boost_core::loss::{Gamma, Logistic, Loss, Poisson, SquaredError, Tweedie};
@@ -156,6 +156,7 @@ impl PyBooster {
             lambda: lambda_,
             min_split_gain,
             max_delta_step,
+            sampling: Sampling::Full,
         };
         config.validate().map_err(py_err)?;
         let bin_config = BinConfig {

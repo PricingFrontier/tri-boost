@@ -246,6 +246,49 @@ pub(crate) fn leaf_values(
     Ok(leaves)
 }
 
+/// Refit an already-chosen tree structure from full-precision gradients over `rows`.
+///
+/// MVS uses a sampled row set only to choose the split structure; the leaf values are
+/// then recomputed on all training rows so the final model remains a standard exact
+/// constant-leaf ensemble.
+///
+/// # Errors
+/// Propagates typed shape/index errors from row routing and the Newton leaf solve.
+pub(crate) fn refit_tree_leaves(
+    x: &BinnedMatrix,
+    gh: &GradHess,
+    rows: &[u32],
+    tree: &mut ObliviousTree,
+    cfg: &GrowConfig,
+) -> Result<(), PbError> {
+    let mut leaf_of_row: Vec<u8> = Hist::try_zeroed_vec(x.n_rows as usize, "refit leaf map")?;
+    for &r in rows {
+        let ru = r as usize;
+        let mut leaf = 0u8;
+        for (level, split) in tree.splits.iter().enumerate() {
+            let col = x
+                .data
+                .get(split.axis as usize)
+                .ok_or_else(internal("refit split col"))?;
+            let bin = *col.get(ru).ok_or_else(internal("refit split bin"))?;
+            leaf |= u8::from(low_bit(bin, split.bin_le, split.missing_left)) << level;
+        }
+        *leaf_of_row
+            .get_mut(ru)
+            .ok_or_else(internal("refit leaf slot"))? = leaf;
+    }
+    tree.leaves = leaf_values(
+        gh,
+        rows,
+        &leaf_of_row,
+        usize::from(tree.depth),
+        cfg.lambda,
+        cfg.lr,
+        cfg.max_delta_step,
+    )?;
+    Ok(())
+}
+
 /// Grow one depth-`1..=3` oblivious tree (spec §06.2/§06.6) over `rows`, scanning the
 /// candidate `axes` (already column-sampled by the caller). Returns `None` when no
 /// admissible candidate clears `min_split_gain` at the first level (a degenerate

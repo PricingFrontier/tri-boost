@@ -637,11 +637,33 @@ fn inverse_link(link: Link, raw: f32) -> f32 {
     }
 }
 
+/// Row-sampling strategy for split search (§06 / M5-MVS).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Sampling {
+    /// Use every row for split search (the v1 green-spine default).
+    Full,
+    /// Minimal-variance-style probability-proportional-to-gradient row sampling.
+    ///
+    /// `rate` is the target sample fraction and `min_rows` is a lower bound on the
+    /// selected row count. The final tree leaves are still refit from all rows.
+    Mvs {
+        /// Target row fraction, `0 < rate <= 1`.
+        rate: f32,
+        /// Minimum sampled row count.
+        min_rows: u32,
+    },
+}
+
+impl Default for Sampling {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
 /// The optimizer configuration (spec §06.1). v1 green-spine subset: the full §06.1
-/// knob set (sampling, `colsample_*`, `hist_precision`, credibility floors, `accel`,
-/// LR schedule, early stopping) lands with its features — v1 bakes in the
-/// simplifications (no sampling, full-precision histograms, single Newton step,
-/// early stopping off). FLAG: `Config` is a subset of the §06.1 type for now.
+/// knob set (`colsample_*`, `hist_precision`, credibility floors, `accel`, LR schedule,
+/// early stopping) lands with its features — v1.5 adds row sampling via
+/// [`Sampling::Mvs`]. FLAG: `Config` remains a subset of the full §06.1 type for now.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Number of boosting rounds (upper bound; growth also stops if a round can't split).
@@ -656,6 +678,8 @@ pub struct Config {
     /// back to `Loss::max_delta_step()` (Poisson ⇒ `Some(0.7)`); a non-`None` value wins.
     /// Applied on the full-precision aggregated Newton step, never per-row `h`.
     pub max_delta_step: Option<f32>,
+    /// Row sampler used for split search. [`Sampling::Full`] is the inert default.
+    pub sampling: Sampling,
 }
 
 impl Default for Config {
@@ -666,6 +690,7 @@ impl Default for Config {
             lambda: 1.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Sampling::Full,
         }
     }
 }
@@ -708,6 +733,21 @@ impl Config {
                 return Err(PbError::InvalidConfig {
                     what: format!("max_delta_step must be finite and > 0 when set, got {d}"),
                 });
+            }
+        }
+        match self.sampling {
+            Sampling::Full => {}
+            Sampling::Mvs { rate, min_rows } => {
+                if !rate.is_finite() || rate <= 0.0 || rate > 1.0 {
+                    return Err(PbError::InvalidConfig {
+                        what: format!("MVS rate must be finite and in (0, 1], got {rate}"),
+                    });
+                }
+                if min_rows == 0 {
+                    return Err(PbError::InvalidConfig {
+                        what: "MVS min_rows must be > 0".into(),
+                    });
+                }
             }
         }
         Ok(())

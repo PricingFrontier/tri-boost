@@ -19,11 +19,13 @@
 //! Reconstruction gate is sized for. The per-tree leaf values are bit-identical
 //! between the two scorers (same `low_bit` routing); only the accumulation width differs.
 
-use crate::backend::{pb_rng, Stage};
+use crate::backend::{pb_rng, pb_seed, Stage};
 use crate::cat::CatEncoderStore;
 use crate::data::{compute_offset, BinnedMatrix};
-use crate::engine::split::{grow_oblivious_tree, GrowConfig};
-use crate::engine::{low_bit, Config, ExactnessMode, FitSpec, Model, ModelSchema, ObliviousTree};
+use crate::engine::split::{grow_oblivious_tree, refit_tree_leaves, GrowConfig};
+use crate::engine::{
+    low_bit, Config, ExactnessMode, FitSpec, Model, ModelSchema, ObliviousTree, Sampling,
+};
 use crate::error::PbError;
 use crate::loss::GradHess;
 use crate::serialize::SCHEMA_VERSION;
@@ -227,11 +229,15 @@ pub(crate) fn fit(
     let mut gh = GradHess::default();
     for t in 0..config.n_trees {
         // Per-round deterministic re-seed — the seam for MVS/subsampling (M5-QHIST,
-        // v1.5). v1 draws no randomness, so the stream is established but unused.
+        // v1.5).
         let _round_rng = pb_rng(spec.seed, t, Stage::Sample, 0);
         spec.loss.grad_hess(y, &raw, weight, &mut gh)?;
-        match grow_oblivious_tree(x, &gh, &rows, &axes, &grow_cfg)? {
-            Some(tree) => {
+        let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
+        match grow_oblivious_tree(x, &gh, &sampled_rows, &axes, &grow_cfg)? {
+            Some(mut tree) => {
+                if sampled_rows.len() != rows.len() {
+                    refit_tree_leaves(x, &gh, &rows, &mut tree, &grow_cfg)?;
+                }
                 update_raw(&mut raw, x, &tree)?;
                 trees.push((1.0, tree));
             }
@@ -258,6 +264,56 @@ pub(crate) fn fit(
         schema,
         schema_version: SCHEMA_VERSION,
     })
+}
+
+fn sample_rows(
+    sampling: &Sampling,
+    gh: &GradHess,
+    seed: u64,
+    round: u32,
+    all_rows: &[u32],
+) -> Result<Vec<u32>, PbError> {
+    match *sampling {
+        Sampling::Full => Ok(all_rows.to_vec()),
+        Sampling::Mvs { rate, min_rows } => {
+            let n = all_rows.len();
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            let target = ((n as f64) * f64::from(rate)).ceil() as usize;
+            let min_rows = usize::try_from(min_rows).map_err(|_| PbError::Internal {
+                what: "MVS min_rows exceeded usize".into(),
+            })?;
+            let k = target.max(min_rows).min(n).max(1);
+            if k == n {
+                return Ok(all_rows.to_vec());
+            }
+            let mut keyed: Vec<(f64, u32)> = Vec::with_capacity(n);
+            for (pos, &row) in all_rows.iter().enumerate() {
+                let ru = row as usize;
+                let g = f64::from(*gh.g.get(ru).ok_or_else(|| PbError::Internal {
+                    what: "MVS row escaped gradients".into(),
+                })?);
+                let h = f64::from(*gh.h.get(ru).ok_or_else(|| PbError::Internal {
+                    what: "MVS row escaped hessians".into(),
+                })?);
+                let weight = (g * g + h * h).sqrt().max(1e-12);
+                let block = u32::try_from(pos).map_err(|_| PbError::InvalidInput {
+                    what: "MVS sampling supports at most u32::MAX rows".into(),
+                })?;
+                let bits = pb_seed(seed, round, Stage::Sample as u32, block);
+                let unit = ((bits >> 11) as f64 + 1.0) / ((1_u64 << 53) as f64 + 1.0);
+                // Efraimidis-Spirakis PPS-without-replacement key. Larger is better
+                // (`ln(unit)` is negative; dividing by a larger gradient weight moves
+                // it closer to zero).
+                keyed.push((unit.ln() / weight, row));
+            }
+            keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let mut rows: Vec<u32> = keyed.into_iter().take(k).map(|(_, row)| row).collect();
+            rows.sort_unstable();
+            Ok(rows)
+        }
+    }
 }
 
 /// Add a freshly-grown tree's contribution to every row's raw score (spec §06.6
@@ -308,7 +364,7 @@ mod tests {
     use crate::constraints::MonoSign;
     use crate::data::{bin_columns, BinConfig};
     use crate::engine::Booster;
-    use crate::explain::FeatureSet;
+    use crate::explain::{assert_exact_decomposition, FeatureSet, RefMeasure};
     use crate::loss::SquaredError;
 
     fn spec<'a>(loss: &'a SquaredError) -> FitSpec<'a> {
@@ -354,6 +410,7 @@ mod tests {
             lambda: 0.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -384,6 +441,7 @@ mod tests {
             lambda: 1.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -413,6 +471,7 @@ mod tests {
                     lambda: 1.0,
                     min_split_gain: 0.0,
                     max_delta_step: None,
+                    sampling: Default::default(),
                 });
                 let sqe = SquaredError;
                 let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -440,6 +499,7 @@ mod tests {
             lambda: 1.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -466,6 +526,7 @@ mod tests {
             lambda: 1.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         });
 
         // (1) Constant target ⇒ no split ⇒ 0 trees ⇒ every prediction == f0 == mean.
@@ -512,6 +573,7 @@ mod tests {
             lambda: 1.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         });
         assert!(matches!(
             bad.fit(&x, &[1.0, 2.0], &spec(&sqe)),
@@ -640,6 +702,7 @@ mod tests {
             lambda: 1.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -669,6 +732,7 @@ mod tests {
             lambda: 1.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -704,6 +768,7 @@ mod tests {
             lambda: 0.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -728,6 +793,7 @@ mod tests {
             lambda: 1.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -761,6 +827,7 @@ mod tests {
             lambda: 0.0,
             min_split_gain: 0.0,
             max_delta_step: None,
+            sampling: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -771,5 +838,99 @@ mod tests {
                 predict(&model, &x, i)
             );
         }
+    }
+
+    #[test]
+    fn mvs_sampler_is_deterministic_and_gradient_weighted() {
+        let rows: Vec<u32> = (0..20).collect();
+        let gh = GradHess {
+            g: (0..20)
+                .map(|i| if i < 5 { 20.0 - i as f32 } else { 0.1 })
+                .collect(),
+            h: vec![1.0; 20],
+        };
+        let sampling = Sampling::Mvs {
+            rate: 0.25,
+            min_rows: 4,
+        };
+        let a = sample_rows(&sampling, &gh, 123, 7, &rows).unwrap();
+        let b = sample_rows(&sampling, &gh, 123, 7, &rows).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 5);
+        let sampled_mean_g: f32 =
+            a.iter().map(|&r| gh.g[r as usize].abs()).sum::<f32>() / a.len() as f32;
+        let population_mean_g: f32 = gh.g.iter().map(|g| g.abs()).sum::<f32>() / gh.g.len() as f32;
+        assert!(sampled_mean_g > population_mean_g);
+    }
+
+    #[test]
+    fn mvs_config_validation_is_fail_closed() {
+        for sampling in [
+            Sampling::Mvs {
+                rate: 0.0,
+                min_rows: 1,
+            },
+            Sampling::Mvs {
+                rate: 1.1,
+                min_rows: 1,
+            },
+            Sampling::Mvs {
+                rate: 0.5,
+                min_rows: 0,
+            },
+        ] {
+            let cfg = Config {
+                sampling,
+                ..Config::default()
+            };
+            assert!(matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })));
+        }
+    }
+
+    #[test]
+    fn mvs_fit_stays_exact_and_thread_deterministic() {
+        let n = 180usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 9 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 7 + 1) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                let a = if x0[i] <= 4.0 { 2.0 } else { -1.0 };
+                let b = if x1[i] <= 3.0 { 1.5 } else { -0.5 };
+                let c = if x2[i] <= 2.0 { 0.75 } else { -0.25 };
+                a + b + c
+            })
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let cfg = Config {
+            n_trees: 40,
+            learning_rate: 0.3,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Sampling::Mvs {
+                rate: 0.6,
+                min_rows: 40,
+            },
+        };
+        let sqe = SquaredError;
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(cfg.clone())
+                    .fit(&x, &y, &spec(&sqe))
+                    .unwrap();
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
     }
 }

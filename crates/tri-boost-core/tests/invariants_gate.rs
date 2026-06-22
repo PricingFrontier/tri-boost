@@ -50,6 +50,7 @@ fn fit_additive() -> (Model, ServeBinnedMatrix) {
         lambda: 0.0,
         min_split_gain: 0.0,
         max_delta_step: None,
+        sampling: Default::default(),
     })
     .fit(&x, &y, &spec)
     .unwrap();
