@@ -165,6 +165,18 @@ pub struct CatEncoder {
     pub config: TsConfig,
 }
 
+impl CatEncoder {
+    /// Serve-time target-statistic value for `label`; unseen levels map to
+    /// [`CatEncoder::base`] (§04.8).
+    #[must_use]
+    pub fn encode_label(&self, label: &str) -> f32 {
+        self.levels
+            .iter()
+            .find(|level| level.label == label)
+            .map_or(self.base, |level| level.encoding)
+    }
+}
+
 /// Per-fit categorical encoder specification (spec §04.3).
 pub struct CatFitSpec<'a> {
     /// Raw feature this encoder belongs to.
@@ -485,16 +497,23 @@ fn full_data_encoder(
         });
     }
     let mut out = Vec::with_capacity(agg.len());
-    for (i, (label, term)) in agg.into_iter().enumerate() {
-        let bin = u8::try_from(i + 1).map_err(|_| PbError::Internal {
-            what: "validated categorical level count exceeded u8".into(),
-        })?;
+    for (label, term) in agg {
         out.push(CatLevel {
             label,
             encoding: shrunken_encoding(term.sum_y, term.denom, base, config.smooth)?,
-            bin,
+            bin: 0,
             weight: term.denom as f32,
         });
+    }
+    out.sort_by(|a, b| {
+        a.encoding
+            .total_cmp(&b.encoding)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    for (i, level) in out.iter_mut().enumerate() {
+        level.bin = u8::try_from(i + 1).map_err(|_| PbError::Internal {
+            what: "validated categorical level count exceeded u8".into(),
+        })?;
     }
     Ok(CatEncoder {
         raw,
@@ -770,7 +789,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "b", "c"]
         );
+        assert_eq!(
+            enc_a.levels.iter().map(|l| l.bin).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(enc_a.encode_label("unseen"), enc_a.base);
         assert!(train_a.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn full_data_encoder_uses_fisher_sorted_ordinal_order() {
+        let levels = vec!["z", "a", "m", "z", "a", "m"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let y = [30.0_f32, 1.0, 10.0, 40.0, 2.0, 12.0];
+        let cfg = TsConfig {
+            leakage: LeakageScheme::KFold { k: 2 },
+            smooth: Smooth::Fixed { m: 0.0 },
+            ..TsConfig::default()
+        };
+        let spec = CatFitSpec {
+            raw: FeatureId(7),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 4,
+        };
+        let (enc, _) = fit_cat_encoder(&levels, &y, spec).unwrap();
+        assert_eq!(
+            enc.levels
+                .iter()
+                .map(|l| l.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "m", "z"]
+        );
+        assert_eq!(enc.encode_label("a"), 1.5);
+        assert_eq!(enc.encode_label("m"), 11.0);
+        assert_eq!(enc.encode_label("z"), 35.0);
+        assert_eq!(
+            enc.levels.iter().map(|l| l.bin).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
