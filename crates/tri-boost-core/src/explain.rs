@@ -74,49 +74,77 @@ pub struct Tensor {
     data: Vec<f64>,
 }
 
-fn to_u32_shape(shape: &[usize]) -> Vec<u32> {
-    shape
-        .iter()
-        .map(|&d| u32::try_from(d).unwrap_or(u32::MAX))
-        .collect()
+fn checked_shape(shape: &[usize]) -> Result<(Vec<u32>, usize), PbError> {
+    let mut shape_u32 = Vec::with_capacity(shape.len());
+    let mut cells = 1usize;
+    for (axis, &dim) in shape.iter().enumerate() {
+        if dim == 0 {
+            return Err(PbError::InvalidInput {
+                what: format!("tensor axis {axis} has zero extent"),
+            });
+        }
+        shape_u32.push(u32::try_from(dim).map_err(|_| PbError::InvalidInput {
+            what: format!("tensor axis {axis} extent {dim} exceeds u32"),
+        })?);
+        cells = cells.checked_mul(dim).ok_or_else(|| PbError::Internal {
+            what: "tensor shape overflows usize".into(),
+        })?;
+    }
+    Ok((shape_u32, cells))
+}
+
+fn filled_data(cells: usize, value: f64) -> Result<Vec<f64>, PbError> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(cells)
+        .map_err(|_| PbError::Internal {
+            what: "tensor allocation failed".into(),
+        })?;
+    data.resize(cells, value);
+    Ok(data)
 }
 
 impl Tensor {
-    /// A zero tensor of the given per-axis extents (0-D — an empty shape — is one cell).
-    #[must_use]
-    pub fn zeros(shape: Vec<usize>) -> Self {
-        let n: usize = shape.iter().product();
-        Self {
-            data: vec![0.0; n],
-            shape: to_u32_shape(&shape),
-        }
+    /// Try to build a zero tensor of the given per-axis extents. 0-D — an empty
+    /// shape — is one scalar cell.
+    ///
+    /// # Errors
+    /// [`PbError::InvalidInput`] if an extent is zero or exceeds `u32`;
+    /// [`PbError::Internal`] if shape arithmetic overflows or allocation fails.
+    pub fn try_zeros(shape: Vec<usize>) -> Result<Self, PbError> {
+        let (shape, cells) = checked_shape(&shape)?;
+        Ok(Self {
+            data: filled_data(cells, 0.0)?,
+            shape,
+        })
     }
 
-    /// A constant-`value` tensor of the given extents.
-    #[must_use]
-    pub fn filled(shape: Vec<usize>, value: f64) -> Self {
-        let n: usize = shape.iter().product();
-        Self {
-            data: vec![value; n],
-            shape: to_u32_shape(&shape),
-        }
+    /// Try to build a constant-`value` tensor of the given extents.
+    ///
+    /// # Errors
+    /// [`PbError::InvalidInput`] if an extent is zero or exceeds `u32`;
+    /// [`PbError::Internal`] if shape arithmetic overflows or allocation fails.
+    pub fn try_filled(shape: Vec<usize>, value: f64) -> Result<Self, PbError> {
+        let (shape, cells) = checked_shape(&shape)?;
+        Ok(Self {
+            data: filled_data(cells, value)?,
+            shape,
+        })
     }
 
     /// Build from an explicit row-major buffer.
     ///
     /// # Errors
+    /// [`PbError::InvalidInput`] if an extent is zero or exceeds `u32`;
+    /// [`PbError::Internal`] if shape arithmetic overflows;
     /// [`PbError::ShapeMismatch`] if `data.len()` does not equal the product of `shape`.
     pub fn from_vec(shape: Vec<usize>, data: Vec<f64>) -> Result<Self, PbError> {
-        let n: usize = shape.iter().product();
+        let (shape, n) = checked_shape(&shape)?;
         if data.len() != n {
             return Err(PbError::ShapeMismatch {
                 what: format!("tensor data len {} != product(shape) {n}", data.len()),
             });
         }
-        Ok(Self {
-            shape: to_u32_shape(&shape),
-            data,
-        })
+        Ok(Self { shape, data })
     }
 
     /// The tensor's per-axis extents (as `usize` for indexing).
@@ -385,6 +413,7 @@ struct MergedAxis {
     axis: usize,
     borders: Vec<f32>,
     model_border_index: Vec<usize>,
+    model_n_bins: u16,
 }
 
 impl MergedAxis {
@@ -415,9 +444,17 @@ impl MergedAxis {
 
     /// Model bin → its merged cell. Uses only the merged border indices (a model bin
     /// `b` sits above merged border index `k` iff `k <= b - 2`).
-    fn model_bin_to_cell(&self, bin: u8) -> u32 {
+    fn model_bin_to_cell(&self, bin: u8) -> Result<u32, PbError> {
+        if u16::from(bin) >= self.model_n_bins {
+            return Err(PbError::InvalidInput {
+                what: format!(
+                    "model bin {bin} outside grid n_bins {} for axis {}",
+                    self.model_n_bins, self.axis
+                ),
+            });
+        }
         if bin == 0 {
-            return 0;
+            return Ok(0);
         }
         // Count merged borders strictly below bin `b` (i.e. model index <= b-2).
         let threshold = i64::from(bin) - 2;
@@ -426,7 +463,9 @@ impl MergedAxis {
             .iter()
             .filter(|&&k| (k as i64) <= threshold)
             .count();
-        (below + 1) as u32
+        u32::try_from(below + 1).map_err(|_| PbError::Internal {
+            what: "merged cell id exceeded u32".into(),
+        })
     }
 }
 
@@ -509,6 +548,11 @@ impl MergedGrids {
             let grid = model.grids.get(axis).ok_or_else(|| PbError::Internal {
                 what: "merged-grid axis absent from model grids".into(),
             })?;
+            if grid.n_bins == 0 {
+                return Err(PbError::InvalidInput {
+                    what: format!("model grid {axis} has n_bins=0"),
+                });
+            }
             let idxs = border_indices.get(r).ok_or_else(|| PbError::Internal {
                 what: "raw feature escaped border-index table".into(),
             })?;
@@ -525,6 +569,7 @@ impl MergedGrids {
                 axis,
                 borders,
                 model_border_index,
+                model_n_bins: grid.n_bins,
             });
         }
         Ok(MergedGrids { per_raw })
@@ -745,7 +790,7 @@ fn accumulate(
                 RawTable {
                     u: u.clone(),
                     axes,
-                    values: Tensor::zeros(extents),
+                    values: Tensor::try_zeros(extents)?,
                 },
             );
         }
@@ -806,9 +851,9 @@ fn build_weights(
         match w {
             RefMeasure::Uniform => None,
             RefMeasure::ProductMarginals { laplace } => {
-                if laplace.is_nan() || *laplace <= 0.0 {
+                if !laplace.is_finite() || *laplace <= 0.0 {
                     return Err(PbError::InvalidConfig {
-                        what: "ProductMarginals laplace must be > 0".into(),
+                        what: "ProductMarginals laplace must be finite and > 0".into(),
                     });
                 }
                 Some(f64::from(*laplace))
@@ -836,7 +881,7 @@ fn build_weights(
                             what: format!("serve matrix missing column {} for weights", ma.axis),
                         })?;
                 for &bin in col {
-                    let cell = ma.model_bin_to_cell(bin) as usize;
+                    let cell = ma.model_bin_to_cell(bin)? as usize;
                     let slot = counts.get_mut(cell).ok_or_else(|| PbError::Internal {
                         what: "weight cell escaped counts".into(),
                     })?;
@@ -874,7 +919,7 @@ fn build_weights(
 fn center_along(values: &mut Tensor, p: usize, axis_w: &[f64]) -> Result<Tensor, PbError> {
     let extents = values.shape();
     let sub_extents = drop_index(&extents, p);
-    let mut means = Tensor::zeros(sub_extents);
+    let mut means = Tensor::try_zeros(sub_extents)?;
     // Pass 1: accumulate the weighted slice mean for each lower-order coordinate.
     walk_extents(&extents, |coord| {
         let cell_p = *coord.get(p).ok_or_else(|| PbError::Internal {
@@ -969,7 +1014,7 @@ fn purify(
                             sub_extents.push(grids.cells(*sr)?);
                         }
                         axes_of.insert(sub_u.clone(), sub_axes);
-                        values_of.insert(sub_u.clone(), Tensor::zeros(sub_extents));
+                        values_of.insert(sub_u.clone(), Tensor::try_zeros(sub_extents)?);
                     }
                     let target = values_of.get_mut(&sub_u).ok_or_else(|| PbError::Internal {
                         what: "cascade target vanished".into(),
@@ -995,7 +1040,7 @@ fn purify(
             what: "table lost its axes".into(),
         })?;
         let variance = table_variance(&u, &values, w)?;
-        let support = Tensor::zeros(values.shape());
+        let support = Tensor::try_zeros(values.shape())?;
         tables.push(EffectTable {
             u,
             axes,
@@ -1064,7 +1109,7 @@ fn fill_support(
                 let slot = coord.get_mut(k).ok_or_else(|| PbError::Internal {
                     what: "support coord position escaped".into(),
                 })?;
-                *slot = ma.model_bin_to_cell(bin) as usize;
+                *slot = ma.model_bin_to_cell(bin)? as usize;
             }
             table.support.add(&coord, 1.0)?;
         }
@@ -1085,6 +1130,38 @@ fn bank_features(bank: &TableBank) -> Vec<FeatureId> {
         }
     }
     set.into_iter().collect()
+}
+
+/// The sorted distinct raw features appearing in any tree split of the model.
+fn model_features(model: &Model) -> Result<Vec<FeatureId>, PbError> {
+    let mut set: BTreeSet<FeatureId> = BTreeSet::new();
+    for (_, tree) in &model.trees {
+        for split in &tree.splits {
+            let prov =
+                model
+                    .provenance
+                    .get(split.axis as usize)
+                    .ok_or_else(|| PbError::Internal {
+                        what: format!("split axis {} absent from provenance", split.axis),
+                    })?;
+            set.insert(prov.raw);
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
+/// The joint-grid features a gate must inspect: every model-realized raw feature AND
+/// every table feature. Using only table features would let a malformed bank hide a
+/// missing table by shrinking the check domain.
+fn gate_features(model: &Model, bank: &TableBank) -> Result<Vec<FeatureId>, PbError> {
+    let mut set: BTreeSet<FeatureId> = BTreeSet::new();
+    for f in model_features(model)? {
+        set.insert(f);
+    }
+    for f in bank_features(bank) {
+        set.insert(f);
+    }
+    Ok(set.into_iter().collect())
 }
 
 /// Visit interior points of the joint merged grid over `feats`. Exhaustive when the
@@ -1154,7 +1231,7 @@ fn enumerate_check_points(
 pub fn check_reconstruction(model: &Model, bank: &TableBank) -> Result<(), PbError> {
     let tol = ExactTol::for_model(model).recon_tol;
     let grids = MergedGrids::from_model(model)?;
-    let feats = bank_features(bank);
+    let feats = gate_features(model, bank)?;
     enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
         let ens = model.ensemble_f64(rep_bins)?;
         let tab = bank.score(x_cells)?;
@@ -1177,7 +1254,7 @@ pub(crate) fn check_mass_conservation(
 ) -> Result<(), PbError> {
     let tol = ExactTol::for_model(model).mass_tol;
     let grids = MergedGrids::from_model(model)?;
-    let feats = bank_features(bank);
+    let feats = gate_features(model, bank)?;
     let mut mass = 0.0_f64;
     enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
         let wprod = joint_weight(w, &feats, x_cells)?;
@@ -1259,7 +1336,7 @@ pub(crate) fn check_variance_sum(
 ) -> Result<(), PbError> {
     let tol = ExactTol::for_model(model).var_tol;
     let grids = MergedGrids::from_model(model)?;
-    let feats = bank_features(bank);
+    let feats = gate_features(model, bank)?;
     let (mut m1, mut m2) = (0.0_f64, 0.0_f64);
     enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
         let wprod = joint_weight(w, &feats, x_cells)?;
@@ -1285,7 +1362,7 @@ pub(crate) fn check_variance_sum(
 pub fn check_three_way_equal(model: &Model, bank: &TableBank) -> Result<(), PbError> {
     let tol = ExactTol::for_model(model).recon_tol;
     let grids = MergedGrids::from_model(model)?;
-    let feats = bank_features(bank);
+    let feats = gate_features(model, bank)?;
     enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
         let tree = model.ensemble_f64(rep_bins)?;
         let table = bank.score(x_cells)?;
@@ -1381,12 +1458,51 @@ impl Model {
                 ),
             });
         }
+        if x.0.grids.len() != n_features {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "serve matrix has {} grids, model has {n_features} features",
+                    x.0.grids.len()
+                ),
+            });
+        }
+        if x.0.provenance.len() != n_features {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "serve matrix has {} provenance entries, model has {n_features} features",
+                    x.0.provenance.len()
+                ),
+            });
+        }
+        if x.0.grids != self.grids {
+            return Err(PbError::ShapeMismatch {
+                what: "serve matrix grids do not match model grids".into(),
+            });
+        }
+        if x.0.provenance != self.provenance {
+            return Err(PbError::ShapeMismatch {
+                what: "serve matrix provenance does not match model provenance".into(),
+            });
+        }
         let n_rows = x.0.n_rows as usize;
         for (a, col) in x.0.data.iter().enumerate() {
             if col.len() != n_rows {
                 return Err(PbError::ShapeMismatch {
                     what: format!("serve column {a} len {} != n_rows {n_rows}", col.len()),
                 });
+            }
+            let grid = self.grids.get(a).ok_or_else(|| PbError::Internal {
+                what: "model grid disappeared during serve validation".into(),
+            })?;
+            for (row, &bin) in col.iter().enumerate() {
+                if u16::from(bin) >= grid.n_bins {
+                    return Err(PbError::InvalidInput {
+                        what: format!(
+                            "serve column {a} row {row} bin {bin} outside model grid n_bins {}",
+                            grid.n_bins
+                        ),
+                    });
+                }
             }
         }
 
@@ -1418,7 +1534,7 @@ fn verify_raw_accumulation(
 ) -> Result<(), PbError> {
     let tol = ExactTol::for_model(model).recon_tol;
     // Reuse the joint enumerator over the raw bank's realized features.
-    let mut set: BTreeSet<FeatureId> = BTreeSet::new();
+    let mut set: BTreeSet<FeatureId> = model_features(model)?.into_iter().collect();
     for u in raw.tables.keys() {
         for r in &u.0 {
             set.insert(*r);
@@ -1581,6 +1697,7 @@ impl MergedGrids {
                 axis: r,
                 borders: g.borders.clone(),
                 model_border_index: (0..g.borders.len()).collect(),
+                model_n_bins: g.n_bins,
             })
             .collect();
         MergedGrids { per_raw }
@@ -1596,9 +1713,9 @@ fn build_weights_from_support(bank: &TableBank, w: &RefMeasure) -> Result<Weight
         match w {
             RefMeasure::Uniform => None,
             RefMeasure::ProductMarginals { laplace } => {
-                if laplace.is_nan() || *laplace <= 0.0 {
+                if !laplace.is_finite() || *laplace <= 0.0 {
                     return Err(PbError::InvalidConfig {
-                        what: "ProductMarginals laplace must be > 0".into(),
+                        what: "ProductMarginals laplace must be finite and > 0".into(),
                     });
                 }
                 Some(f64::from(*laplace))
@@ -1613,6 +1730,11 @@ fn build_weights_from_support(bank: &TableBank, w: &RefMeasure) -> Result<Weight
     let mut per_axis = Vec::with_capacity(bank.merged_grids.len());
     for (r, g) in bank.merged_grids.iter().enumerate() {
         let cells = usize::from(g.n_bins);
+        if cells == 0 {
+            return Err(PbError::InvalidInput {
+                what: format!("bank merged grid {r} has n_bins=0"),
+            });
+        }
         let raw_w = match laplace {
             None => vec![1.0_f64 / cells as f64; cells],
             Some(lap) => {
@@ -1884,6 +2006,24 @@ mod tests {
     }
 
     #[test]
+    fn reconstruction_enumerates_model_features_even_if_bank_omits_tables() {
+        let m = fixture_model();
+        let x = fixture_serve();
+        let mut bank = m.explain(&x, RefMeasure::Uniform).unwrap();
+        // Old bug shape: if the check domain came only from `bank.tables`, clearing
+        // tables and setting f0 to the missing/missing score made reconstruction pass
+        // vacuously at one point. The gate must inspect the model's realized features.
+        bank.f0 = 0.0;
+        bank.tables.clear();
+        assert!(matches!(
+            check_reconstruction(&m, &bank),
+            Err(PbError::InvariantViolated {
+                invariant: Invariant::Reconstruction
+            })
+        ));
+    }
+
+    #[test]
     fn negative_three_way_is_caught() {
         let m = fixture_model();
         let x = fixture_serve();
@@ -1951,6 +2091,51 @@ mod tests {
         assert!(matches!(
             m.explain(&x, RefMeasure::Joint),
             Err(PbError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn nonfinite_laplace_and_malformed_serve_matrix_are_rejected() {
+        let m = fixture_model();
+        let x = fixture_serve();
+        assert!(matches!(
+            m.explain(
+                &x,
+                RefMeasure::ProductMarginals {
+                    laplace: f32::INFINITY
+                }
+            ),
+            Err(PbError::InvalidConfig { .. })
+        ));
+
+        let mut bad = x.clone();
+        bad.0.data[0][0] = u8::MAX;
+        assert!(matches!(
+            m.explain(&bad, RefMeasure::Uniform),
+            Err(PbError::InvalidInput { .. })
+        ));
+
+        let mut bad = x;
+        bad.0.grids[0].borders.clear();
+        assert!(matches!(
+            m.explain(&bad, RefMeasure::Uniform),
+            Err(PbError::ShapeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn tensor_rejects_unrepresentable_shapes_without_panicking() {
+        assert!(matches!(
+            Tensor::try_zeros(vec![0]),
+            Err(PbError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            Tensor::try_zeros(vec![u32::MAX as usize + 1]),
+            Err(PbError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            Tensor::from_vec(vec![0], Vec::new()),
+            Err(PbError::InvalidInput { .. })
         ));
     }
 
@@ -2159,11 +2344,13 @@ mod tests {
                 axis: 0,
                 borders: vec![],
                 model_border_index: vec![],
+                model_n_bins: 2,
             },
             MergedAxis {
                 axis: 1,
                 borders: vec![1.5],
                 model_border_index: vec![0],
+                model_n_bins: 3,
             },
         ];
         let grids = MergedGrids { per_raw };
@@ -2171,7 +2358,7 @@ mod tests {
             grids.axis_id(FeatureId(0)).unwrap(),
             grids.axis_id(FeatureId(1)).unwrap(),
         ];
-        let mut tens = Tensor::zeros(vec![2, 3]);
+        let mut tens = Tensor::try_zeros(vec![2, 3]).unwrap();
         for (i, &v) in values.iter().enumerate() {
             let c = [i / 3, i % 3];
             tens.set(&c, v).unwrap();
