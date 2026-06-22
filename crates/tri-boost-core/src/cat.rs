@@ -5,7 +5,9 @@
 
 use crate::data::FeatureId;
 use crate::error::PbError;
+use crate::{pb_seed, Stage};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Identifier for one categorical Target-Statistic encoding (spec §04). Resolves to
 /// a concrete [`CatEncoder`] in the [`CatEncoderStore`].
@@ -161,6 +163,22 @@ pub struct CatEncoder {
     pub base: f32,
     /// Configuration that produced the encoder.
     pub config: TsConfig,
+}
+
+/// Per-fit categorical encoder specification (spec §04.3).
+pub struct CatFitSpec<'a> {
+    /// Raw feature this encoder belongs to.
+    pub raw: FeatureId,
+    /// Encoder id to stamp into [`crate::data::AxisKind::CategoricalTS`].
+    pub id: TsEncodingId,
+    /// Optional per-row weights; absent means all ones.
+    pub weight: Option<&'a [f32]>,
+    /// Optional exposure values `e_i`; absent means `e_i = 1`.
+    pub exposure: Option<&'a [f32]>,
+    /// Encoder configuration.
+    pub config: &'a TsConfig,
+    /// Deterministic base seed.
+    pub seed: u64,
 }
 
 /// The frozen `TsEncodingId → CatEncoder` table backing serve/export (spec §2.6 /
@@ -348,6 +366,259 @@ pub fn shrunken_encoding(
     }
 }
 
+/// Fit a categorical target-statistic encoder (§04.3), returning the frozen
+/// full-data serve encoder plus leakage-free per-row training encodings.
+///
+/// The full-data encoder is deterministic by level label order. Training encodings
+/// use the configured leakage scheme: ordered prefix statistics never include the
+/// current row, and K-fold encodings exclude the row's whole fold.
+///
+/// # Errors
+/// [`PbError::ShapeMismatch`] on length mismatch; [`PbError::InvalidInput`] on bad
+/// row values; [`PbError::InvalidConfig`] on unsupported/invalid config values.
+pub fn fit_cat_encoder(
+    levels: &[String],
+    y: &[f32],
+    spec: CatFitSpec<'_>,
+) -> Result<(CatEncoder, Vec<f32>), PbError> {
+    spec.config.validate()?;
+    if levels.len() != y.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!("categorical fit: levels={}, y={}", levels.len(), y.len()),
+        });
+    }
+    let weights;
+    let w = match spec.weight {
+        Some(w) => {
+            if w.len() != y.len() {
+                return Err(PbError::ShapeMismatch {
+                    what: format!("categorical fit: y={}, weight={}", y.len(), w.len()),
+                });
+            }
+            w
+        }
+        None => {
+            weights = vec![1.0_f32; y.len()];
+            &weights
+        }
+    };
+    let base = exposure_weighted_base_rate(y, w, spec.exposure)?;
+    let row_terms = categorical_row_terms(y, w, spec.exposure)?;
+    let full = full_data_encoder(spec.raw, spec.id, levels, &row_terms, base, spec.config)?;
+    let train = match spec.config.leakage {
+        LeakageScheme::Ordered { n_perms } => ordered_training_encodings(
+            levels,
+            &row_terms,
+            base,
+            spec.config.smooth,
+            spec.seed,
+            n_perms,
+        )?,
+        LeakageScheme::KFold { k } => {
+            kfold_training_encodings(levels, &row_terms, base, spec.config.smooth, spec.seed, k)?
+        }
+    };
+    Ok((full, train))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CatRowTerm {
+    sum_y: f64,
+    denom: f64,
+}
+
+fn categorical_row_terms(
+    y: &[f32],
+    weight: &[f32],
+    exposure: Option<&[f32]>,
+) -> Result<Vec<CatRowTerm>, PbError> {
+    let mut out = Vec::with_capacity(y.len());
+    for (i, (&yi, &wi)) in y.iter().zip(weight).enumerate() {
+        if !yi.is_finite() || !wi.is_finite() || wi < 0.0 {
+            return Err(PbError::InvalidInput {
+                what: format!("invalid categorical row {i}: y={yi}, weight={wi}"),
+            });
+        }
+        let e = match exposure {
+            Some(ex) => {
+                let ei = *ex.get(i).ok_or_else(|| PbError::Internal {
+                    what: "validated exposure lost a row".into(),
+                })?;
+                if !ei.is_finite() || ei <= 0.0 {
+                    return Err(PbError::InvalidInput {
+                        what: format!("categorical exposure[{i}] must be finite and > 0, got {ei}"),
+                    });
+                }
+                f64::from(ei)
+            }
+            None => 1.0,
+        };
+        let w = f64::from(wi);
+        out.push(CatRowTerm {
+            sum_y: w * f64::from(yi),
+            denom: w * e,
+        });
+    }
+    Ok(out)
+}
+
+fn full_data_encoder(
+    raw: FeatureId,
+    id: TsEncodingId,
+    levels: &[String],
+    rows: &[CatRowTerm],
+    base: f32,
+    config: &TsConfig,
+) -> Result<CatEncoder, PbError> {
+    let mut agg: BTreeMap<String, CatRowTerm> = BTreeMap::new();
+    for (label, term) in levels.iter().zip(rows) {
+        let entry = agg.entry(label.clone()).or_default();
+        entry.sum_y += term.sum_y;
+        entry.denom += term.denom;
+    }
+    if agg.len() > 254 {
+        return Err(PbError::InvalidInput {
+            what: format!(
+                "categorical encoder has {} distinct levels; high-cardinality Fisher bin merging is not implemented yet",
+                agg.len()
+            ),
+        });
+    }
+    let mut out = Vec::with_capacity(agg.len());
+    for (i, (label, term)) in agg.into_iter().enumerate() {
+        let bin = u8::try_from(i + 1).map_err(|_| PbError::Internal {
+            what: "validated categorical level count exceeded u8".into(),
+        })?;
+        out.push(CatLevel {
+            label,
+            encoding: shrunken_encoding(term.sum_y, term.denom, base, config.smooth)?,
+            bin,
+            weight: term.denom as f32,
+        });
+    }
+    Ok(CatEncoder {
+        raw,
+        id,
+        levels: out,
+        base,
+        config: config.clone(),
+    })
+}
+
+fn ordered_training_encodings(
+    levels: &[String],
+    rows: &[CatRowTerm],
+    base: f32,
+    smooth: Smooth,
+    seed: u64,
+    n_perms: u32,
+) -> Result<Vec<f32>, PbError> {
+    if n_perms == 0 {
+        return Err(PbError::InvalidConfig {
+            what: "Ordered target statistics require n_perms > 0".into(),
+        });
+    }
+    let n = levels.len();
+    let mut out = vec![0.0_f64; n];
+    for perm in 0..n_perms {
+        let mut order = Vec::with_capacity(n);
+        for row in 0..n {
+            order.push((
+                pb_seed(
+                    seed,
+                    perm,
+                    Stage::Categorical as u32,
+                    u32::try_from(row).map_err(|_| PbError::InvalidInput {
+                        what: "categorical fit supports at most u32::MAX rows".into(),
+                    })?,
+                ),
+                row,
+            ));
+        }
+        order.sort_unstable_by_key(|(key, row)| (*key, *row));
+        let mut prefix: BTreeMap<&str, CatRowTerm> = BTreeMap::new();
+        for (_, row) in order {
+            let label = levels.get(row).ok_or_else(|| PbError::Internal {
+                what: "ordered categorical row escaped levels".into(),
+            })?;
+            let prev = prefix.get(label.as_str()).copied().unwrap_or_default();
+            let enc = if prev.denom > 0.0 {
+                shrunken_encoding(prev.sum_y, prev.denom, base, smooth)?
+            } else {
+                base
+            };
+            let slot = out.get_mut(row).ok_or_else(|| PbError::Internal {
+                what: "ordered categorical row escaped output".into(),
+            })?;
+            *slot += f64::from(enc);
+            let term = rows.get(row).ok_or_else(|| PbError::Internal {
+                what: "ordered categorical row escaped terms".into(),
+            })?;
+            let entry = prefix.entry(label.as_str()).or_default();
+            entry.sum_y += term.sum_y;
+            entry.denom += term.denom;
+        }
+    }
+    let scale = 1.0 / f64::from(n_perms);
+    Ok(out.into_iter().map(|v| (v * scale) as f32).collect())
+}
+
+fn kfold_training_encodings(
+    levels: &[String],
+    rows: &[CatRowTerm],
+    base: f32,
+    smooth: Smooth,
+    seed: u64,
+    k: u32,
+) -> Result<Vec<f32>, PbError> {
+    if k < 2 {
+        return Err(PbError::InvalidConfig {
+            what: format!("KFold target statistics require k >= 2, got {k}"),
+        });
+    }
+    let mut total: BTreeMap<&str, CatRowTerm> = BTreeMap::new();
+    let mut by_fold: BTreeMap<(u32, &str), CatRowTerm> = BTreeMap::new();
+    let mut folds = Vec::with_capacity(levels.len());
+    for (row, (label, term)) in levels.iter().zip(rows).enumerate() {
+        let fold = (pb_seed(
+            seed,
+            0,
+            Stage::Categorical as u32,
+            u32::try_from(row).map_err(|_| PbError::InvalidInput {
+                what: "categorical fit supports at most u32::MAX rows".into(),
+            })?,
+        ) % u64::from(k)) as u32;
+        folds.push(fold);
+        let t = total.entry(label.as_str()).or_default();
+        t.sum_y += term.sum_y;
+        t.denom += term.denom;
+        let f = by_fold.entry((fold, label.as_str())).or_default();
+        f.sum_y += term.sum_y;
+        f.denom += term.denom;
+    }
+    let mut out = Vec::with_capacity(levels.len());
+    for (row, label) in levels.iter().enumerate() {
+        let fold = *folds.get(row).ok_or_else(|| PbError::Internal {
+            what: "kfold categorical row escaped folds".into(),
+        })?;
+        let all = total.get(label.as_str()).copied().unwrap_or_default();
+        let held = by_fold
+            .get(&(fold, label.as_str()))
+            .copied()
+            .unwrap_or_default();
+        let term = CatRowTerm {
+            sum_y: all.sum_y - held.sum_y,
+            denom: all.denom - held.denom,
+        };
+        out.push(if term.denom > 0.0 {
+            shrunken_encoding(term.sum_y, term.denom, base, smooth)?
+        } else {
+            base
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -456,5 +727,81 @@ mod tests {
             shrunken_encoding(1.0, 1.0, 0.0, Smooth::Auto),
             Err(PbError::InvalidConfig { .. })
         ));
+    }
+
+    #[test]
+    fn fit_cat_encoder_is_deterministic_and_freezes_full_data_map() {
+        let levels = vec!["b", "a", "b", "c", "a", "c"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let y = [2.0_f32, 1.0, 4.0, 8.0, 3.0, 10.0];
+        let cfg = TsConfig {
+            leakage: LeakageScheme::Ordered { n_perms: 3 },
+            smooth: Smooth::Fixed { m: 2.0 },
+            ..TsConfig::default()
+        };
+        let spec = CatFitSpec {
+            raw: FeatureId(2),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 99,
+        };
+        let (enc_a, train_a) = fit_cat_encoder(&levels, &y, spec).unwrap();
+        let spec = CatFitSpec {
+            raw: FeatureId(2),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 99,
+        };
+        let (enc_b, train_b) = fit_cat_encoder(&levels, &y, spec).unwrap();
+        assert_eq!(enc_a, enc_b);
+        assert_eq!(train_a, train_b);
+        assert_eq!(enc_a.base, y.iter().sum::<f32>() / y.len() as f32);
+        assert_eq!(
+            enc_a
+                .levels
+                .iter()
+                .map(|l| l.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!(train_a.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn kfold_training_encoding_does_not_consult_own_target() {
+        let levels = vec!["a".to_string(); 30];
+        let y = (0..30).map(|i| i as f32).collect::<Vec<_>>();
+        let cfg = TsConfig {
+            leakage: LeakageScheme::KFold { k: 5 },
+            smooth: Smooth::Fixed { m: 0.0 },
+            ..TsConfig::default()
+        };
+        let spec = CatFitSpec {
+            raw: FeatureId(0),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 123,
+        };
+        let (_, train_a) = fit_cat_encoder(&levels, &y, spec).unwrap();
+        let mut changed = y.clone();
+        changed[0] += 10_000.0;
+        let spec = CatFitSpec {
+            raw: FeatureId(0),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 123,
+        };
+        let (_, train_b) = fit_cat_encoder(&levels, &changed, spec).unwrap();
+        assert_eq!(train_a[0], train_b[0]);
     }
 }
