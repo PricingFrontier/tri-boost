@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "tri-boost dev tasks: grep-gates and the (later) accuracy harness. Dev-only, never published, ships no library code."
+description = "tri-boost dev tasks: grep-gates and the accuracy harness. Dev-only, never published, ships no library code."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +9,8 @@ publish = false
 
 # Deliberately does NOT inherit `[lints] workspace = true`: `xtask` is in the
 # unwrap-allowed set {tests, benches, xtask} (spec §1 / plan F4), so the no-panic
-# deny set does not apply to dev tooling. Pure std, no dependencies.
+# deny set does not apply to dev tooling.
+
+[dependencies]
+serde_json.workspace = true
+tri-boost-core = { path = "../crates/tri-boost-core", version = "0.1.0" }

@@ -3,7 +3,7 @@
 //! This crate ships **no** library code (it is `publish = false` and is not a
 //! dependency of `tri-boost-core`/`tri-boost-py`), so it is in the unwrap-allowed
 //! set `{tests, benches, xtask}` and does NOT inherit the workspace `[lints]`
-//! panic-gate. It is pure `std`: no third-party dependencies.
+//! panic-gate.
 //!
 //! It hosts the source-scanning *grep-gates* that CI runs over the shipped crates
 //! (`crates/*/src`, excluding `tests/`/`benches/` and this crate). Doing them here
@@ -17,7 +17,7 @@
 //! * `check-no-usize-serialized` — no `usize`/`isize` field on a serialized type (§13.4 wire-width).
 //! * `check-no-hashmap-serialized` — no `HashMap`/`HashSet` field on a serialized type (order).
 //! * `check-all` — run every gate; non-zero exit if any fails.
-//! * `accuracy` — placeholder for the §13 accuracy harness (lands later).
+//! * `accuracy` — deterministic, exactness-gated benchmark smoke harness (§13.7).
 //!
 //! Each gate prints `file:line` for every violation and returns a non-zero
 //! `ExitCode`, so CI fails closed.
@@ -26,6 +26,13 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use serde_json::json;
+use tri_boost_core::{
+    assert_exact_decomposition, bin, bin_columns, check_feature_budget, encode_model, BinConfig,
+    BinnedMatrix, Booster, Config, ExactnessMode, FitSpec, HistPrecision, InteractionPolicy, Loss,
+    MonotoneMap, PbError, RefMeasure, Sampling, ServeBinnedMatrix, SquaredError, Stage,
+};
 
 /// A grep-gate: scans the shipped sources and returns any violations found.
 type GateFn = fn(&[SourceFile]) -> Vec<Violation>;
@@ -38,13 +45,13 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::SUCCESS
         }
-        "accuracy" => {
-            println!(
-                "xtask accuracy: placeholder. The §13 accuracy harness (XGBoost/LightGBM/\
-                 CatBoost parity on fixed datasets) lands with the learner; nothing to run in Phase 0."
-            );
-            ExitCode::SUCCESS
-        }
+        "accuracy" => match run_accuracy_cli(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("xtask accuracy: {err}");
+                ExitCode::FAILURE
+            }
+        },
         "check-no-box-dyn" => run_gate(check_no_box_dyn),
         "check-justified" => run_gate(check_justified),
         "check-no-usize-serialized" => run_gate(check_no_usize_serialized),
@@ -100,9 +107,384 @@ fn print_usage() {
          \x20 check-justified              require `// JUSTIFIED:` on unwrap/expect/panic/allow\n\
          \x20 check-no-usize-serialized     forbid usize/isize on serialized types\n\
          \x20 check-no-hashmap-serialized   forbid HashMap/HashSet on serialized types\n\
-         \x20 accuracy                      (placeholder) accuracy harness, lands with the learner\n\
+         \x20 accuracy [--seed N] [--output PATH]\n\
+         \x20                               exactness-gated deterministic benchmark smoke\n\
          \x20 --help                        show this message"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `xtask accuracy`: dev-only deterministic smoke harness (§13.7 / M6-1..M6-3).
+// ---------------------------------------------------------------------------
+
+type XtaskResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Debug, Clone, PartialEq)]
+struct AccuracyOptions {
+    seed: u64,
+    output: Option<PathBuf>,
+}
+
+impl Default for AccuracyOptions {
+    fn default() -> Self {
+        Self {
+            seed: 20260622,
+            output: None,
+        }
+    }
+}
+
+fn run_accuracy_cli(args: &[String]) -> XtaskResult<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_accuracy_usage();
+        return Ok(());
+    }
+    let opts = parse_accuracy_options(args)?;
+    let artifact = run_accuracy_fixture(opts.seed)?;
+    let text = serde_json::to_string_pretty(&artifact)?;
+    match opts.output {
+        Some(path) => {
+            fs::write(&path, format!("{text}\n"))?;
+            println!("wrote {}", path.display());
+        }
+        None => println!("{text}"),
+    }
+    Ok(())
+}
+
+fn parse_accuracy_options(args: &[String]) -> XtaskResult<AccuracyOptions> {
+    let mut opts = AccuracyOptions::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        match args.get(i).map(String::as_str) {
+            Some("--seed") => {
+                let raw = args.get(i + 1).ok_or("missing value after --seed")?;
+                opts.seed = raw.parse::<u64>()?;
+                i += 2;
+            }
+            Some("--output") => {
+                let raw = args.get(i + 1).ok_or("missing value after --output")?;
+                opts.output = Some(PathBuf::from(raw));
+                i += 2;
+            }
+            Some(other) => return Err(format!("unknown accuracy option `{other}`").into()),
+            None => break,
+        }
+    }
+    Ok(opts)
+}
+
+fn print_accuracy_usage() {
+    println!(
+        "USAGE: cargo run -p xtask -- accuracy [--seed N] [--output PATH]\n\n\
+         Fits the committed synthetic order-3 fixture, verifies Exact mode + all five\
+         decomposition gates, then emits deviance/lift/ordered-Gini JSON."
+    );
+}
+
+fn run_accuracy_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
+    let raw = synthetic_fixture(seed, 320)?;
+    let split = deterministic_split(seed, raw.y.len())?;
+    let train = select_fixture_rows(&raw, &split.train);
+    let test = select_fixture_rows(&raw, &split.test);
+    let x_train = build_train_matrix(&train)?;
+
+    let loss = SquaredError;
+    let booster = Booster::with_config(Config {
+        n_trees: 120,
+        learning_rate: 0.25,
+        lambda: 1.0,
+        min_split_gain: 0.0,
+        max_delta_step: None,
+        sampling: Sampling::Mvs {
+            rate: 0.75,
+            min_rows: 96,
+        },
+        hist_precision: HistPrecision::QuantizedI32,
+    });
+    let spec = FitSpec {
+        loss: &loss,
+        weight: None,
+        exposure: None,
+        monotone: MonotoneMap::new(),
+        interaction: InteractionPolicy::default(),
+        seed,
+    };
+    let model = booster.fit(&x_train, &train.y, &spec)?;
+
+    let serve_train = ServeBinnedMatrix(x_train.clone());
+    let bank = model.explain(&serve_train, RefMeasure::default())?;
+    if model.mode != ExactnessMode::Exact {
+        return Err("accuracy harness refuses to score a non-Exact model".into());
+    }
+    check_feature_budget(&model)?;
+    assert_exact_decomposition(&model, &bank, &serve_train)?;
+
+    let x_test = bin_like_model(&test, &model.grids, &model.provenance)?;
+    let mut raw_pred = vec![0.0_f32; x_test.n_rows as usize];
+    model.score_trees(&x_test, None, &mut raw_pred)?;
+    let pred = model.predict_binned(&x_test, None)?;
+    let weight = vec![1.0_f32; test.y.len()];
+    let deviance = loss.deviance(&test.y, &raw_pred, &weight)?;
+    let lift = lift_curve(&test.y, &pred, &weight, 10);
+    let ordered_gini = ordered_gini(&test.y, &pred, &weight);
+    let encoded_len = encode_model(&model)?.len();
+
+    Ok(json!({
+        "schema_version": 1,
+        "fixture": raw.name,
+        "objective": "squared_error",
+        "seed": seed,
+        "split": {
+            "train_rows": train.y.len(),
+            "test_rows": test.y.len()
+        },
+        "exactness": {
+            "mode": "Exact",
+            "feature_budget": true,
+            "decomposition": true
+        },
+        "model": {
+            "n_trees": model.trees.len(),
+            "n_features": model.grids.len(),
+            "hist_precision": "QuantizedI32",
+            "sampling": "Mvs",
+            "bincode_bytes": encoded_len
+        },
+        "metrics": {
+            "deviance": deviance,
+            "ordered_gini": ordered_gini,
+            "lift": lift
+        }
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct RawFixture {
+    name: &'static str,
+    columns: Vec<Vec<f32>>,
+    y: Vec<f32>,
+}
+
+fn synthetic_fixture(seed: u64, n_rows: usize) -> XtaskResult<RawFixture> {
+    let mut columns = vec![
+        Vec::with_capacity(n_rows),
+        Vec::with_capacity(n_rows),
+        Vec::with_capacity(n_rows),
+    ];
+    let mut y = Vec::with_capacity(n_rows);
+    for row in 0..n_rows {
+        let block = u32::try_from(row)?;
+        let jitter = unit_from_seed(seed, 0, Stage::Binning, block) as f32;
+        let x0 = ((row * 17 + 3) % 29) as f32 + 0.01 * jitter;
+        let x1 = ((row * 11 + 5) % 23) as f32 + 0.02 * (1.0 - jitter);
+        let x2 = ((row * 7 + 13) % 19) as f32;
+        let f0 = if x0 <= 10.0 { 1.2 } else { -0.4 };
+        let f1 = if x1 <= 8.0 { 0.8 } else { -0.3 };
+        let f2 = if x2 <= 6.0 { 0.5 } else { -0.1 };
+        let pair = if x0 <= 10.0 && x1 > 8.0 { 0.7 } else { -0.2 };
+        let triple = if x0 > 10.0 && x1 <= 8.0 && x2 <= 6.0 {
+            0.9
+        } else {
+            0.0
+        };
+        columns[0].push(x0);
+        columns[1].push(x1);
+        columns[2].push(x2);
+        y.push(10.0 + f0 + f1 + f2 + pair + triple);
+    }
+    Ok(RawFixture {
+        name: "synthetic_order3",
+        columns,
+        y,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SplitRows {
+    train: Vec<usize>,
+    test: Vec<usize>,
+}
+
+fn deterministic_split(seed: u64, n_rows: usize) -> XtaskResult<SplitRows> {
+    let mut keyed = Vec::with_capacity(n_rows);
+    for row in 0..n_rows {
+        keyed.push((
+            tri_boost_core::pb_seed(seed, 0, Stage::Sample as u32, u32::try_from(row)?),
+            row,
+        ));
+    }
+    keyed.sort_unstable_by_key(|(key, row)| (*key, *row));
+    let n_test = (n_rows / 4).max(1);
+    let mut test: Vec<usize> = keyed.iter().take(n_test).map(|(_, row)| *row).collect();
+    let mut train: Vec<usize> = keyed.iter().skip(n_test).map(|(_, row)| *row).collect();
+    train.sort_unstable();
+    test.sort_unstable();
+    Ok(SplitRows { train, test })
+}
+
+fn select_fixture_rows(fixture: &RawFixture, rows: &[usize]) -> RawFixture {
+    let columns = fixture
+        .columns
+        .iter()
+        .map(|col| rows.iter().filter_map(|&r| col.get(r).copied()).collect())
+        .collect();
+    let y = rows
+        .iter()
+        .filter_map(|&r| fixture.y.get(r).copied())
+        .collect();
+    RawFixture {
+        name: fixture.name,
+        columns,
+        y,
+    }
+}
+
+fn build_train_matrix(fixture: &RawFixture) -> Result<BinnedMatrix, PbError> {
+    let refs: Vec<&[f32]> = fixture.columns.iter().map(Vec::as_slice).collect();
+    bin_columns(&refs, None, &BinConfig::default(), 0)
+}
+
+fn bin_like_model(
+    fixture: &RawFixture,
+    grids: &[tri_boost_core::BorderGrid],
+    provenance: &[tri_boost_core::AxisProvenance],
+) -> Result<BinnedMatrix, PbError> {
+    if fixture.columns.len() != grids.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "fixture columns {} != model grids {}",
+                fixture.columns.len(),
+                grids.len()
+            ),
+        });
+    }
+    let mut data = Vec::with_capacity(fixture.columns.len());
+    for (axis, col) in fixture.columns.iter().enumerate() {
+        let grid = grids.get(axis).ok_or_else(|| PbError::Internal {
+            what: "grid disappeared while binning fixture".into(),
+        })?;
+        let bins: Result<Vec<u8>, PbError> = col.iter().map(|&v| bin(v, grid)).collect();
+        data.push(bins?);
+    }
+    Ok(BinnedMatrix {
+        data,
+        n_rows: u32::try_from(fixture.y.len()).map_err(|_| PbError::InvalidInput {
+            what: "fixture has more than u32::MAX rows".into(),
+        })?,
+        grids: grids.to_vec(),
+        provenance: provenance.to_vec(),
+    })
+}
+
+fn unit_from_seed(seed: u64, round: u32, stage: Stage, block: u32) -> f64 {
+    let bits = tri_boost_core::pb_seed(seed, round, stage as u32, block);
+    ((bits >> 11) as f64) / ((1_u64 << 53) as f64)
+}
+
+fn lift_curve(y: &[f32], pred: &[f32], weight: &[f32], buckets: usize) -> Vec<serde_json::Value> {
+    if y.is_empty() || pred.len() != y.len() || weight.len() != y.len() || buckets == 0 {
+        return Vec::new();
+    }
+    let total_w: f64 = weight.iter().map(|&w| f64::from(w.max(0.0))).sum();
+    let total_yw: f64 = y
+        .iter()
+        .zip(weight)
+        .map(|(&yi, &wi)| f64::from(yi) * f64::from(wi.max(0.0)))
+        .sum();
+    let overall = if total_w > 0.0 {
+        total_yw / total_w
+    } else {
+        0.0
+    };
+    let mut order: Vec<usize> = (0..y.len()).collect();
+    order.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]).then_with(|| a.cmp(&b)));
+    let mut out = Vec::new();
+    let n = y.len();
+    for bucket in 0..buckets {
+        let start = bucket * n / buckets;
+        let end = ((bucket + 1) * n / buckets).min(n);
+        if start >= end {
+            continue;
+        }
+        let mut w_sum = 0.0_f64;
+        let mut y_sum = 0.0_f64;
+        let mut p_sum = 0.0_f64;
+        for &idx in &order[start..end] {
+            let w = f64::from(weight[idx].max(0.0));
+            w_sum += w;
+            y_sum += f64::from(y[idx]) * w;
+            p_sum += f64::from(pred[idx]) * w;
+        }
+        let mean_y = if w_sum > 0.0 { y_sum / w_sum } else { 0.0 };
+        let mean_pred = if w_sum > 0.0 { p_sum / w_sum } else { 0.0 };
+        let lift = if overall.abs() > f64::EPSILON {
+            mean_y / overall
+        } else {
+            0.0
+        };
+        out.push(json!({
+            "bucket": bucket + 1,
+            "rows": end - start,
+            "mean_y": finite_or_zero(mean_y),
+            "mean_pred": finite_or_zero(mean_pred),
+            "lift": finite_or_zero(lift)
+        }));
+    }
+    out
+}
+
+fn ordered_gini(y: &[f32], pred: &[f32], weight: &[f32]) -> f64 {
+    let model = concentration_gini(y, pred, weight);
+    let perfect_scores: Vec<f32> = y.to_vec();
+    let perfect = concentration_gini(y, &perfect_scores, weight);
+    if perfect.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        finite_or_zero(model / perfect)
+    }
+}
+
+fn concentration_gini(y: &[f32], score: &[f32], weight: &[f32]) -> f64 {
+    if y.is_empty() || score.len() != y.len() || weight.len() != y.len() {
+        return 0.0;
+    }
+    let total_w: f64 = weight.iter().map(|&w| f64::from(w.max(0.0))).sum();
+    let total_yw: f64 = y
+        .iter()
+        .zip(weight)
+        .map(|(&yi, &wi)| f64::from(yi.max(0.0)) * f64::from(wi.max(0.0)))
+        .sum();
+    if total_w <= 0.0 || total_yw <= 0.0 {
+        return 0.0;
+    }
+    let mut order: Vec<usize> = (0..y.len()).collect();
+    order.sort_by(|&a, &b| score[b].total_cmp(&score[a]).then_with(|| a.cmp(&b)));
+
+    let mut prev_x = 0.0_f64;
+    let mut prev_y = 0.0_f64;
+    let mut cum_w = 0.0_f64;
+    let mut cum_y = 0.0_f64;
+    let mut area = 0.0_f64;
+    for idx in order {
+        let w = f64::from(weight[idx].max(0.0));
+        cum_w += w;
+        cum_y += f64::from(y[idx].max(0.0)) * w;
+        let x = cum_w / total_w;
+        let yy = cum_y / total_yw;
+        area += (x - prev_x) * (yy + prev_y) * 0.5;
+        prev_x = x;
+        prev_y = yy;
+    }
+    finite_or_zero(2.0 * area - 1.0)
+}
+
+fn finite_or_zero(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
 }
 
 /// Run one gate over the shipped sources and translate its findings into an exit code.
@@ -498,5 +880,47 @@ fn strip_line_comment(line: &str) -> String {
     match line.find("//") {
         Some(idx) => line.get(..idx).unwrap_or("").to_string(),
         None => line.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod accuracy_tests {
+    use super::*;
+
+    #[test]
+    fn ordered_gini_pins_perfect_and_reversed_rankings() {
+        let y = [10.0_f32, 0.0, 0.0, 0.0];
+        let w = [1.0_f32; 4];
+        let perfect = [4.0_f32, 3.0, 2.0, 1.0];
+        let reversed = [1.0_f32, 2.0, 3.0, 4.0];
+        assert!((ordered_gini(&y, &perfect, &w) - 1.0).abs() < 1e-12);
+        assert!((ordered_gini(&y, &reversed, &w) + 1.0).abs() < 1e-12);
+        assert_eq!(ordered_gini(&[0.0, 0.0], &[2.0, 1.0], &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn lift_curve_pins_bucket_means() {
+        let y = [8.0_f32, 4.0, 2.0, 2.0];
+        let pred = [0.9_f32, 0.8, 0.2, 0.1];
+        let w = [1.0_f32; 4];
+        let lift = lift_curve(&y, &pred, &w, 2);
+        assert_eq!(lift.len(), 2);
+        assert_eq!(lift[0]["rows"], 2);
+        assert!((lift[0]["mean_y"].as_f64().unwrap() - 6.0).abs() < 1e-12);
+        assert!((lift[0]["lift"].as_f64().unwrap() - 1.5).abs() < 1e-12);
+        assert!((lift[1]["mean_y"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+        assert!((lift[1]["lift"].as_f64().unwrap() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn accuracy_artifact_is_seed_stable_and_exactness_gated() {
+        let a = run_accuracy_fixture(7).unwrap();
+        let b = run_accuracy_fixture(7).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a["exactness"]["mode"], "Exact");
+        assert_eq!(a["exactness"]["decomposition"], true);
+        assert_eq!(a["exactness"]["feature_budget"], true);
+        assert!(a["metrics"]["deviance"].as_f64().unwrap().is_finite());
+        assert!(a["metrics"]["ordered_gini"].as_f64().unwrap().is_finite());
     }
 }
