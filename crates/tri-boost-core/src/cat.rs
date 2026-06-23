@@ -42,11 +42,21 @@ pub enum LeakageScheme {
         /// Number of folds.
         k: u32,
     },
+    /// Leave-one-out target statistics: each row sees its level's full statistics with
+    /// ITSELF removed. Deterministic and knob-free, but NOT the default: although it is the
+    /// nominal cross-fit variance floor, it reintroduces a per-row dependence on the row's
+    /// own target (`enc ≈ (Σ − yᵣ)/(n−1)`) that depth-3 trees partially invert — measured
+    /// WORSE than KFold on both MTPL tasks (the classic LOO target-encoding pathology).
+    LeaveOneOut,
 }
 
 impl Default for LeakageScheme {
     fn default() -> Self {
-        Self::Ordered { n_perms: 1 }
+        // K-fold cross-fit: each row's encoding comes from OTHER folds, so (unlike LOO) rows
+        // in the same fold share a held-out value and the per-row self-dependence is broken.
+        // Empirically the lowest-variance / best-accuracy leakage-free scheme on MTPL
+        // (beats the old `Ordered{1}` default and LOO on both frequency and severity).
+        Self::KFold { k: 5 }
     }
 }
 
@@ -135,6 +145,7 @@ impl TsConfig {
                     });
                 }
             }
+            LeakageScheme::LeaveOneOut => {}
         }
         if self.target_borders == 0 {
             return Err(PbError::InvalidConfig {
@@ -551,6 +562,9 @@ pub fn fit_cat_encoder(
         LeakageScheme::KFold { k } => {
             kfold_training_encodings(&fit_levels, &row_terms, base, smooth, spec.seed, k)?
         }
+        LeakageScheme::LeaveOneOut => {
+            loo_training_encodings(&fit_levels, &row_terms, base, smooth)?
+        }
     };
     Ok((full, train))
 }
@@ -903,6 +917,39 @@ fn ordered_training_encodings(
     }
     let scale = 1.0 / f64::from(n_perms);
     Ok(out.into_iter().map(|v| (v * scale) as f32).collect())
+}
+
+/// Leave-one-out training encodings: each row sees its level's full `(Σwy, Σw)` with its
+/// OWN term subtracted, then shrunk. The variance floor of the cross-fit family (no fold or
+/// permutation noise), deterministic and seed-free, and leakage-free (the row's own target
+/// never enters its encoding). Falls back to `base` when the row is the only member of its
+/// level. Summation is in fixed row order ⇒ thread-count independent.
+fn loo_training_encodings(
+    levels: &[String],
+    rows: &[CatRowTerm],
+    base: f32,
+    smooth: Smooth,
+) -> Result<Vec<f32>, PbError> {
+    let mut total: BTreeMap<&str, CatRowTerm> = BTreeMap::new();
+    for (label, term) in levels.iter().zip(rows) {
+        let t = total.entry(label.as_str()).or_default();
+        t.sum_y += term.sum_y;
+        t.denom += term.denom;
+    }
+    let mut out = Vec::with_capacity(levels.len());
+    for (label, term) in levels.iter().zip(rows) {
+        let all = total.get(label.as_str()).copied().unwrap_or_default();
+        let held = CatRowTerm {
+            sum_y: all.sum_y - term.sum_y,
+            denom: all.denom - term.denom,
+        };
+        out.push(if held.denom > 0.0 {
+            shrunken_encoding(held.sum_y, held.denom, base, smooth)?
+        } else {
+            base
+        });
+    }
+    Ok(out)
 }
 
 fn kfold_training_encodings(
@@ -1375,5 +1422,51 @@ mod tests {
         };
         let (_, train_b) = fit_cat_encoder(&levels, &changed, spec).unwrap();
         assert_eq!(train_a[0], train_b[0]);
+    }
+
+    #[test]
+    fn leave_one_out_excludes_each_rows_own_target() {
+        // Two rows in one level; m=0 ⇒ no shrinkage, so each row's LOO encoding is exactly
+        // the OTHER row's target (its own is excluded) — leakage-free by construction.
+        let levels = vec!["a".to_string(), "a".to_string()];
+        let rows = vec![
+            CatRowTerm {
+                sum_y: 1.0,
+                denom: 1.0,
+            },
+            CatRowTerm {
+                sum_y: 3.0,
+                denom: 1.0,
+            },
+        ];
+        let enc = loo_training_encodings(&levels, &rows, 2.0, Smooth::Fixed { m: 0.0 }).unwrap();
+        assert!(
+            (enc[0] - 3.0).abs() < 1e-6,
+            "row 0 sees only row 1's target"
+        );
+        assert!(
+            (enc[1] - 1.0).abs() < 1e-6,
+            "row 1 sees only row 0's target"
+        );
+        // A singleton level has no other rows ⇒ falls back to base.
+        let solo = loo_training_encodings(
+            &["b".to_string()],
+            &[CatRowTerm {
+                sum_y: 5.0,
+                denom: 1.0,
+            }],
+            2.0,
+            Smooth::Fixed { m: 0.0 },
+        )
+        .unwrap();
+        assert!((solo[0] - 2.0).abs() < 1e-6, "singleton ⇒ base");
+    }
+
+    #[test]
+    fn default_leakage_scheme_is_kfold() {
+        assert!(matches!(
+            LeakageScheme::default(),
+            LeakageScheme::KFold { k: 5 }
+        ));
     }
 }

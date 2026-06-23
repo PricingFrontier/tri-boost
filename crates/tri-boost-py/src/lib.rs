@@ -172,12 +172,15 @@ fn parse_cat_target(name: Option<&str>) -> Result<CatTarget, PbError> {
 
 fn parse_cat_leakage(name: Option<&str>, n_perms: u32, k: u32) -> Result<LeakageScheme, PbError> {
     match name.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        None | Some("ordered") => Ok(LeakageScheme::Ordered { n_perms }),
-        Some("kfold") | Some("k_fold") | Some("crossfit") | Some("cross_fit") => {
+        // Default to K-fold cross-fit: lowest-variance leakage-free encoding measured on MTPL
+        // (beats both the old Ordered{1} default and leave-one-out on frequency and severity).
+        None | Some("kfold") | Some("k_fold") | Some("crossfit") | Some("cross_fit") => {
             Ok(LeakageScheme::KFold { k })
         }
+        Some("ordered") => Ok(LeakageScheme::Ordered { n_perms }),
+        Some("loo") | Some("leave_one_out") | Some("leaveoneout") => Ok(LeakageScheme::LeaveOneOut),
         Some(other) => Err(PbError::InvalidConfig {
-            what: format!("cat_leakage must be 'ordered' or 'kfold', got {other:?}"),
+            what: format!("cat_leakage must be 'kfold', 'ordered', or 'loo', got {other:?}"),
         }),
     }
 }
