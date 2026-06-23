@@ -16,6 +16,7 @@
 //!   code carries a `// JUSTIFIED:` proof (§13.8).
 //! * `check-no-usize-serialized` — no `usize`/`isize` field on a serialized type (§13.4 wire-width).
 //! * `check-no-hashmap-serialized` — no `HashMap`/`HashSet` field on a serialized type (order).
+//! * `check-no-rival-deps` — no benchmark-rival dependency leaks into shipped manifests (§13.7/M6).
 //! * `check-all` — run every gate; non-zero exit if any fails.
 //! * `accuracy` — deterministic, exactness-gated benchmark smoke harness (§13.7).
 //! * `release-preflight` — internal v1.5 lever/exactness checkpoint (§14.3/M6-0).
@@ -66,6 +67,7 @@ fn main() -> ExitCode {
         "check-justified" => run_gate(check_justified),
         "check-no-usize-serialized" => run_gate(check_no_usize_serialized),
         "check-no-hashmap-serialized" => run_gate(check_no_hashmap_serialized),
+        "check-no-rival-deps" => run_manifest_gate(check_no_rival_deps),
         "check-all" => {
             let gates: [(&str, GateFn); 4] = [
                 ("check-no-box-dyn", check_no_box_dyn),
@@ -93,6 +95,25 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            let manifest_violations = match load_dependency_boundary_files() {
+                Ok(files) => check_no_rival_deps(&files),
+                Err(err) => {
+                    eprintln!("xtask: could not enumerate dependency-boundary files: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if manifest_violations.is_empty() {
+                println!("[ok]   check-no-rival-deps");
+            } else {
+                failed = true;
+                println!(
+                    "[FAIL] check-no-rival-deps: {} violation(s)",
+                    manifest_violations.len()
+                );
+                for v in &manifest_violations {
+                    println!("    {v}");
+                }
+            }
             if failed {
                 ExitCode::FAILURE
             } else {
@@ -117,6 +138,7 @@ fn print_usage() {
          \x20 check-justified              require `// JUSTIFIED:` on unwrap/expect/panic/allow\n\
          \x20 check-no-usize-serialized     forbid usize/isize on serialized types\n\
          \x20 check-no-hashmap-serialized   forbid HashMap/HashSet on serialized types\n\
+         \x20 check-no-rival-deps           forbid benchmark rival deps in shipped manifests\n\
          \x20 accuracy [--seed N] [--output PATH] [--adversarial]\n\
          \x20                               exactness-gated deterministic benchmark smoke\n\
          \x20 release-preflight [--seed N] [--output PATH]\n\
@@ -822,6 +844,27 @@ fn run_gate(gate: GateFn) -> ExitCode {
     }
 }
 
+/// Run a gate over dependency-boundary manifests and translate findings into an exit code.
+fn run_manifest_gate(gate: GateFn) -> ExitCode {
+    let files = match load_dependency_boundary_files() {
+        Ok(files) => files,
+        Err(err) => {
+            eprintln!("xtask: could not enumerate dependency-boundary files: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let violations = gate(&files);
+    if violations.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        for v in &violations {
+            println!("{v}");
+        }
+        eprintln!("xtask: {} violation(s)", violations.len());
+        ExitCode::FAILURE
+    }
+}
+
 /// A loaded shipped source file: its display path plus its lines.
 struct SourceFile {
     path: PathBuf,
@@ -871,6 +914,32 @@ fn load_shipped_sources() -> std::io::Result<Vec<SourceFile>> {
             path: display,
             lines,
         });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// Collect the shipped dependency manifests. `xtask` is deliberately excluded:
+/// benchmark rivals may be invoked from dev tooling, but they must not become Rust
+/// core/binding or wheel dependencies.
+fn load_dependency_boundary_files() -> std::io::Result<Vec<SourceFile>> {
+    let root = workspace_root();
+    let paths = [
+        root.join("Cargo.toml"),
+        root.join("crates/tri-boost-core/Cargo.toml"),
+        root.join("crates/tri-boost-py/Cargo.toml"),
+        root.join("pyproject.toml"),
+    ];
+    let mut out = Vec::new();
+    for path in paths {
+        if path.is_file() {
+            let text = fs::read_to_string(&path)?;
+            let display = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
+            out.push(SourceFile {
+                path: display,
+                lines: text.lines().map(str::to_owned).collect(),
+            });
+        }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
@@ -1036,6 +1105,63 @@ fn check_no_hashmap_serialized(files: &[SourceFile]) -> Vec<Violation> {
         &["HashMap", "HashSet"],
         "`HashMap`/`HashSet` on a serialized type has nondeterministic order; use `BTreeMap`/`Vec`",
     )
+}
+
+// ---------------------------------------------------------------------------
+// Gate: no benchmark-rival dependencies in shipped manifests (§13.7 / M6-4).
+// ---------------------------------------------------------------------------
+
+fn check_no_rival_deps(files: &[SourceFile]) -> Vec<Violation> {
+    const RIVALS: [&str; 6] = [
+        "xgboost",
+        "lightgbm",
+        "catboost",
+        "interpret",
+        "shap",
+        "treeshap",
+    ];
+    let mut out = Vec::new();
+    for file in files {
+        for (i, line) in file.lines.iter().enumerate() {
+            let code = strip_toml_comment(line).to_ascii_lowercase();
+            if let Some(rival) = RIVALS
+                .iter()
+                .find(|&&rival| contains_rival_dep_name(&code, rival))
+            {
+                out.push(Violation {
+                    path: file.path.clone(),
+                    line: i + 1,
+                    message: format!(
+                        "benchmark rival dependency `{rival}` must stay outside shipped manifests; invoke it only from dev tooling"
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn contains_rival_dep_name(line: &str, rival: &str) -> bool {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix(rival) {
+        if rest.trim_start().starts_with('=') || rest.starts_with(char::is_whitespace) {
+            return true;
+        }
+    }
+    quoted_package_names(trimmed).any(|name| name == rival)
+}
+
+fn quoted_package_names(line: &str) -> impl Iterator<Item = &str> {
+    line.split(['"', '\'']).skip(1).step_by(2).filter_map(|s| {
+        let end = s
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'))
+            .unwrap_or(s.len());
+        s.get(..end)
+    })
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    line.split('#').next().unwrap_or("")
 }
 
 /// Scan each `Serialize`/`Deserialize`-deriving struct/enum body and flag any field
@@ -1283,5 +1409,16 @@ mod accuracy_tests {
             artifact["external"]["treeshap_oracle"],
             "not_run_by_local_preflight"
         );
+    }
+
+    #[test]
+    fn rival_dependency_gate_catches_shipped_manifest_leak() {
+        let files = [SourceFile {
+            path: PathBuf::from("crates/tri-boost-core/Cargo.toml"),
+            lines: vec!["xgboost = \"1\"".to_owned()],
+        }];
+        let violations = check_no_rival_deps(&files);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].message.contains("xgboost"));
     }
 }
