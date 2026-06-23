@@ -74,7 +74,13 @@ class _BaseTriBoost(BaseEstimator):
 
     def set_params(self, **params: Any):
         result = super().set_params(**params)
-        for name in ("_model", "n_features_in_", "feature_names_in_", "classes_"):
+        for name in (
+            "_model",
+            "_precision_warning_emitted_",
+            "n_features_in_",
+            "feature_names_in_",
+            "classes_",
+        ):
             if hasattr(self, name):
                 delattr(self, name)
         return result
@@ -103,7 +109,7 @@ class _BaseTriBoost(BaseEstimator):
         class_labels: list[str] | None,
     ) -> _Model:
         feature_names = _feature_names_from_x(x)
-        x32 = _as_float32_2d(x, warn=True)
+        x32 = self._as_float32_2d_once(x)
         y32 = _as_float32_1d(y, "y")
         if x32.shape[0] != y32.shape[0]:
             raise ValueError(f"X has {x32.shape[0]} rows but y has {y32.shape[0]}")
@@ -135,9 +141,38 @@ class _BaseTriBoost(BaseEstimator):
             self.feature_names_in_ = np.asarray(feature_names, dtype=object)
         return model
 
+    def _as_float32_2d_once(self, x: Any) -> np.ndarray:
+        arr0 = np.asarray(x)
+        warn = arr0.dtype != np.float32 and not getattr(
+            self, "_precision_warning_emitted_", False
+        )
+        out = _as_float32_2d(x, warn=warn)
+        if warn:
+            self._precision_warning_emitted_ = True
+        return out
+
+    def _attach_model(self, model: _Model) -> None:
+        self._model = model
+        self.n_features_in_ = model.n_features
+        names = model.feature_names
+        if names:
+            self.feature_names_in_ = np.asarray(names, dtype=object)
+
 
 class TriBoostRegressor(RegressorMixin, _BaseTriBoost):
     """Exact depth-3 oblivious boosting regressor."""
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "TriBoostRegressor":
+        est = cls()
+        est._attach_model(_Model.from_bytes(data))
+        return est
+
+    @classmethod
+    def from_json(cls, data: str) -> "TriBoostRegressor":
+        est = cls()
+        est._attach_model(_Model.from_json(data))
+        return est
 
     def fit(
         self,
@@ -157,12 +192,12 @@ class TriBoostRegressor(RegressorMixin, _BaseTriBoost):
 
     def predict(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "_model")
-        x32 = _as_float32_2d(X, warn=True)
+        x32 = self._as_float32_2d_once(X)
         return self._model.predict(x32)
 
     def predict_raw(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "_model")
-        x32 = _as_float32_2d(X, warn=True)
+        x32 = self._as_float32_2d_once(X)
         return self._model.predict_raw(x32)
 
     def to_bytes(self) -> bytes:
@@ -176,6 +211,18 @@ class TriBoostRegressor(RegressorMixin, _BaseTriBoost):
 
 class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
     """Binary exact depth-3 oblivious boosting classifier."""
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "TriBoostClassifier":
+        est = cls()
+        est._attach_classifier_model(_Model.from_bytes(data))
+        return est
+
+    @classmethod
+    def from_json(cls, data: str) -> "TriBoostClassifier":
+        est = cls()
+        est._attach_classifier_model(_Model.from_json(data))
+        return est
 
     def __init__(
         self,
@@ -229,13 +276,13 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
 
     def predict_proba(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "_model")
-        x32 = _as_float32_2d(X, warn=True)
+        x32 = self._as_float32_2d_once(X)
         p1 = np.asarray(self._model.predict(x32), dtype=np.float32)
         return np.column_stack((1.0 - p1, p1))
 
     def decision_function(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "_model")
-        x32 = _as_float32_2d(X, warn=True)
+        x32 = self._as_float32_2d_once(X)
         return self._model.predict_raw(x32)
 
     def predict(self, X: Any) -> np.ndarray:
@@ -249,3 +296,10 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
     def to_json(self) -> str:
         check_is_fitted(self, "_model")
         return self._model.to_json()
+
+    def _attach_classifier_model(self, model: _Model) -> None:
+        labels = model.class_labels
+        if labels is None or len(labels) != 2:
+            raise ValueError("serialized classifier model must carry exactly two class labels")
+        self.classes_ = np.asarray(labels, dtype=object)
+        self._attach_model(model)
