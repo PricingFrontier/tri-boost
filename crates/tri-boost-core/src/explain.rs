@@ -1663,6 +1663,23 @@ impl Model {
     /// if a table or the bank exceeds its cell budget; [`PbError::InvariantViolated`] if any
     /// of the five gates fail; plus propagated shape/grid errors.
     pub fn explain(&self, x: &ServeBinnedMatrix, w: RefMeasure) -> Result<TableBank, PbError> {
+        self.explain_with_budget(x, w, TableBudget::default())
+    }
+
+    /// Build the complete purified [`TableBank`] with an explicit table budget
+    /// (spec §08.10). This is the same exact pipeline as [`Model::explain`], but lets
+    /// callers choose [`OverflowPolicy::SparseFallback`] for adversarial or large
+    /// merged grids instead of the default hard-error policy.
+    ///
+    /// # Errors
+    /// Same as [`Model::explain`], plus [`PbError::InvalidConfig`] if the sparse
+    /// fallback threshold is malformed.
+    pub fn explain_with_budget(
+        &self,
+        x: &ServeBinnedMatrix,
+        w: RefMeasure,
+        budget: TableBudget,
+    ) -> Result<TableBank, PbError> {
         if let crate::engine::ExactnessMode::Approximate { reason } = &self.mode {
             return Err(PbError::ExactnessFirewall(reason.clone()));
         }
@@ -1724,7 +1741,6 @@ impl Model {
         }
 
         let grids = MergedGrids::from_model(self)?;
-        let budget = TableBudget::default();
         let raw = accumulate(self, &grids, &budget)?;
         verify_raw_accumulation(self, &raw, &grids)?;
         let weights = build_weights(x, &grids, &w)?;
@@ -3017,6 +3033,24 @@ mod tests {
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, bank);
         check_reconstruction(&model, &decoded).unwrap();
+    }
+
+    #[test]
+    fn explain_with_budget_activates_sparse_fallback() {
+        let model = fixture_model();
+        let x = fixture_serve();
+        let budget = TableBudget {
+            max_table_cells: 1,
+            max_bank_cells: 1,
+            on_overflow: OverflowPolicy::SparseFallback {
+                density_threshold: 1.0,
+            },
+        };
+        let bank = model
+            .explain_with_budget(&x, RefMeasure::Uniform, budget)
+            .unwrap();
+        assert!(bank.tables.iter().any(|table| table.values.is_sparse()));
+        assert_exact_decomposition(&model, &bank, &x).unwrap();
     }
 
     #[test]

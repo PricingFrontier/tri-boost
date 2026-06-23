@@ -26,13 +26,14 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use serde_json::json;
 use tri_boost_core::{
     assert_exact_decomposition, bin, bin_columns, check_feature_budget, encode_model, BinConfig,
     BinnedMatrix, Booster, BoosterConfig, Config, ExactnessMode, FitSpec, HistPrecision,
-    InteractionPolicy, Loss, MonotoneMap, NesterovSpec, PbError, RefMeasure, RefitSpec, Sampling,
-    ServeBinnedMatrix, SquaredError, Stage,
+    InteractionPolicy, Loss, MonotoneMap, NesterovSpec, OverflowPolicy, PbError, RefMeasure,
+    RefitSpec, Sampling, ServeBinnedMatrix, SquaredError, Stage, TableBudget,
 };
 
 /// A grep-gate: scans the shipped sources and returns any violations found.
@@ -108,7 +109,7 @@ fn print_usage() {
          \x20 check-justified              require `// JUSTIFIED:` on unwrap/expect/panic/allow\n\
          \x20 check-no-usize-serialized     forbid usize/isize on serialized types\n\
          \x20 check-no-hashmap-serialized   forbid HashMap/HashSet on serialized types\n\
-         \x20 accuracy [--seed N] [--output PATH]\n\
+         \x20 accuracy [--seed N] [--output PATH] [--adversarial]\n\
          \x20                               exactness-gated deterministic benchmark smoke\n\
          \x20 --help                        show this message"
     );
@@ -124,6 +125,7 @@ type XtaskResult<T> = Result<T, Box<dyn std::error::Error>>;
 struct AccuracyOptions {
     seed: u64,
     output: Option<PathBuf>,
+    adversarial: bool,
 }
 
 impl Default for AccuracyOptions {
@@ -131,6 +133,7 @@ impl Default for AccuracyOptions {
         Self {
             seed: 20260622,
             output: None,
+            adversarial: false,
         }
     }
 }
@@ -141,7 +144,11 @@ fn run_accuracy_cli(args: &[String]) -> XtaskResult<()> {
         return Ok(());
     }
     let opts = parse_accuracy_options(args)?;
-    let artifact = run_accuracy_fixture(opts.seed)?;
+    let artifact = if opts.adversarial {
+        run_adversarial_fixture(opts.seed)?
+    } else {
+        run_accuracy_fixture(opts.seed)?
+    };
     let text = serde_json::to_string_pretty(&artifact)?;
     match opts.output {
         Some(path) => {
@@ -168,6 +175,10 @@ fn parse_accuracy_options(args: &[String]) -> XtaskResult<AccuracyOptions> {
                 opts.output = Some(PathBuf::from(raw));
                 i += 2;
             }
+            Some("--adversarial") => {
+                opts.adversarial = true;
+                i += 1;
+            }
             Some(other) => return Err(format!("unknown accuracy option `{other}`").into()),
             None => break,
         }
@@ -177,9 +188,11 @@ fn parse_accuracy_options(args: &[String]) -> XtaskResult<AccuracyOptions> {
 
 fn print_accuracy_usage() {
     println!(
-        "USAGE: cargo run -p xtask -- accuracy [--seed N] [--output PATH]\n\n\
+        "USAGE: cargo run -p xtask -- accuracy [--seed N] [--output PATH] [--adversarial]\n\n\
          Fits the committed synthetic order-3 fixture, verifies Exact mode + all five\
-         decomposition gates, then emits deviance/lift/ordered-Gini JSON."
+         decomposition gates, then emits deviance/lift/ordered-Gini JSON. With\
+         --adversarial, forces the §08 SparseFallback table-budget path and emits\
+         a budget-firewall artifact."
     );
 }
 
@@ -293,6 +306,79 @@ fn run_accuracy_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
                 "agbm_default": "off",
                 "reason": "Smoke results are recorded for regression visibility; default-on requires repayment on the external accuracy corpus."
             }
+        }
+    }))
+}
+
+fn run_adversarial_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
+    let raw = synthetic_fixture(seed, 192)?;
+    let x_train = build_train_matrix(&raw)?;
+    let loss = SquaredError;
+    let spec = FitSpec {
+        loss: &loss,
+        weight: None,
+        exposure: None,
+        monotone: MonotoneMap::new(),
+        interaction: InteractionPolicy::default(),
+        seed,
+    };
+    let model = Booster::with_config(accuracy_config(BoosterConfig::default()))
+        .fit(&x_train, &raw.y, &spec)?;
+    if model.mode != ExactnessMode::Exact {
+        return Err("adversarial harness refuses to score a non-Exact model".into());
+    }
+    check_feature_budget(&model)?;
+
+    let serve = ServeBinnedMatrix(x_train);
+    let budget = TableBudget {
+        max_table_cells: 1,
+        max_bank_cells: 1,
+        on_overflow: OverflowPolicy::SparseFallback {
+            density_threshold: 1.0,
+        },
+    };
+    let started = Instant::now();
+    let bank = model.explain_with_budget(&serve, RefMeasure::default(), budget)?;
+    let purification_ms = started.elapsed().as_secs_f64() * 1000.0;
+    assert_exact_decomposition(&model, &bank, &serve)?;
+
+    let sparse_tables = bank
+        .tables
+        .iter()
+        .filter(|table| table.values.is_sparse())
+        .count();
+    let sparse_triples = bank
+        .tables
+        .iter()
+        .filter(|table| table.u.order() == 3 && table.values.is_sparse())
+        .count();
+    if sparse_tables == 0 {
+        return Err("adversarial budget did not engage SparseFallback".into());
+    }
+
+    Ok(json!({
+        "schema_version": 1,
+        "fixture": raw.name,
+        "mode": "adversarial_table_budget",
+        "seed": seed,
+        "exactness": {
+            "mode": "Exact",
+            "feature_budget": true,
+            "decomposition": true
+        },
+        "budget": {
+            "max_table_cells": budget.max_table_cells,
+            "max_bank_cells": budget.max_bank_cells,
+            "overflow_policy": "SparseFallback",
+            "density_threshold": 1.0
+        },
+        "tables": {
+            "total": bank.tables.len(),
+            "sparse": sparse_tables,
+            "sparse_triples": sparse_triples
+        },
+        "perf": {
+            "purification_ms": finite_or_zero(purification_ms)
         }
     }))
 }
@@ -1059,5 +1145,22 @@ mod accuracy_tests {
             assert_eq!(candidate["exact"], true);
             assert!(candidate["deviance"].as_f64().unwrap().is_finite());
         }
+    }
+
+    #[test]
+    fn adversarial_artifact_is_seed_stable_and_uses_sparse_fallback() {
+        let a = run_adversarial_fixture(7).unwrap();
+        let b = run_adversarial_fixture(7).unwrap();
+        assert_eq!(a["fixture"], b["fixture"]);
+        assert_eq!(a["seed"], b["seed"]);
+        assert_eq!(a["exactness"], b["exactness"]);
+        assert_eq!(a["budget"], b["budget"]);
+        assert_eq!(a["tables"], b["tables"]);
+        assert_eq!(a["mode"], "adversarial_table_budget");
+        assert_eq!(a["exactness"]["mode"], "Exact");
+        assert_eq!(a["exactness"]["decomposition"], true);
+        assert_eq!(a["budget"]["overflow_policy"], "SparseFallback");
+        assert!(a["tables"]["sparse"].as_u64().unwrap() > 0);
+        assert!(a["perf"]["purification_ms"].as_f64().unwrap().is_finite());
     }
 }
