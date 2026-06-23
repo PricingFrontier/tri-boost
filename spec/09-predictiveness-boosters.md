@@ -1,12 +1,12 @@
 # tri-boost — SPEC §09: Predictiveness boosters
 
-> 2026-06-21. Conforms to `spec/00-spec-skeleton.md` (§1 engineering standards, §2 shared types, §3 invariant contract, §4 ownership). This section OWNS: teacher-distillation training mode; fully-corrective leaf refit; Nesterov/accelerated boosting; bagged greedy ensemble selection (and its outer-bag table-average on-ramp); the residual optional knobs (DART, `random_strength`). It USES `Model.trees` alphas (§06), the `Loss` trait (§05), purification linearity (§08), and the firewall (§3). Single quotes mark inline Rust identifiers.
+> 2026-06-21. Conforms to `spec/00-spec-skeleton.md` (§1 engineering standards, §2 shared types, §3 invariant contract, §4 ownership). This section OWNS: fully-corrective leaf refit; Nesterov/accelerated boosting; bagged greedy ensemble selection (and its outer-bag table-average on-ramp); global mean re-anchoring; and the residual optional knobs (DART, `random_strength`). It USES `Model.trees` alphas (§06), the `Loss` trait (§05), purification linearity (§08), and the firewall (§3). Single quotes mark inline Rust identifiers.
 
 ## 09 — Predictiveness boosters
 
-Where the gap-closing playbook is cashed in. The v1 spine (§05–§08) reaches "beat EBM, near-parity on most data"; the boosters here chase the unconstrained GBMs — distillation leads (highest-upside *new* lever), ensembling closes (the last variance slice). **The governing constraint is uniform: every booster touches only the loss target, the leaf scalars, the tree weights, or a convex average of banks — never tree shape.** So I1 and I2 hold *by construction* and every booster stays `ExactnessMode::Exact`; the firewall (§3) enumerates these five as exactness-preserving precisely because none can inflate interaction order. Honest disclaimer, meant: **none lift the order-3 *bias* ceiling** — they recover variance and search slack, not genuine ≥4-way structure.
+Where the gap-closing playbook is cashed in. The v1 spine (§05–§08) reaches "beat EBM, near-parity on most data"; the boosters here chase the unconstrained GBMs through exactness-preserving variance reduction, leaf re-optimization, and accelerated stagewise search. **The governing constraint is uniform: every booster touches only the leaf scalars, the tree weights, the global intercept, or a convex average of banks — never tree shape.** So I1 and I2 hold *by construction* and every booster stays `ExactnessMode::Exact`; the firewall (§3) enumerates these as exactness-preserving precisely because none can inflate interaction order. Honest disclaimer, meant: **none lift the order-3 *bias* ceiling** — they recover variance and search slack, not genuine ≥4-way structure.
 
-All boosters are **default-off**; the default is the single best-tuned model. Fixed pipeline order: *distill (target) → fit → refit leaves → ensemble-average banks → purify → tables*.
+All boosters are **default-off**; the default is the single best-tuned model. Fixed pipeline order: *fit → refit leaves → optional re-anchor → ensemble-average banks → purify → tables*.
 
 ### 09.1 Configuration surface
 
@@ -25,43 +25,7 @@ pub struct BoosterConfig {
 }
 ```
 
-**Distillation is NOT a `BoosterConfig` knob — it is a `FitSpec` field.** Whether to distil lives in `FitSpec.distill: Option<DistillSpec>` (skeleton §2.9), alongside `weight` and `exposure`, because — like those — it carries **per-row data** (the `teacher_raw` vector is one score per training row) that must be supplied at `fit` time, not baked into a reusable config. `BoosterConfig` holds only the per-row-data-free booster knobs; the per-row distillation target is threaded through `FitSpec` (09.2). The other boosters here (refit, Nesterov, ensemble, DART, `random_strength`, `reanchor`) carry no per-row data and so stay in `BoosterConfig`.
-
-### 09.2 Teacher-distillation training mode
-
-**Decision.** Ship a distillation training mode (v1.5, default off): the booster fits against a teacher's soft score blended with true labels. The distillation target lives in **`FitSpec.distill: Option<DistillSpec>`** (skeleton §2.9), NOT in `BoosterConfig` — it is a per-row-data field (the per-row `teacher_raw` scores), so it belongs with `weight`/`exposure` at `fit` time. **Teacher default is CatBoost** — itself an oblivious-tree ensemble, so distilling takes the ≤3rd-order projection of the *same tree family*, and it carries best-in-class ordered-TS categorical signal matching our Fisher-TS axes (§04). The teacher is consumed data-side only (tri-boost never links CatBoost; the user, or the optional `distill` Python helper §12, supplies per-row soft scores).
-
-**What changes — only the target.** A `Loss`-target substitution; never the split-finder, histogram engine, or tree shape. Given teacher raw scores `t` (in *our* score space `F`, pre-link — caller aligns the link) and labels `y`, each iteration fits gradients against a blended target
-
-```text
-ĝ_i, ĥ_i  =  loss.grad_hess on the BLENDED objective
-          =  blend · grad_hess(y_i, F_i) + (1−blend) · grad_hess(t_i, F_i)
-```
-
-where `blend ∈ [0,1]` is the true-label weight (`soft_weight = 1−blend`). The "soft" term is the **base `grad_hess` called with `teacher_raw` as the target** (no separate trait method): squared error `(F_i − t_i)`; Logistic a cross-entropy to the soft label `σ(t_i)`; Poisson/Gamma/Tweedie the deviance gradient toward `pred_from_raw(t_i)`. This is the §05 `BlendedLoss` adaptor, same name/polarity (`g = blend·g_true + (1−blend)·g_soft`). Because the trait is fallible (`Loss::grad_hess(..) -> Result<(), PbError>`, §2.4), each of the two passes is `?`-propagated and the blend itself is infallible. Blending in *gradient* space composes with exposure offsets and weights with zero special-casing.
-
-```rust
-/// Teacher-distillation target. Teacher scores are pre-supplied (data-side).
-#[derive(Clone, Debug)]
-pub struct DistillSpec {
-    /// Teacher raw scores in OUR score space F (pre-link), one per training row.
-    pub teacher_raw: Vec<f32>,
-    /// Soft+true blend: target = blend·true + (1−blend)·soft. Default 0.5
-    /// (balanced). Meaningful only when this DistillSpec is present (= ON);
-    /// blend=1.0 is the degenerate zero-teacher case (reproduces the
-    /// non-distilled fit, kept as a test oracle), NOT the off switch —
-    /// disabling is FitSpec.distill = None, which skips teacher training.
-    pub blend: f32,
-    pub teacher: TeacherKind,                 // provenance tag, for the model card
-}
-pub enum TeacherKind { CatBoost, LightGbm, XgBoost, Other(String) }
-```
-
-**Two parameters, off by default.** *Whether* to distil = `FitSpec.distill: Option<DistillSpec>` — `None` (the default) fits no teacher and trains on true labels; the teacher (the §12 Python helper that fits CatBoost) is invoked **only** when `distill.is_some()`. *How much* = `DistillSpec.blend`, the true-label weight, **default `0.5` (balanced)** — clamp to `[0,1]`, reject NaN with `PbError::InvalidConfig`. `blend == 1.0` is the degenerate zero-teacher case (it reproduces the non-distilled fit bit-for-bit, kept as an inert-default test oracle), *not* the disable switch — disabling is `distill = None`, which skips teacher training entirely.
-
-**Exactness.** The distilled model is bit-exact to its own tables — distillation changes *what F approximates*, never *how F decomposes*; it stays `Exact` and exports tables normally. Its *fidelity to the teacher* is <1 (the student matches the teacher's ≤3rd-order projection exactly; genuine ≥4-way teacher structure is irreducible). Teacher provenance is stamped on the `Model` card; the teacher never enters inference. **Firewall note:** distillation only ever fits *toward* the teacher; *adding* a >3-order teacher as a base-margin is the banned path (§3) and is not this path.
-
-**Cost.** One extra O(n) gradient pass per iteration (cheap), plus the one-time external teacher fit (caller-borne). **Serves:** accuracy (headline new lever); decomposable (untouched); fast (negligible overhead).
+`BoosterConfig` holds only per-row-data-free booster knobs. Per-row data belongs in `FitSpec` (`y`, weights, exposure, row subsets); §09 does not introduce any extra fit-time target vector or external model hook.
 
 ### 09.3 Fully-corrective leaf refit
 
@@ -168,8 +132,8 @@ All preserve exactness, all default off, all situational (benchmark-gated, none 
 
 ### 09.7 Testing approach
 
-Per §1/§13, every booster carries: (1) **a decomposition-safety property test** — after the booster, the five Invariant checks (§3: Reconstruction, MassConservation, Purity, VarianceSum, ThreeWayEqual) still pass, proving `Exact` survives; (2) **a bit-reproducibility test** — bit-identical training at `n_threads ∈ {1,2,8}` (the determinism [GATE]). Booster-specific oracles: **distillation** — `blend == 1.0` reproduces the non-distilled model bit-for-bit (inert-default check), and a synthetic order-3 teacher is matched to float tolerance (the ≤3rd-order-projection property). **Refit** — on a single tree the IRLS solve equals the direct Newton leaf optimum; refitting an optimal ensemble is a near-no-op; `proptest` that `Z θ` reconstructs the leaf-lookup scores. **Nesterov** — the alpha-folded `Model.trees` scores bit-identically to the three-sequence accumulation; on a quadratic loss it matches the closed-form accelerated trajectory. **Ensemble** — `average_banks` satisfies purify-then-average ≡ average-then-purify to tolerance (the linearity `proptest`); union-grid mapping is lossless (member score == its image at one interior point per cell); `Σα`/`α ≥ 0`/`w`-mismatch each raise the typed error. **DART** — the non-unit-weight fold reproduces the pre-fold score exactly, and the `1/(k+1)` / `k·(k+1)⁻¹` renormalization preserves total contribution to tolerance. **Re-anchoring** — after `f0 ← f0 + δ` the weighted total prediction equals the weighted total observed (`Σ w·μ̂ == Σ w·y` to tolerance) and all five Invariant checks still pass (only `f0` moved). **SE bands** — the published averaged value equals the across-bag mean per cell, the `se` annotation is excluded from `Reconstruction`/`VarianceSum` and from inference (scoring a model with and without the `se` annotation gives bit-identical predictions).
+Per §1/§13, every booster carries: (1) **a decomposition-safety property test** — after the booster, the five Invariant checks (§3: Reconstruction, MassConservation, Purity, VarianceSum, ThreeWayEqual) still pass, proving `Exact` survives; (2) **a bit-reproducibility test** — bit-identical training at `n_threads ∈ {1,2,8}` (the determinism [GATE]). Booster-specific oracles: **Refit** — on a single tree the IRLS solve equals the direct Newton leaf optimum; refitting an optimal ensemble is a near-no-op; `proptest` that `Z θ` reconstructs the leaf-lookup scores. **Nesterov** — the alpha-folded `Model.trees` scores bit-identically to the three-sequence accumulation; on a quadratic loss it matches the closed-form accelerated trajectory. **Ensemble** — `average_banks` satisfies purify-then-average ≡ average-then-purify to tolerance (the linearity `proptest`); union-grid mapping is lossless (member score == its image at one interior point per cell); `Σα`/`α ≥ 0`/`w`-mismatch each raise the typed error. **DART** — the non-unit-weight fold reproduces the pre-fold score exactly, and the `1/(k+1)` / `k·(k+1)⁻¹` renormalization preserves total contribution to tolerance. **Re-anchoring** — after `f0 ← f0 + δ` the weighted total prediction equals the weighted total observed (`Σ w·μ̂ == Σ w·y` to tolerance) and all five Invariant checks still pass (only `f0` moved). **SE bands** — the published averaged value equals the across-bag mean per cell, the `se` annotation is excluded from `Reconstruction`/`VarianceSum` and from inference (scoring a model with and without the `se` annotation gives bit-identical predictions).
 
 ### 09.8 Build order & open forks
 
-**v1.5:** distillation (09.2), ensemble on-ramp `OuterBag` + full `GreedySelect` (09.5). **v2:** fully-corrective refit (09.3), Nesterov/AGBM (09.4), DART/`random_strength` (09.6). **The one genuinely-open fork:** whether fully-corrective refit and/or AGBM should ever flip default-on — both are exact and both shrink tree count, but the solve/2×-iter cost must be measured on pricing data first. **Recommended default: both off**, promoted only behind a benchmark showing tree-count reduction repays the per-round cost (logged in skeleton §14).
+**v1.5:** ensemble on-ramp `OuterBag` + full `GreedySelect` (09.5). **v2:** fully-corrective refit (09.3), Nesterov/AGBM (09.4), DART/`random_strength` (09.6). **The one genuinely-open fork:** whether fully-corrective refit and/or AGBM should ever flip default-on — both are exact and both shrink tree count, but the solve/2×-iter cost must be measured on pricing data first. **Recommended default: both off**, promoted only behind a benchmark showing tree-count reduction repays the per-round cost (logged in skeleton §14).

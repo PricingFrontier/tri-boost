@@ -109,7 +109,6 @@ jobs:
         run: |
           cargo build -p tri-boost-core --no-default-features
           cargo build -p tri-boost-core --no-default-features --features arrow
-          cargo build -p tri-boost-core --no-default-features --features distill
           cargo build -p tri-boost-core --no-default-features --features nightly
           cargo build -p tri-boost-core --all-features
       - name: Benches compile

@@ -33,9 +33,6 @@ impl PyBooster {
     ///   `n_estimators` are fit; sklearn-familiar). `Some(frac)` ⇒ a deterministic seeded
     ///   internal holdout of that fraction drives the §05 deviance early stopping (mirrors the
     ///   core `Config.validation_fraction`, §06 — there is NO implicit "internal holdout by default").
-    /// `teacher_raw` (default `None`): per-row teacher scores in OUR score space F (pre-link); when
-    ///   present it is moved into `DistillSpec.teacher_raw` and threaded onto `FitSpec.distill` (§09);
-    ///   `blend` is the true-label weight (default 0.5). `None` ⇒ no distillation (train on `y`).
     /// `feature_names` / `class_labels` (default `None`): persisted into `Model.schema` (`ModelSchema`,
     ///   §2.6 / R-SCHEMA) so names, classifier labels, and `predict_proba` column order survive a
     ///   serialize/deserialize round-trip; raw categoricals are re-encoded on serve through
@@ -43,7 +40,6 @@ impl PyBooster {
     #[pyo3(signature = (x, y, *, weight=None, exposure=None, eval_set=None,
                         callbacks=None, monotone=None, max_interaction_order=3,
                         interaction_groups=None, validation_fraction=None,
-                        teacher_raw=None, blend=0.5, teacher=None,
                         feature_names=None, class_labels=None, seed=0))]
     fn fit<'py>(
         &self, py: Python<'py>,
@@ -57,9 +53,6 @@ impl PyBooster {
         max_interaction_order: u8,
         interaction_groups: Option<Vec<Vec<String>>>,   // optional name-keyed support whitelist (§07)
         validation_fraction: Option<f32>,        // None = early stopping OFF (§06); Some(frac) = seeded holdout
-        teacher_raw: Option<PyReadonlyArray1<'py, f32>>, // distillation teacher scores → FitSpec.distill (§09)
-        blend: f32,                              // distill true-label weight, default 0.5 (§09)
-        teacher: Option<String>,                 // TeacherKind provenance tag for the model card (§09)
         feature_names: Option<Vec<String>>,      // → ModelSchema.feature_names (R-SCHEMA); owned, Send
         class_labels: Option<Vec<String>>,       // → ModelSchema.class_labels (classifier; R-SCHEMA)
         seed: u64,
@@ -71,19 +64,10 @@ impl PyBooster {
         let y_owned: Vec<f32> = y.as_slice()?.to_vec();           // copy out from the !Send borrow
         let w_owned: Option<Vec<f32>> = match weight { Some(a) => Some(a.as_slice()?.to_vec()), None => None };
         let e_owned: Option<Vec<f32>> = match exposure { Some(a) => Some(a.as_slice()?.to_vec()), None => None };
-        // distillation: move the per-row teacher scores into an owned DistillSpec for FitSpec.distill (§09).
-        let distill: Option<DistillSpec> = match teacher_raw {
-            Some(t) => Some(DistillSpec {
-                teacher_raw: t.as_slice()?.to_vec(),              // OWNED Vec<f32>, !Send borrow dropped here
-                blend,                                            // §09 clamps to [0,1], rejects NaN
-                teacher: parse_teacher_kind(teacher),             // TeacherKind tag (default Other)
-            }),
-            None => None,
-        };
         // interaction = InteractionPolicy { max_order: max_interaction_order, groups } (§07/§2.9)
         let spec = self.build_spec(&y_owned, w_owned, e_owned, monotone,
                                    max_interaction_order, interaction_groups,
-                                   validation_fraction, distill, seed)?;  // FitSpec OWNS its buffers
+                                   validation_fraction, seed)?;  // FitSpec OWNS its buffers
         let host = CallbackHost::new(py, callbacks, eval_set);   // §12.4 (owns Py handles; re-acquires GIL per fire)
         // Now everything crossing the boundary is Send: owned `binned`, `y_owned`, `spec`, `host`.
         let mut model = py.detach(move || self.pool().install(|| {
@@ -154,7 +138,7 @@ impl PyModel {
 }
 ```
 
-**The marshalling rule (load-bearing for correctness, R-PYDETACH):** `PyReadonlyArray`/`ArrayView` is a runtime-checked borrow and is **not `Send`/`Sync`**, so it can **never** be moved into `py.detach`. The canonical pattern is therefore: *while the GIL is held*, marshal every input into Rust-**owned** buffers — bin `X` into an owned `ServeBinnedMatrix` (§03), and `.to_vec()` each 1-D `y`/`weight`/`exposure`/`teacher_raw` slice out from behind its borrow — and only **`Send`** data (the owned matrix, owned `Vec`s, the `FitSpec`/`spec`, the `Arc<Model>`) is then captured by the `move ||` closure passed to `py.detach`. The one-time copy of the 1-D arrays is negligible against training/scoring; `X` is binned (not copied) regardless. No `Py<PyAny>` is ever captured by the detached closure except through `CallbackHost`, which re-acquires the GIL on each fire (§12.4).
+**The marshalling rule (load-bearing for correctness, R-PYDETACH):** `PyReadonlyArray`/`ArrayView` is a runtime-checked borrow and is **not `Send`/`Sync`**, so it can **never** be moved into `py.detach`. The canonical pattern is therefore: *while the GIL is held*, marshal every input into Rust-**owned** buffers — bin `X` into an owned `ServeBinnedMatrix` (§03), and `.to_vec()` each 1-D `y`/`weight`/`exposure` slice out from behind its borrow — and only **`Send`** data (the owned matrix, owned `Vec`s, the `FitSpec`/`spec`, the `Arc<Model>`) is then captured by the `move ||` closure passed to `py.detach`. The one-time copy of the 1-D arrays is negligible against training/scoring; `X` is binned (not copied) regardless. No `Py<PyAny>` is ever captured by the detached closure except through `CallbackHost`, which re-acquires the GIL on each fire (§12.4).
 
 ### 12.3 NumPy zero-copy & the optional Arrow path
 
@@ -192,8 +176,6 @@ impl Loss for PyLoss {
 ```
 
 A custom-objective model is `Approximate` only if its declared `link` is non-canonical for table reading; with a declared standard link it stays `Exact` (objective is orthogonal to tree shape — I1/I2 untouched, §3).
-
-**Distillation (R-DISTILL).** Distillation is a `FitSpec` field, not a `BoosterConfig` knob — the per-row teacher scores belong with `weight`/`exposure` in `FitSpec`. The native surface exposes it as `fit(..., teacher_raw=<float32[n_rows]>, blend=0.5, teacher=None)`: when `teacher_raw` is present the binding moves it into a `DistillSpec { teacher_raw, blend, teacher }` (§09) and sets `FitSpec.distill = Some(..)`; `None` ⇒ no distillation (train on `y`). `teacher_raw` is in *our* score space `F` (pre-link, caller-aligned), `blend` is the true-label weight (default 0.5; §09 clamps to `[0,1]` and rejects NaN), and `teacher` is a provenance tag (`"catboost"`/`"lightgbm"`/`"xgboost"`/other → `TeacherKind`, default `Other`) for the model card. The sklearn/Python layer offers a convenience `distill=` argument (or the §12 distill helper) that **fits a CatBoost teacher and supplies `teacher_raw` + `blend`** — tri-boost never links CatBoost (data-side only, behind the `distill` feature). The binding adds no blending math; `BlendedLoss` (§05) does the gradient blend in core. A distilled model stays `Exact` (only the loss target changes — I1/I2 untouched, §3/§09).
 
 **Callbacks + early stopping.** A `callbacks=` list of Python callables receives a per-iteration `CallbackEnv` (`{iteration, train_metric, valid_metrics, model_proxy}`); a callback returning `True` requests a stop. `CallbackHost` owns the `Py` handles and, inside the detached training loop, re-acquires the GIL **only at the callback fire point** (end of each round), so the heavy histogram/split work runs GIL-free:
 
@@ -235,16 +217,14 @@ class TriBoostRegressor(RegressorMixin, BaseEstimator):
                  validation_fraction=None, early_stopping_rounds=50):  # None = early stopping OFF (§06, R-EARLYSTOP)
         # NO logic: store each arg unchanged as self.<same_name>  (powers get_params/set_params/clone)
         ...
-    def fit(self, X, y, sample_weight=None, exposure=None, eval_set=None, teacher=None):
+    def fit(self, X, y, sample_weight=None, exposure=None, eval_set=None):
         X = self._validate(X, y)                     # f64→f32 (warn), set n_features_in_, feature_names_in_
         self._booster = _Booster(**self._native_kwargs())
-        teacher_raw, blend = self._resolve_teacher(teacher, X, y)  # distill helper: fit CatBoost → (raw, blend), or (None, 0.5) (§09)
         self._model_ = self._booster.fit(X, y, weight=sample_weight, exposure=exposure, eval_set=eval_set,
                                          monotone=self._resolve_monotone(),  # name→sign, never positional
                                          max_interaction_order=self.max_interaction_order,
                                          interaction_groups=self.interaction_groups,  # optional name-keyed whitelist (§07)
                                          validation_fraction=self.validation_fraction,  # None = early stopping OFF (§06)
-                                         teacher_raw=teacher_raw, blend=blend,  # distillation → FitSpec.distill (§09)
                                          feature_names=list(self.feature_names_in_),  # → Model.schema (R-SCHEMA)
                                          seed=self.random_state)
         return self                                   # sklearn contract
@@ -254,7 +234,7 @@ class TriBoostRegressor(RegressorMixin, BaseEstimator):
     def tables(self, w=None):  return self._model_.tables(w)   # explanation passthrough
 ```
 
-The `feature_names_in_` / `n_features_in_` set by `_validate` are also forwarded into the native `fit` so they land in `Model.schema` (`ModelSchema.feature_names`, §2.6 / R-SCHEMA) and **survive serialization** — `from_bytes(to_bytes(m))` round-trips them; on `predict` the schema's frozen `cat_encoders` re-encode raw categoricals (audit-on-serve, R-CATSERVE), so naming is exact and leakage-free. The `distill=` argument feeds the §12 distill helper (R-DISTILL).
+The `feature_names_in_` / `n_features_in_` set by `_validate` are also forwarded into the native `fit` so they land in `Model.schema` (`ModelSchema.feature_names`, §2.6 / R-SCHEMA) and **survive serialization** — `from_bytes(to_bytes(m))` round-trips them; on `predict` the schema's frozen `cat_encoders` re-encode raw categoricals (audit-on-serve, R-CATSERVE), so naming is exact and leakage-free.
 
 `TriBoostClassifier` adds `classes_` (label encoding from `schema.class_labels`; binary only in v1, Logistic loss), `predict_proba` (columns ordered to `classes_`), `decision_function` (raw score), and `__sklearn_tags__` overrides (sklearn ≥1.6). On fit it passes the encoded label set as `class_labels=` so it persists in `Model.schema.class_labels` (R-SCHEMA); `classes_` and `predict_proba`'s column order are reconstructed from the schema after a serialize/deserialize round-trip (so a reloaded classifier predicts probabilities with the original label ordering, not a re-inferred one). Monotone constraints are **name-keyed** (`{"age": +1}`) and resolved against `feature_names_in_` into the §07 `MonotoneMap` (a `BTreeMap<String, MonoSign>` — ordered, config-only, never serialized, so it cannot perturb the determinism [GATE], §13.4), never positional — the §02 invariant. Fitted attributes carry the trailing underscore (`n_features_in_`, `feature_names_in_`, `classes_`, `_model_`). `set_params` clears any fitted state.
 
@@ -284,7 +264,6 @@ All four custom exceptions derive a package base `TriBoostError`. The compiled m
 - **Determinism [GATE] mirror:** `fit` at `n_jobs ∈ {1,2,8}` ⇒ byte-equal `to_bytes()` (Python-side reflection of the §1 core gate).
 - **Custom-objective + callback:** a Python `squared_error` callable reproduces the native loss bit-for-bit *with non-uniform `sample_weight`* (asserts the `PyLoss` adapter scales `(g,h)` by `weight[i]`, R-PYWEIGHTS); a stop-requesting callback truncates at the expected iteration.
 - **Early stopping (R-EARLYSTOP):** `validation_fraction=None` fits all `n_estimators` (no implicit holdout); `validation_fraction=Some(frac)` carves a deterministic seeded holdout, picks `best_iteration`, and tables are built from that prefix — same `(seed, validation_fraction)` ⇒ same `best_iteration`.
-- **Distillation (R-DISTILL):** `teacher_raw=None` ≡ `blend=1.0` reproduces the non-distilled fit bit-for-bit (degenerate zero-teacher oracle); a supplied `teacher_raw` threads onto `FitSpec.distill` and the result stays `Exact`.
 - **Schema round-trip (R-SCHEMA):** `from_bytes(to_bytes(m))` / `from_json(to_json(m))` recover `feature_names` and (classifier) `class_labels`; a reloaded classifier's `predict_proba` column order matches the original `classes_`; categoricals re-encode through the frozen `schema.cat_encoders` on serve (R-CATSERVE).
 - **Firewall & round-trip:** an `Approximate` model raises `ExactnessError` on `.tables()`; `from_json(to_json(m))` and `from_bytes(to_bytes(m))` reproduce predictions exactly (§10).
 - **Stub/lint:** `mypy --strict` over the typed Python package; stubtest against the compiled module.

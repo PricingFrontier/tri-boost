@@ -1,6 +1,6 @@
 ## 05 — Objectives & the Loss trait
 
-> Owner: §05 — the `Loss` trait + `Link`, the v1 implementors `SquaredError`, `Logistic`, `Poisson`, `Gamma`, `Tweedie { rho }`, `GradHess` production, `max_delta_step`, the hessian floor ε, the per-objective deviance metric, the `exp(k·F)` power rule, and the `Metric` enum plus the `default_metric`/`hessian_floor`/`max_delta_step` trait methods (registered §05 in skeleton §4). Consumes `FitSpec`/`BinnedMatrix`/exposure offset (§03); composes with the distillation soft-target loss (§09). It owns **no** tree shape: the objective is a function of `(y, F, w)` only — it never sees a split — which is exactly why every loss composes natively with the depth-3 oblivious cage (I1/I2 untouched).
+> Owner: §05 — the `Loss` trait + `Link`, the v1 implementors `SquaredError`, `Logistic`, `Poisson`, `Gamma`, `Tweedie { rho }`, `GradHess` production, `max_delta_step`, the hessian floor ε, the per-objective deviance metric, the `exp(k·F)` power rule, and the `Metric` enum plus the `default_metric`/`hessian_floor`/`max_delta_step` trait methods (registered §05 in skeleton §4). Consumes `FitSpec`/`BinnedMatrix`/exposure offset (§03). It owns **no** tree shape: the objective is a function of `(y, F, w)` only — it never sees a split — which is exactly why every loss composes natively with the depth-3 oblivious cage (I1/I2 untouched).
 
 ### 05.1 Decisions (with defaults)
 
@@ -140,17 +140,10 @@ f0 = log( Σ w_i y_i / Σ w_i e_i )
 
 Poisson's `h = exp(F)` makes the leaf step `w* = −G/(H+λ)` explosive when `F` drifts high. We adopt LightGBM's safeguard, default `δ = 0.7`, exposed as `Option<f32>`. **Default realization — the leaf-stage `|w*|`-clamp (hessian-inflation rejected, because it would perturb the quantized `QuantGradHess` accumulation and so break bit-reproducibility):** the engine clamps `|w*| ≤ δ` when computing leaf weights — applied **on full-precision aggregated sums** (§06's mandatory leaf refit), so it leaves the quantized histogram accumulation, the bit-reproducibility mechanism, untouched. The loss only *advertises* `δ` via `Loss::max_delta_step()`; it never mutates per-row `h`. The override surface is the §06 `Config.max_delta_step: Option<f32>` (default `None`); when `None` the engine falls back to `Loss::max_delta_step()`, so a default Poisson fit is stabilized at `0.7` and a non-`None` `Config` value wins.
 
-### 05.7 Composition with the distillation soft-target loss (§09)
-
-Distillation (§09, v1.5, CatBoost teacher default) changes **only the target the loss sees** — never tree shape — so I1/I2 are untouched and the student stays exactly decomposable. §05 provides the seam, §09 owns the policy:
-
-- **Soft target on the natural scale.** The student fits the teacher's `μ` under the **same** link and `grad_hess`: `y_soft = exp(F_teacher)` (log-link) or `p_teacher` (Logistic), fed as a continuous `y` into the *unchanged* implementor. There is no separate `grad_hess_soft` trait method — the "soft" gradient is just the base `grad_hess` called with the teacher output (`teacher_raw → y_soft`) as the target. No new loss type for the pure-soft case — every formula above already admits real-valued `y ∈ ℝ≥0` (Gamma/Tweedie) or `[0,1]` (Logistic), not only integer counts.
-- **Blend (unified polarity, §09-owned).** The blend parameter is `blend` = the **true-label weight** (default `0.5`; `blend = 1.0` ⇒ the degenerate zero-teacher fit, exactly the base loss; the on/off is §09's `FitSpec.distill: Option<DistillSpec>`). A convex `g = blend·g_true + (1−blend)·g_soft` (likewise `h`) via a thin `BlendedLoss { base: &dyn Loss, soft_target: &[f32], blend: f32 }` adaptor that calls the base `grad_hess` twice and combines the buffers in fixed order, inheriting the floor/clamp/`f64` guarantees and propagating the `Result` (the second call's `?` carries any base-loss error through unchanged). `blend`'s default and teacher orchestration are §09's; §05 only matches the name and polarity. `BlendedLoss::deviance` and `init_score` delegate to the base implementor on the **true** `y` (the teacher is not ground truth) and forward its `Result<f32,_>` / `Result<f64,_>` verbatim — so early stopping and the base rate stay honest *and* still surface the true-`y` domain errors of 05.3a.
-
 ### 05.8 How this upholds I1/I2 and serves the three aims
 
 - **Decomposable (I1/I2):** the loss touches only `(y, F, w)`; it never references an axis, split, or tree, so swapping objectives cannot create a >3-feature coupling or a non-constant leaf — this section never approaches the firewall (§3). The `f64` `init_score` becomes the exact fANOVA intercept `f0`.
-- **Predictive:** strictly-proper deviance (not RMSE) as the stop metric, exact Newton `(g,h)` feeding `w* = −G/(H+λ)`, `max_delta_step` stabilizing Poisson, and the distillation seam (the single highest-upside gap-closer) all land here. Multi-step Newton leaf refit (§06) re-calls `grad_hess` at updated leaves — sharpening the non-quadratic Gamma/Tweedie leaves that are the pricing point.
+- **Predictive:** strictly-proper deviance (not RMSE) as the stop metric, exact Newton `(g,h)` feeding `w* = −G/(H+λ)`, and `max_delta_step` stabilizing Poisson all land here. Multi-step Newton leaf refit (§06) re-calls `grad_hess` at updated leaves — sharpening the non-quadratic Gamma/Tweedie leaves that are the pricing point.
 - **Fast:** one-pass fused `(g,h)` with shared `exp` terms, `f32` hot path, no `powf`, autovectorizable straight-line kernels (the only branch is the stable-sigmoid sign test, handled by `multiversion`), offset folded once by the engine.
 
 ### 05.9 Testing approach
@@ -164,7 +157,7 @@ Distillation (§09, v1.5, CatBoost teacher default) changes **only the target th
 7. **Determinism [GATE]:** `init_score`/`deviance` (their `Ok` payloads) byte-identical at `n_threads ∈ {1,2,8}`. (Any randomized loss path would re-seed per work unit via the frozen `splitmix64`-mix of `(base, round, stage, block)` into `Pcg64::seed_from_u64` — the v1 closed-form losses draw no randomness, but the seam follows the one cross-cutting scheme.)
 8. **Error/no-panic:** unequal-length slices return `Err(PbError::ShapeMismatch)` (never panic); the hot-loop boundary test at `n ∈ {0,1}` (05.2) asserts no out-of-bounds.
 9a. **Domain errors `[R-LOSSFALLIBLE]`:** per 05.3a, `init_score`/`deviance` return `Err(PbError::InvalidInput)` (never `NaN`/`±inf`/panic) for: Gamma with any in-weight `y ≤ 0`; all-zero weights on every objective; an all-zero-positive (or all-positive) Logistic column; non-positive exposure (`Σ w e ≤ 0`) on Poisson/Gamma/Tweedie. A `proptest` asserts the result is `Ok(finite)` on every in-domain draw and `Err` on every out-of-domain draw.
-9. **No-`powf` lint test** (05.4); `BlendedLoss` test: `blend=1.0` reproduces the base loss bit-for-bit, `blend=0.0` the pure-soft fit.
+9. **No-`powf` lint test** (05.4).
 
 ### 05.10 Open fork (recommended default) & deferred robust loss
 

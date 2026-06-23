@@ -16,7 +16,7 @@
 | Error model | one `PbError` enum (defined here), `Result<T, PbError>` on every fallible public fn | typed errors, no panics in library code |
 | `schema_version` | a single monotone `u32` on `Model`/`TableBank`, owned here, bumped on any wire-incompatible change | reproducible, auditable, cross-language load |
 
-**Open fork (recommended default):** crate granularity. Recommended default is the **two-crate** workspace above. If, post-v1, the explainability engine (§08) or the distillation data hooks (§09) grow heavy optional dependency trees, split them into `tri-boost-explain` / `tri-boost-distill` sub-crates behind cargo features rather than feature-gating one fat crate. Not v1; flagged so the module boundaries below are drawn to make that split mechanical (each owns a top-level module already).
+**Open fork (recommended default):** crate granularity. Recommended default is the **two-crate** workspace above. If, post-v1, the explainability engine (§08), sparse tensor storage (§08), or ensemble-selection machinery (§09) grows heavy optional dependency trees, split it into a focused sub-crate behind cargo features rather than feature-gating one fat crate. Not v1; flagged so the module boundaries below are drawn to make that split mechanical (each owns a top-level module already).
 
 ### 02.2 — Workspace & directory tree
 
@@ -45,7 +45,7 @@ tri-boost/
 │   │       ├── engine/             # §06: ObliviousTree, Split, Model, Booster, FitSpec, Hist, histogram, split-finder
 │   │       ├── constraints/        # §07: MonotoneMap, interaction-order, heredity/FAST/Sobol funnel
 │   │       ├── explain/            # §08: EffectTable, TableBank, RefMeasure, purify, the 5 Invariant checks
-│   │       ├── boosters/           # §09: distillation target, corrective refit, Nesterov, ensemble selection
+│   │       ├── boosters/           # §09: corrective refit, Nesterov, re-anchor, ensemble selection
 │   │       ├── serialize/          # §10: serde_json + bincode, schema_version round-trip, scoring
 │   │       └── simd/               # §11: multiversion/pulp/wide dense kernels (safe wrappers only)
 │   └── tri-boost-py/           # THIN pyo3 binding. crate-type=["cdylib"].
@@ -185,7 +185,6 @@ overflow-checks = true
 [features]
 default = []
 arrow   = ["dep:arrow"]          # optional zero-copy Arrow/PyCapsule ingest (§03)
-distill = []                     # CatBoost teacher DATA hooks only (§09); no FFI to CatBoost
 nightly = []                     # portable_simd path; off the default/shipping wheel (§11)
 ```
 
@@ -286,12 +285,11 @@ How the seam serves the three aims: (FAST) the four kernels are exactly the spee
 |---|---|---|---|
 | (base) | `tri-boost-core` | — | numpy-free, pyo3-free, pure-Rust train/predict/explain on `f32` |
 | `arrow` | core | off | optional zero-copy Arrow/PyCapsule column ingest (§03) |
-| `distill` | core | off | CatBoost-teacher DATA hooks (soft-target ingestion only; no native FFI) (§09) |
 | `nightly` | core | off | `portable_simd` kernels; never on the shipping wheel (§11) |
 | `extension-module` | `tri-boost-py` | on for wheels, off for `cargo test` | pyo3 builds a `cdylib` Python extension |
 | `abi3-py310` | `tri-boost-py` | on | stable-ABI: one wheel per `(os, arch)` for CPython ≥3.10 |
 
-Rules (build `[GATE]`s): (1) **default features of the core must compile and pass all five Invariant gates on stable Rust** — no optional feature is load-bearing for correctness; (2) `cargo tree -p tri-boost-core | grep -q pyo3` must return non-zero in CI — pyo3 in the core fails the build; (3) the core must build for a non-Python target (e.g. `cargo build -p tri-boost-core --target wasm32-unknown-unknown` smoke-builds the no-Python guarantee — which is exactly why all serialized index fields are fixed-width, never `usize`, see 02.8); (4) `extension-module` is OFF during `cargo test` so the core's unit/invariant tests run without a Python interpreter (research/05 §2). `arrow`/`distill`/`nightly` are additive and independently composable.
+Rules (build `[GATE]`s): (1) **default features of the core must compile and pass all five Invariant gates on stable Rust** — no optional feature is load-bearing for correctness; (2) `cargo tree -p tri-boost-core | grep -q pyo3` must return non-zero in CI — pyo3 in the core fails the build; (3) the core must build for a non-Python target (e.g. `cargo build -p tri-boost-core --target wasm32-unknown-unknown` smoke-builds the no-Python guarantee — which is exactly why all serialized index fields are fixed-width, never `usize`, see 02.8); (4) `extension-module` is OFF during `cargo test` so the core's unit/invariant tests run without a Python interpreter (research/05 §2). `arrow`/`nightly` are additive and independently composable.
 
 ### 02.7 — Build, CI matrix & distribution
 
@@ -309,7 +307,7 @@ CI is two pipelines. **Correctness CI** (every PR, the build `[GATE]`s) runs on 
 
 **I1/I2 are protected structurally by the layout, not just by §06/§08.** The module boundaries put all leaf-value math, all tree construction, and all purification in backend-independent code (`engine/`, `explain/`); the `Backend` seam is restricted to histogram/gain/grad-hess/predict kernels that cannot, by their signatures, introduce a fourth feature into a tree or a non-constant leaf. The `ExactnessMode` firewall (§3) lives on `Model` and is checked in `explain/`, which no backend can reach. So "a backend cannot break an invariant" is a property of where the code is allowed to live.
 
-**ACCURACY:** the architecture is deliberately neutral to the learner — losses, sampling, constraints, distillation, and ensembling are separate modules that never touch tree shape, so every gap-closer from §09 composes without architectural friction.
+**ACCURACY:** the architecture is deliberately neutral to the learner — losses, sampling, constraints, refit, acceleration, and ensembling are separate modules that never touch tree shape, so every gap-closer from §09 composes without architectural friction.
 
 **FAST:** the two-crate split keeps the hot path (`engine/`, `simd/`, `backend.rs`) free of pyo3/Python overhead; the GIL is released at the §12 boundary and a scoped rayon pool runs the `CpuBackend`; the pre-binned `u8` columnar layout is simultaneously the fast-CPU layout and the GPU-ready layout, so the GPU door stays open at zero v1 cost.
 
@@ -317,4 +315,4 @@ CI is two pipelines. **Correctness CI** (every PR, the build `[GATE]`s) runs on 
 
 ### 02.10 — Testing approach for this section
 
-The architecture's own correctness is testable independently of the learner: (1) **a no-pyo3-in-core test** — a CI step asserting `cargo tree -p tri-boost-core` contains no `pyo3`/`numpy`, plus a non-Python-target (`wasm32`) build of the core; (2) **a `Backend` reproducibility test** — `CpuBackend { n_threads }` for `n ∈ {1,2,8}` over the same fixed inputs must yield byte-identical `Hist` and `predict_block` output (the §1 `[GATE]`); (3) **an error-mapping completeness test** — every `Invariant` variant is reachable and maps to exactly one `PbError::InvariantViolated`, and every public fallible fn in the core returns `Result<_, PbError>` (enforced by clippy + a doc-test convention); (4) **a serde round-trip + `schema_version` test** — `Model`/`TableBank` round-trip through both serde_json and bincode (2.x, frozen `config::standard()`) bit-identically, the `ModelDoc` nested (non-`flatten`) form round-trips through bincode, a bumped-version blob is rejected with `PbError::Serialization`, an aliased old field still loads, and a fixed-width-index model serialized on the host deserializes byte-identically against a `wasm32`-built schema (the `usize`→`u32` guard, §10 owns the format); (5) **a feature-matrix build test** — the core builds and passes the Invariant gates under each combination of `{arrow, distill, nightly}` and with default features only on stable; (6) **a no-panic hot-loop boundary test** — every proven-unchecked `#[allow(clippy::indexing_slicing)]` site of 02.4 (the 8-cell leaf index, `predict_block` bin reads, `Hist` accumulation) has a unit test exercising the extreme indices, and an overflow-trap test confirms `overflow-checks` is live in the test profile (02.3a). These are unit/integration tests in the core plus CI config; none require the Python toolchain, which is itself the point.
+The architecture's own correctness is testable independently of the learner: (1) **a no-pyo3-in-core test** — a CI step asserting `cargo tree -p tri-boost-core` contains no `pyo3`/`numpy`, plus a non-Python-target (`wasm32`) build of the core; (2) **a `Backend` reproducibility test** — `CpuBackend { n_threads }` for `n ∈ {1,2,8}` over the same fixed inputs must yield byte-identical `Hist` and `predict_block` output (the §1 `[GATE]`); (3) **an error-mapping completeness test** — every `Invariant` variant is reachable and maps to exactly one `PbError::InvariantViolated`, and every public fallible fn in the core returns `Result<_, PbError>` (enforced by clippy + a doc-test convention); (4) **a serde round-trip + `schema_version` test** — `Model`/`TableBank` round-trip through both serde_json and bincode (2.x, frozen `config::standard()`) bit-identically, the `ModelDoc` nested (non-`flatten`) form round-trips through bincode, a bumped-version blob is rejected with `PbError::Serialization`, an aliased old field still loads, and a fixed-width-index model serialized on the host deserializes byte-identically against a `wasm32`-built schema (the `usize`→`u32` guard, §10 owns the format); (5) **a feature-matrix build test** — the core builds and passes the Invariant gates under each combination of `{arrow, nightly}` and with default features only on stable; (6) **a no-panic hot-loop boundary test** — every proven-unchecked `#[allow(clippy::indexing_slicing)]` site of 02.4 (the 8-cell leaf index, `predict_block` bin reads, `Hist` accumulation) has a unit test exercising the extreme indices, and an overflow-trap test confirms `overflow-checks` is live in the test profile (02.3a). These are unit/integration tests in the core plus CI config; none require the Python toolchain, which is itself the point.
