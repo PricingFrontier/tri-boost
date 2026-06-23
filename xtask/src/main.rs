@@ -324,9 +324,14 @@ fn print_release_verdict_usage() {
          Reads an external benchmark artifact with records of the form\n\
          {{\"datasets\":[{{\"fixture\":\"...\",\"objective\":\"...\",\
          \"tri_boost\":{{\"deviance\":...,\"exact\":true}},\
-         \"ebm\":{{\"deviance\":...}},\"gbdt_best\":{{\"deviance\":...}}}}]}}.\n\
+         \"ebm\":{{\"deviance\":...}},\"gbdt_best\":{{\"deviance\":...}}}}],\
+         \"external\":{{\"rival_adapters\":{{\"results\":[{{\"name\":\"xgboost\",\
+         \"deviance\":...,\"lift\":...,\"ordered_gini\":...}}]}},\
+         \"treeshap_oracle\":{{\"passed\":true,\"max_abs_error\":...,\
+         \"tolerance\":...,\"fixtures\":...}}}}}}.\n\
          The command fails if any tri-boost model is non-exact or if tri-boost does\
-         not beat EBM on median deviance for every objective. The GBDT gap is\
+         not beat EBM on median deviance for every objective. Rival adapters and\
+         the TreeSHAP oracle are release-gate preconditions. The GBDT gap is\
          reported, not release-blocking."
     );
 }
@@ -344,6 +349,8 @@ fn print_release_preflight_usage() {
 #[derive(Debug, Deserialize)]
 struct ReleaseBenchmarkSuite {
     datasets: Vec<ReleaseBenchmarkRecord>,
+    #[serde(default)]
+    external: Option<ReleaseExternalChecks>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,10 +374,49 @@ struct BenchmarkScore {
     deviance: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct ReleaseExternalChecks {
+    rival_adapters: RivalAdapterSection,
+    treeshap_oracle: TreeShapOracleSection,
+}
+
+#[derive(Debug, Deserialize)]
+struct RivalAdapterSection {
+    #[serde(default = "default_required_rivals")]
+    required: Vec<String>,
+    results: Vec<RivalAdapterResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RivalAdapterResult {
+    name: String,
+    deviance: f64,
+    lift: f64,
+    ordered_gini: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeShapOracleSection {
+    passed: bool,
+    max_abs_error: f64,
+    tolerance: f64,
+    fixtures: u32,
+}
+
+fn default_required_rivals() -> Vec<String> {
+    ["ebm", "ga2m", "xgboost", "lightgbm", "catboost"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
 fn evaluate_release_verdict(suite: &ReleaseBenchmarkSuite) -> XtaskResult<serde_json::Value> {
     if suite.datasets.is_empty() {
         return Err("release verdict input has no datasets".into());
     }
+    let external = suite.external.as_ref().ok_or(
+        "release verdict input must include external.rival_adapters and external.treeshap_oracle sections",
+    )?;
     let mut exact_failures = Vec::new();
     for record in &suite.datasets {
         require_finite_metric(&record.fixture, "tri_boost", record.tri_boost.deviance)?;
@@ -422,19 +468,26 @@ fn evaluate_release_verdict(suite: &ReleaseBenchmarkSuite) -> XtaskResult<serde_
         }));
     }
 
+    let rival_gate = evaluate_rival_adapters(&external.rival_adapters)?;
+    let treeshap_gate = evaluate_treeshap_oracle(&external.treeshap_oracle)?;
     let exactness_passed = exact_failures.is_empty();
+    let rival_passed = rival_gate["passed"].as_bool().unwrap_or(false);
+    let treeshap_passed = treeshap_gate["passed"].as_bool().unwrap_or(false);
+    let all_passed = exactness_passed && beat_ebm_all && rival_passed && treeshap_passed;
     Ok(json!({
         "schema_version": 1,
-        "status": if exactness_passed && beat_ebm_all { "pass" } else { "fail" },
+        "status": if all_passed { "pass" } else { "fail" },
         "hard_gates": {
-            "all_passed": exactness_passed && beat_ebm_all,
+            "all_passed": all_passed,
             "exactness": {
                 "passed": exactness_passed,
                 "failures": exact_failures
             },
             "beat_ebm_median_deviance": {
                 "passed": beat_ebm_all
-            }
+            },
+            "rival_adapters": rival_gate,
+            "treeshap_oracle": treeshap_gate
         },
         "reported_checks": {
             "gbdt_gap_is_release_blocking": false
@@ -443,11 +496,89 @@ fn evaluate_release_verdict(suite: &ReleaseBenchmarkSuite) -> XtaskResult<serde_
     }))
 }
 
+fn evaluate_rival_adapters(section: &RivalAdapterSection) -> XtaskResult<serde_json::Value> {
+    if section.required.is_empty() {
+        return Err("external.rival_adapters.required must name at least one rival".into());
+    }
+    if section.results.is_empty() {
+        return Err(
+            "external.rival_adapters.results must contain finite adapter smoke results".into(),
+        );
+    }
+
+    let mut required = Vec::new();
+    for raw in &section.required {
+        let name = normalize_rival_name(raw)?;
+        if !required.contains(&name) {
+            required.push(name);
+        }
+    }
+
+    let mut observed = Vec::new();
+    for result in &section.results {
+        let name = normalize_rival_name(&result.name)?;
+        require_finite_metric(&name, "rival_adapter", result.deviance)?;
+        require_finite_check(&name, "lift", result.lift)?;
+        require_finite_check(&name, "ordered_gini", result.ordered_gini)?;
+        if !observed.contains(&name) {
+            observed.push(name);
+        }
+    }
+    observed.sort();
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|name| !observed.contains(name))
+        .cloned()
+        .collect();
+
+    Ok(json!({
+        "passed": missing.is_empty(),
+        "required": required,
+        "observed": observed,
+        "missing": missing,
+        "results": section.results.len()
+    }))
+}
+
+fn evaluate_treeshap_oracle(section: &TreeShapOracleSection) -> XtaskResult<serde_json::Value> {
+    require_finite_check("treeshap_oracle", "max_abs_error", section.max_abs_error)?;
+    require_finite_check("treeshap_oracle", "tolerance", section.tolerance)?;
+    if section.max_abs_error < 0.0 || section.tolerance < 0.0 {
+        return Err("TreeSHAP oracle error and tolerance must be non-negative".into());
+    }
+    let passed =
+        section.passed && section.fixtures > 0 && section.max_abs_error <= section.tolerance;
+    Ok(json!({
+        "passed": passed,
+        "reported_passed": section.passed,
+        "max_abs_error": section.max_abs_error,
+        "tolerance": section.tolerance,
+        "fixtures": section.fixtures
+    }))
+}
+
+fn normalize_rival_name(raw: &str) -> XtaskResult<String> {
+    let name = raw.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        Err("rival adapter name must not be empty".into())
+    } else {
+        Ok(name)
+    }
+}
+
 fn require_finite_metric(fixture: &str, model: &str, value: f64) -> XtaskResult<()> {
     if value.is_finite() && value >= 0.0 {
         Ok(())
     } else {
         Err(format!("{fixture} {model} deviance must be finite and >= 0, got {value}").into())
+    }
+}
+
+fn require_finite_check(fixture: &str, check: &str, value: f64) -> XtaskResult<()> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(format!("{fixture} {check} must be finite, got {value}").into())
     }
 }
 
@@ -1651,12 +1782,15 @@ mod accuracy_tests {
                     "tri_boost": {"deviance": 1.8, "exact": true},
                     "ebm": {"deviance": 2.0}
                 }
-            ]
+            ],
+            "external": passing_external_json()
         }))
         .unwrap();
         let verdict = evaluate_release_verdict(&suite).unwrap();
         assert_eq!(verdict["status"], "pass");
         assert_eq!(verdict["hard_gates"]["all_passed"], true);
+        assert_eq!(verdict["hard_gates"]["rival_adapters"]["passed"], true);
+        assert_eq!(verdict["hard_gates"]["treeshap_oracle"]["passed"], true);
         assert_eq!(
             verdict["reported_checks"]["gbdt_gap_is_release_blocking"],
             false
@@ -1671,7 +1805,8 @@ mod accuracy_tests {
                 "objective": "squared_error",
                 "tri_boost": {"deviance": 0.8, "exact": false},
                 "ebm": {"deviance": 1.0}
-            }]
+            }],
+            "external": passing_external_json()
         }))
         .unwrap();
         let verdict = evaluate_release_verdict(&non_exact).unwrap();
@@ -1692,7 +1827,8 @@ mod accuracy_tests {
                     "tri_boost": {"deviance": 1.3, "exact": true},
                     "ebm": {"deviance": 1.1}
                 }
-            ]
+            ],
+            "external": passing_external_json()
         }))
         .unwrap();
         let verdict = evaluate_release_verdict(&ebm_loss).unwrap();
@@ -1701,5 +1837,77 @@ mod accuracy_tests {
             verdict["hard_gates"]["beat_ebm_median_deviance"]["passed"],
             false
         );
+    }
+
+    #[test]
+    fn release_verdict_requires_external_proof_sections() {
+        let suite: ReleaseBenchmarkSuite = serde_json::from_value(json!({
+            "datasets": [{
+                "fixture": "a",
+                "objective": "squared_error",
+                "tri_boost": {"deviance": 0.8, "exact": true},
+                "ebm": {"deviance": 1.0}
+            }]
+        }))
+        .unwrap();
+        let err = evaluate_release_verdict(&suite).unwrap_err().to_string();
+        assert!(err.contains("external.rival_adapters"));
+        assert!(err.contains("external.treeshap_oracle"));
+    }
+
+    #[test]
+    fn release_verdict_fails_on_missing_rival_or_bad_treeshap() {
+        let suite: ReleaseBenchmarkSuite = serde_json::from_value(json!({
+            "datasets": [{
+                "fixture": "a",
+                "objective": "squared_error",
+                "tri_boost": {"deviance": 0.8, "exact": true},
+                "ebm": {"deviance": 1.0}
+            }],
+            "external": {
+                "rival_adapters": {
+                    "required": ["ebm", "xgboost"],
+                    "results": [
+                        {"name": "ebm", "deviance": 1.0, "lift": 1.1, "ordered_gini": 0.2}
+                    ]
+                },
+                "treeshap_oracle": {
+                    "passed": true,
+                    "max_abs_error": 0.2,
+                    "tolerance": 0.1,
+                    "fixtures": 1
+                }
+            }
+        }))
+        .unwrap();
+        let verdict = evaluate_release_verdict(&suite).unwrap();
+        assert_eq!(verdict["status"], "fail");
+        assert_eq!(verdict["hard_gates"]["all_passed"], false);
+        assert_eq!(verdict["hard_gates"]["rival_adapters"]["passed"], false);
+        assert_eq!(
+            verdict["hard_gates"]["rival_adapters"]["missing"][0],
+            "xgboost"
+        );
+        assert_eq!(verdict["hard_gates"]["treeshap_oracle"]["passed"], false);
+    }
+
+    fn passing_external_json() -> serde_json::Value {
+        json!({
+            "rival_adapters": {
+                "results": [
+                    {"name": "ebm", "deviance": 1.0, "lift": 1.2, "ordered_gini": 0.31},
+                    {"name": "ga2m", "deviance": 0.98, "lift": 1.2, "ordered_gini": 0.32},
+                    {"name": "xgboost", "deviance": 0.74, "lift": 1.3, "ordered_gini": 0.41},
+                    {"name": "lightgbm", "deviance": 0.75, "lift": 1.3, "ordered_gini": 0.40},
+                    {"name": "catboost", "deviance": 0.76, "lift": 1.3, "ordered_gini": 0.39}
+                ]
+            },
+            "treeshap_oracle": {
+                "passed": true,
+                "max_abs_error": 1.0e-7,
+                "tolerance": 1.0e-6,
+                "fixtures": 3
+            }
+        })
     }
 }

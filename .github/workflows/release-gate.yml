@@ -2,19 +2,17 @@ name: Release Gate
 
 # The v1.5 publication gate (plan M6-8). This workflow is intentionally heavier
 # than Correctness CI: it is the explicit pre-publish checklist for matrix Rust
-# gates, wheel/sdist builds, clean-env wheel smoke, internal M6 preflight, and the
-# crates.io publish dry-run. It never publishes by itself.
+# gates, wheel/sdist builds, clean-env wheel smoke, internal M6 preflight, the
+# external benchmark verdict, and the crates.io publish dry-run. It never publishes
+# by itself.
 
 on:
   workflow_dispatch:
     inputs:
       benchmark_artifact:
-        description: "Optional repo path to an external M6 benchmark artifact for release-verdict"
-        required: false
-        default: ""
-  push:
-    tags:
-      - "v*"
+        description: "Required repo path to an external M6 benchmark artifact for release-verdict"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -94,7 +92,6 @@ jobs:
 
   external-verdict:
     name: external benchmark verdict
-    if: github.event_name == 'workflow_dispatch' && inputs.benchmark_artifact != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

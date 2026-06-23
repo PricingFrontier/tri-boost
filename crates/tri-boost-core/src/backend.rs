@@ -42,7 +42,8 @@ pub(crate) trait Backend: Send + Sync {
     /// input is the M5-QHIST/v1.5 variant).
     ///
     /// # Errors
-    /// [`PbError`] on shape mismatch or an unimplemented backend (Phase 0).
+    /// [`PbError`] on shape mismatch or because this legacy seam lacks the §06
+    /// leaf-assignment and axis-subset context used by the implemented engine.
     fn build_histograms(
         &self,
         x: &BinnedMatrix,
@@ -55,7 +56,8 @@ pub(crate) trait Backend: Send + Sync {
     /// `(axis, bin_le)` and return the single argmax split for the whole level.
     ///
     /// # Errors
-    /// [`PbError`] on an unimplemented backend (Phase 0).
+    /// [`PbError`] because this legacy seam lacks the §06 axis metadata and
+    /// constraint context used by the implemented split finder.
     fn best_level_split(
         &self,
         hist: &Hist,
@@ -121,7 +123,7 @@ impl Backend for CpuBackend {
     ) -> Result<(), PbError> {
         let _ = (x, gh, rows, hist);
         Err(PbError::Internal {
-            what: "CpuBackend::build_histograms is not implemented in Phase 0 (§06)".into(),
+            what: "CpuBackend::build_histograms legacy seam lacks §06 leaf assignments/axis list; use engine::hist/split".into(),
         })
     }
 
@@ -133,7 +135,7 @@ impl Backend for CpuBackend {
     ) -> Result<Option<Split>, PbError> {
         let _ = (hist, lambda, constraints);
         Err(PbError::Internal {
-            what: "CpuBackend::best_level_split is not implemented in Phase 0 (§06)".into(),
+            what: "CpuBackend::best_level_split legacy seam lacks §06 axis metadata/constraints; use engine::split".into(),
         })
     }
 
