@@ -30,7 +30,8 @@ use crate::engine::split::{
     clamp_monotone, grow_oblivious_tree, refit_tree_leaves, GrowConfig, TableBudgetPenalty,
 };
 use crate::engine::{
-    low_bit, Config, ExactnessMode, FitSpec, Model, ModelSchema, ObliviousTree, Sampling,
+    tree_leaf_index_for_row_with_columns, tree_split_columns, tree_value_for_row_with_columns,
+    Config, ExactnessMode, FitSpec, Model, ModelSchema, ObliviousTree, Sampling,
 };
 use crate::error::PbError;
 use crate::loss::{GradHess, Link};
@@ -224,10 +225,13 @@ pub(crate) fn fit(
     x: &BinnedMatrix,
     y: &[f32],
     spec: &FitSpec,
+    cat_encoders: &CatEncoderStore,
 ) -> Result<Model, PbError> {
     match &config.boosters.ensemble {
-        EnsembleSpec::Off => fit_single(config, x, y, spec),
-        EnsembleSpec::OuterBag { n_bags } => fit_outer_bag(config, x, y, spec, *n_bags),
+        EnsembleSpec::Off => fit_single(config, x, y, spec, cat_encoders),
+        EnsembleSpec::OuterBag { n_bags } => {
+            fit_outer_bag(config, x, y, spec, *n_bags, cat_encoders)
+        }
         EnsembleSpec::GreedySelect {
             library_size,
             hp_grid,
@@ -244,6 +248,7 @@ pub(crate) fn fit(
                 selection_bags: *selection_bags,
                 seed_top_n: *seed_top_n,
             },
+            cat_encoders,
         ),
     }
 }
@@ -253,6 +258,7 @@ fn fit_single(
     x: &BinnedMatrix,
     y: &[f32],
     spec: &FitSpec,
+    cat_encoders: &CatEncoderStore,
 ) -> Result<Model, PbError> {
     config.validate()?;
     validate_fit_spec(spec)?;
@@ -308,7 +314,8 @@ fn fit_single(
         what: "more than u32::MAX features".into(),
     })?)
         .collect();
-    let rows: Vec<u32> = (0..x.n_rows).collect();
+    let (train_rows, validation_rows) =
+        carve_validation_rows(x.n_rows, config.validation_fraction, spec.seed)?;
     // Resolve the leaf-stage |w*|-clamp (§05.6): an explicit Config value wins, else fall
     // back to the loss's advertised cap (Poisson ⇒ Some(0.7)).
     let max_delta_step = config
@@ -317,6 +324,7 @@ fn fit_single(
         .map(f64::from);
     let grow_cfg = GrowConfig {
         lambda: f64::from(config.lambda),
+        l1_leaf: f64::from(config.l1_leaf),
         lr: f64::from(config.learning_rate),
         min_split_gain: f64::from(config.min_split_gain),
         max_order: spec.interaction.max_order,
@@ -338,6 +346,11 @@ fn fit_single(
     let mut gh = GradHess::default();
     let mut last_refit_tree_count = 0usize;
     let mut prev_alphas: Vec<f32> = Vec::new();
+    let mut best_validation_deviance = match validation_rows.as_deref() {
+        Some(val_rows) => Some(deviance_for_rows(spec.loss, y, &raw, weight, val_rows)?),
+        None => None,
+    };
+    let mut best_validation_tree_count = 0usize;
     for t in 0..config.n_trees {
         // Per-round deterministic re-seed — the seam for MVS/subsampling (M5-QHIST,
         // v1.5).
@@ -369,14 +382,29 @@ fn fit_single(
             fit_raw = raw_minus_dropped(&raw, x, &trees, &dart_drops)?;
         }
         spec.loss.grad_hess(y, &fit_raw, weight, &mut gh)?;
-        let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
+        let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &train_rows)?;
+        let round_axes = sample_axes(&axes, config.colsample_bytree, spec.seed, t)?;
         let mut round_grow_cfg = grow_cfg.clone();
         round_grow_cfg.round = t;
-        match grow_oblivious_tree(x, &gh, &sampled_rows, &axes, &round_grow_cfg, weight)? {
+        round_grow_cfg.lr =
+            learning_rate_for_round(config.learning_rate, config.learning_rate_decay, t);
+        match grow_oblivious_tree(x, &gh, &sampled_rows, &round_axes, &round_grow_cfg, weight)? {
             Some(mut tree) => {
-                if sampled_rows.len() != rows.len() {
-                    refit_tree_leaves(x, &gh, &rows, &mut tree, &round_grow_cfg)?;
+                if sampled_rows.len() != train_rows.len() {
+                    refit_tree_leaves(x, &gh, &train_rows, &mut tree, &round_grow_cfg)?;
                 }
+                refine_tree_leaves_after_grow(
+                    config,
+                    spec.loss,
+                    y,
+                    weight,
+                    &fit_raw,
+                    x,
+                    &train_rows,
+                    monotone_ref,
+                    &mut tree,
+                    &round_grow_cfg,
+                )?;
                 if let Some(dart) = dart_cfg {
                     let new_alpha = apply_dart_normalization(&mut trees, &dart_drops, dart)?;
                     trees.push((new_alpha, tree));
@@ -412,20 +440,44 @@ fn fit_single(
                     }
                 ) {
                     spec.loss.grad_hess(y, &raw, weight, &mut gh)?;
-                    let correction_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
+                    let correction_rows =
+                        sample_rows(&config.sampling, &gh, spec.seed, t, &train_rows)?;
                     let mut correction_cfg = grow_cfg.clone();
                     correction_cfg.round = t;
+                    correction_cfg.lr = learning_rate_for_round(
+                        config.learning_rate,
+                        config.learning_rate_decay,
+                        t,
+                    );
                     if let Some(mut correction) = grow_oblivious_tree(
                         x,
                         &gh,
                         &correction_rows,
-                        &axes,
+                        &round_axes,
                         &correction_cfg,
                         weight,
                     )? {
-                        if correction_rows.len() != rows.len() {
-                            refit_tree_leaves(x, &gh, &rows, &mut correction, &correction_cfg)?;
+                        if correction_rows.len() != train_rows.len() {
+                            refit_tree_leaves(
+                                x,
+                                &gh,
+                                &train_rows,
+                                &mut correction,
+                                &correction_cfg,
+                            )?;
                         }
+                        refine_tree_leaves_after_grow(
+                            config,
+                            spec.loss,
+                            y,
+                            weight,
+                            &raw,
+                            x,
+                            &train_rows,
+                            monotone_ref,
+                            &mut correction,
+                            &correction_cfg,
+                        )?;
                         update_raw(&mut raw, x, &correction)?;
                         trees.push((1.0, correction));
                         if should_refit_after_round(&config.boosters.refit_leaves, trees.len())? {
@@ -448,6 +500,21 @@ fn fit_single(
                         }
                     }
                 }
+                if let Some(val_rows) = validation_rows.as_deref() {
+                    let deviance = deviance_for_rows(spec.loss, y, &raw, weight, val_rows)?;
+                    let improved = match best_validation_deviance {
+                        Some(best) => deviance < best,
+                        None => true,
+                    };
+                    if improved {
+                        best_validation_deviance = Some(deviance);
+                        best_validation_tree_count = trees.len();
+                    } else if trees.len().saturating_sub(best_validation_tree_count)
+                        >= config.early_stopping_rounds as usize
+                    {
+                        break;
+                    }
+                }
             }
             // No admissible split clears the floor (e.g. converged / constant target):
             // stop early with what we have — a valid (possibly empty) Exact model.
@@ -458,6 +525,11 @@ fn fit_single(
                 break;
             }
         }
+    }
+    if validation_rows.is_some() && best_validation_tree_count < trees.len() {
+        trees.truncate(best_validation_tree_count);
+        last_refit_tree_count = last_refit_tree_count.min(trees.len());
+        raw = raw_from_tree_alphas(f0_f32, offset.as_deref(), x, &trees)?;
     }
     if should_refit_at_end(
         &config.boosters.refit_leaves,
@@ -497,7 +569,10 @@ fn fit_single(
     let schema = ModelSchema {
         feature_names: (0..n_features).map(|i| format!("f{i}")).collect(),
         feature_kinds: x.provenance.iter().map(|p| p.kind).collect(),
-        cat_encoders: CatEncoderStore::new(),
+        // Carry the (full-data) categorical encoders so every model this builds — including
+        // each OuterBag/GreedySelect member — validates and serves correctly, not just the
+        // single-fit path stamped by `Booster::fit_train`.
+        cat_encoders: cat_encoders.clone(),
         class_labels: None,
         objective: spec.loss.objective_tag(),
     };
@@ -594,11 +669,12 @@ fn fit_outer_bag(
     y: &[f32],
     spec: &FitSpec,
     n_bags: u16,
+    cat_encoders: &CatEncoderStore,
 ) -> Result<Model, PbError> {
     validate_ensemble_fit_inputs(config, x, y, spec)?;
     let base_config = ensemble_base_config(config);
     if n_bags == 1 {
-        return fit_single(&base_config, x, y, spec);
+        return fit_single(&base_config, x, y, spec, cat_encoders);
     }
 
     let n_rows = x.n_rows as usize;
@@ -623,7 +699,7 @@ fn fit_outer_bag(
             credibility: spec.credibility,
             seed: bag_seed,
         };
-        let model = fit_single(&base_config, &data.x, &data.y, &bag_spec)?;
+        let model = fit_single(&base_config, &data.x, &data.y, &bag_spec, cat_encoders)?;
         members.push(WeightedModel { alpha, model });
     }
     soup_models(&members)
@@ -635,6 +711,7 @@ fn fit_greedy_select(
     y: &[f32],
     spec: &FitSpec,
     params: GreedyParams<'_>,
+    cat_encoders: &CatEncoderStore,
 ) -> Result<Model, PbError> {
     validate_ensemble_fit_inputs(config, x, y, spec)?;
     let base_config = ensemble_base_config(config);
@@ -685,7 +762,13 @@ fn fit_greedy_select(
             credibility: spec.credibility,
             seed: member_seed,
         };
-        let model = fit_single(&member_config, &train.x, &train.y, &member_spec)?;
+        let model = fit_single(
+            &member_config,
+            &train.x,
+            &train.y,
+            &member_spec,
+            cat_encoders,
+        )?;
         let holdout_raw = raw_predictions(&model, &holdout.x)?;
         let deviance = f64::from(
             spec.loss
@@ -1250,10 +1333,15 @@ fn raw_from_tree_alphas(
 ) -> Result<Vec<f32>, PbError> {
     let n_rows = x.n_rows as usize;
     let mut out: Vec<f32> = crate::engine::Hist::try_zeroed_vec(n_rows, "AGBM raw")?;
+    let tree_columns: Vec<Vec<&[u8]>> = trees
+        .iter()
+        .map(|(_, tree)| tree_split_columns(tree, &x.data))
+        .collect::<Result<_, _>>()?;
     for row in 0..n_rows {
         let mut score = base_raw(offset, f0, row)?;
-        for (alpha, tree) in trees {
-            score += f64::from(*alpha) * f64::from(tree_value_for_row(tree, x, row)?);
+        for ((alpha, tree), columns) in trees.iter().zip(&tree_columns) {
+            score +=
+                f64::from(*alpha) * f64::from(tree_value_for_row_with_columns(tree, columns, row)?);
         }
         if !score.is_finite() || score < f64::from(f32::MIN) || score > f64::from(f32::MAX) {
             return Err(PbError::InvalidInput {
@@ -1309,14 +1397,19 @@ fn raw_minus_dropped(
             what: "DART raw allocation failed".into(),
         })?;
     out.extend_from_slice(raw);
+    let dropped_trees: Vec<(f32, &ObliviousTree, Vec<&[u8]>)> = trees
+        .iter()
+        .zip(drops)
+        .filter(|(_, dropped)| **dropped)
+        .map(|((alpha, tree), _)| Ok((*alpha, tree, tree_split_columns(tree, &x.data)?)))
+        .collect::<Result<_, PbError>>()?;
     for row in 0..out.len() {
         let mut score = f64::from(*out.get(row).ok_or_else(|| PbError::Internal {
             what: "DART raw row escaped".into(),
         })?);
-        for ((alpha, tree), dropped) in trees.iter().zip(drops) {
-            if *dropped {
-                score -= f64::from(*alpha) * f64::from(tree_value_for_row(tree, x, row)?);
-            }
+        for (alpha, tree, columns) in &dropped_trees {
+            score -=
+                f64::from(*alpha) * f64::from(tree_value_for_row_with_columns(tree, columns, row)?);
         }
         if !score.is_finite() || score < f64::from(f32::MIN) || score > f64::from(f32::MAX) {
             return Err(PbError::InvalidInput {
@@ -1496,10 +1589,14 @@ fn leaf_memberships(x: &BinnedMatrix, trees: &[(f32, ObliviousTree)]) -> Result<
             what: "leaf membership shape overflow".into(),
         })?;
     let mut memberships: Vec<u8> = crate::engine::Hist::try_zeroed_vec(cells, "leaf membership")?;
+    let tree_columns: Vec<Vec<&[u8]>> = trees
+        .iter()
+        .map(|(_, tree)| tree_split_columns(tree, &x.data))
+        .collect::<Result<_, _>>()?;
     for row in 0..n_rows {
-        for (tree_idx, (_, tree)) in trees.iter().enumerate() {
-            let leaf =
-                u8::try_from(leaf_index_for_row(tree, x, row)?).map_err(|_| PbError::Internal {
+        for (tree_idx, ((_, tree), columns)) in trees.iter().zip(&tree_columns).enumerate() {
+            let leaf = u8::try_from(tree_leaf_index_for_row_with_columns(tree, columns, row)?)
+                .map_err(|_| PbError::Internal {
                     what: "leaf index exceeded u8".into(),
                 })?;
             let slot = membership_offset(row, tree_idx, n_trees)?;
@@ -2029,49 +2126,284 @@ fn sample_rows(
     }
 }
 
+fn carve_validation_rows(
+    n_rows: u32,
+    validation_fraction: Option<f32>,
+    seed: u64,
+) -> Result<(Vec<u32>, Option<Vec<usize>>), PbError> {
+    let all_rows: Vec<u32> = (0..n_rows).collect();
+    let Some(frac) = validation_fraction else {
+        return Ok((all_rows, None));
+    };
+    if n_rows < 2 {
+        return Err(PbError::InvalidConfig {
+            what: "validation_fraction requires at least two rows".into(),
+        });
+    }
+    let n = n_rows as usize;
+    let holdout = ((n as f64) * f64::from(frac)).ceil() as usize;
+    let holdout = holdout.clamp(1, n - 1);
+    let mut keyed: Vec<(u64, u32)> = Vec::with_capacity(n);
+    for row in 0..n_rows {
+        keyed.push((pb_seed(seed, 0, Stage::Holdout as u32, row), row));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut is_holdout = vec![false; n];
+    for &(_, row) in keyed.iter().take(holdout) {
+        *is_holdout
+            .get_mut(row as usize)
+            .ok_or_else(|| PbError::Internal {
+                what: "holdout row escaped mask".into(),
+            })? = true;
+    }
+    let mut train_rows = Vec::with_capacity(n - holdout);
+    let mut validation_rows = Vec::with_capacity(holdout);
+    for row in 0..n_rows {
+        if *is_holdout
+            .get(row as usize)
+            .ok_or_else(|| PbError::Internal {
+                what: "holdout row escaped final mask".into(),
+            })?
+        {
+            validation_rows.push(row as usize);
+        } else {
+            train_rows.push(row);
+        }
+    }
+    Ok((train_rows, Some(validation_rows)))
+}
+
+fn sample_axes(axes: &[u32], rate: f32, seed: u64, round: u32) -> Result<Vec<u32>, PbError> {
+    if axes.is_empty() || rate >= 1.0 {
+        return Ok(axes.to_vec());
+    }
+    let n = axes.len();
+    let k = ((n as f64) * f64::from(rate)).ceil() as usize;
+    let k = k.clamp(1, n);
+    let mut keyed = Vec::with_capacity(n);
+    for &axis in axes {
+        keyed.push((pb_seed(seed, round, Stage::Cols as u32, axis), axis));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut sampled: Vec<u32> = keyed.into_iter().take(k).map(|(_, axis)| axis).collect();
+    sampled.sort_unstable();
+    Ok(sampled)
+}
+
+fn learning_rate_for_round(base: f32, decay: f32, round: u32) -> f64 {
+    f64::from(base) / (1.0 + f64::from(decay) * f64::from(round))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_tree_leaves_after_grow(
+    config: &Config,
+    loss: &dyn crate::loss::Loss,
+    y: &[f32],
+    weight: &[f32],
+    base_raw: &[f32],
+    x: &BinnedMatrix,
+    rows: &[u32],
+    monotone: Option<&[Option<MonoSign>]>,
+    tree: &mut ObliviousTree,
+    grow_cfg: &GrowConfig<'_>,
+) -> Result<(), PbError> {
+    if config.leaf_refine_steps == 0 || rows.is_empty() {
+        return Ok(());
+    }
+    let n_rows = x.n_rows as usize;
+    if base_raw.len() != n_rows {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "leaf refinement base_raw len {} != n_rows {n_rows}",
+                base_raw.len()
+            ),
+        });
+    }
+    let columns = tree_split_columns(tree, &x.data)?;
+    let n_leaves = 1usize << usize::from(tree.depth);
+    let eval_rows: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
+    let memberships = tree_memberships_for_rows(tree, &columns, rows, n_leaves)?;
+    let mut raw = raw_with_tree_leaves(base_raw, tree, &columns, &tree.leaves)?;
+    let mut best_deviance = deviance_for_rows(loss, y, &raw, weight, &eval_rows)?;
+    let mut gh = GradHess::default();
+
+    for _ in 0..config.leaf_refine_steps {
+        loss.grad_hess(y, &raw, weight, &mut gh)?;
+        let mut g = [0.0_f64; 8];
+        let mut h = [0.0_f64; 8];
+        for (&row, &leaf_u8) in rows.iter().zip(&memberships) {
+            let ru = row as usize;
+            let leaf = usize::from(leaf_u8);
+            *g.get_mut(leaf).ok_or_else(|| PbError::Internal {
+                what: "leaf refinement g leaf escaped".into(),
+            })? += f64::from(*gh.g.get(ru).ok_or_else(|| PbError::Internal {
+                what: "leaf refinement gradient row escaped".into(),
+            })?);
+            *h.get_mut(leaf).ok_or_else(|| PbError::Internal {
+                what: "leaf refinement h leaf escaped".into(),
+            })? += f64::from(*gh.h.get(ru).ok_or_else(|| PbError::Internal {
+                what: "leaf refinement hessian row escaped".into(),
+            })?);
+        }
+
+        let mut delta = [0.0_f32; 8];
+        let mut any_delta = false;
+        for leaf in 0..n_leaves {
+            let step = incremental_leaf_delta(
+                *g.get(leaf).ok_or_else(|| PbError::Internal {
+                    what: "leaf refinement g lookup escaped".into(),
+                })?,
+                *h.get(leaf).ok_or_else(|| PbError::Internal {
+                    what: "leaf refinement h lookup escaped".into(),
+                })?,
+                grow_cfg.lambda,
+                grow_cfg.l1_leaf,
+                grow_cfg.max_delta_step,
+                grow_cfg.lr,
+            )?;
+            if step.abs() > 1.0e-7 {
+                any_delta = true;
+            }
+            *delta.get_mut(leaf).ok_or_else(|| PbError::Internal {
+                what: "leaf refinement delta lookup escaped".into(),
+            })? = step;
+        }
+        if !any_delta {
+            break;
+        }
+
+        let mut accepted = false;
+        let mut scale = 1.0_f32;
+        for _ in 0..config.leaf_refine_backtracks {
+            let mut trial_leaves = tree.leaves;
+            for (leaf_value, delta_value) in trial_leaves.iter_mut().zip(delta.iter()) {
+                let value = f64::from(*leaf_value) + f64::from(scale * *delta_value);
+                if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX)
+                {
+                    return Err(PbError::InvalidInput {
+                        what: "leaf refinement value is not finite/representable".into(),
+                    });
+                }
+                *leaf_value = value as f32;
+            }
+            clamp_monotone(
+                &mut trial_leaves,
+                &tree.splits,
+                usize::from(tree.depth),
+                monotone,
+            )?;
+            let trial_raw = raw_with_tree_leaves(base_raw, tree, &columns, &trial_leaves)?;
+            let deviance = deviance_for_rows(loss, y, &trial_raw, weight, &eval_rows)?;
+            if deviance < best_deviance {
+                tree.leaves = trial_leaves;
+                raw = trial_raw;
+                best_deviance = deviance;
+                accepted = true;
+                break;
+            }
+            scale *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn incremental_leaf_delta(
+    g: f64,
+    h: f64,
+    lambda: f64,
+    l1_leaf: f64,
+    max_delta_step: Option<f64>,
+    lr: f64,
+) -> Result<f32, PbError> {
+    let denom = h + lambda;
+    let g = if l1_leaf <= 0.0 {
+        g
+    } else {
+        g.signum() * (g.abs() - l1_leaf).max(0.0)
+    };
+    let step = if denom > 0.0 { -g / denom } else { 0.0 };
+    // §05.6: `max_delta_step` clamps the full-precision Newton step BEFORE the learning rate.
+    let step = match max_delta_step {
+        Some(d) => step.clamp(-d, d),
+        None => step,
+    };
+    // Match `leaf_values` (split.rs): the refinement step is `lr`-scaled, so multi-step
+    // Newton refines the leaf WITHIN its shrinkage budget instead of driving it to the
+    // `lr = 1.0` optimum — the latter silently un-shrinks every leaf and overfits (the
+    // Armijo guard cannot catch it because the un-shrunk step still lowers TRAIN deviance).
+    let step = lr * step;
+    if !step.is_finite() || step < f64::from(f32::MIN) || step > f64::from(f32::MAX) {
+        return Err(PbError::InvalidInput {
+            what: "leaf refinement step is not finite/representable".into(),
+        });
+    }
+    Ok(step as f32)
+}
+
+fn tree_memberships_for_rows(
+    tree: &ObliviousTree,
+    columns: &[&[u8]],
+    rows: &[u32],
+    n_leaves: usize,
+) -> Result<Vec<u8>, PbError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for &row in rows {
+        let leaf = tree_leaf_index_for_row_with_columns(tree, columns, row as usize)?;
+        if leaf >= n_leaves {
+            return Err(PbError::Internal {
+                what: "leaf refinement membership escaped depth".into(),
+            });
+        }
+        out.push(u8::try_from(leaf).map_err(|_| PbError::Internal {
+            what: "leaf refinement membership exceeded u8".into(),
+        })?);
+    }
+    Ok(out)
+}
+
+fn raw_with_tree_leaves(
+    base_raw: &[f32],
+    tree: &ObliviousTree,
+    columns: &[&[u8]],
+    leaves: &[f32; 8],
+) -> Result<Vec<f32>, PbError> {
+    let mut out = Vec::with_capacity(base_raw.len());
+    for (row, &base) in base_raw.iter().enumerate() {
+        let leaf = tree_leaf_index_for_row_with_columns(tree, columns, row)?;
+        let value = f64::from(base)
+            + f64::from(*leaves.get(leaf).ok_or_else(|| PbError::Internal {
+                what: "leaf refinement leaf lookup escaped".into(),
+            })?);
+        if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+            return Err(PbError::InvalidInput {
+                what: "leaf refinement raw is not finite/representable".into(),
+            });
+        }
+        out.push(value as f32);
+    }
+    Ok(out)
+}
+
 /// Add a freshly-grown tree's contribution to every row's raw score (spec §06.6
 /// sample→leaf update). Scores ALL rows (not just the round's subsample) so the next
 /// round's gradients are correct everywhere. Panic-free; uses the canonical low bit.
 fn update_raw(raw: &mut [f32], x: &BinnedMatrix, tree: &ObliviousTree) -> Result<(), PbError> {
+    let columns = tree_split_columns(tree, &x.data)?;
     for (r, slot) in raw.iter_mut().enumerate() {
-        *slot += tree_value_for_row(tree, x, r)?;
+        *slot += tree_value_for_row_with_columns(tree, &columns, r)?;
     }
     Ok(())
 }
 
 /// Score one row against one tree by column-major reads, folding the leaf index with
 /// the SAME canonical `low_bit` rule as [`ObliviousTree::lookup`] and the grower.
+#[cfg(test)]
 fn tree_value_for_row(tree: &ObliviousTree, x: &BinnedMatrix, r: usize) -> Result<f32, PbError> {
-    let idx = leaf_index_for_row(tree, x, r)?;
-    tree.leaves
-        .get(idx)
-        .copied()
-        .ok_or_else(|| PbError::Internal {
-            what: "update_raw: leaf index escaped 0..8".into(),
-        })
-}
-
-fn leaf_index_for_row(tree: &ObliviousTree, x: &BinnedMatrix, r: usize) -> Result<usize, PbError> {
-    let mut idx = 0usize;
-    for (level, split) in tree.splits.iter().enumerate() {
-        let bin = *x
-            .data
-            .get(split.axis as usize)
-            .ok_or_else(|| PbError::Internal {
-                what: "update_raw: split axis out of range".into(),
-            })?
-            .get(r)
-            .ok_or_else(|| PbError::Internal {
-                what: "update_raw: row out of column".into(),
-            })?;
-        idx |= usize::from(low_bit(bin, split.bin_le, split.missing_left)) << level;
-    }
-    if idx >= 8 {
-        return Err(PbError::Internal {
-            what: "update_raw: leaf index escaped 0..8".into(),
-        });
-    }
-    Ok(idx)
+    let columns = tree_split_columns(tree, &x.data)?;
+    tree_value_for_row_with_columns(tree, &columns, r)
 }
 
 #[cfg(test)]
@@ -2092,7 +2424,7 @@ mod tests {
     };
     use crate::engine::{Booster, HistPrecision};
     use crate::explain::{assert_exact_decomposition, FeatureSet, RefMeasure};
-    use crate::loss::{Loss, LossId, Poisson, SquaredError};
+    use crate::loss::{Gamma, Loss, LossId, Poisson, SquaredError};
 
     fn spec<'a>(loss: &'a dyn Loss) -> FitSpec<'a> {
         FitSpec {
@@ -2140,6 +2472,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         });
         let sqe = SquaredError;
@@ -2173,6 +2512,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         });
         let sqe = SquaredError;
@@ -2205,6 +2551,13 @@ mod tests {
                     max_delta_step: None,
                     sampling: Default::default(),
                     hist_precision: Default::default(),
+                    l1_leaf: 0.0,
+                    colsample_bytree: 1.0,
+                    learning_rate_decay: 0.0,
+                    validation_fraction: None,
+                    early_stopping_rounds: 50,
+                    leaf_refine_steps: 0,
+                    leaf_refine_backtracks: 4,
                     boosters: Default::default(),
                 });
                 let sqe = SquaredError;
@@ -2240,6 +2593,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: BoosterConfig {
                 random_strength: 0.35,
                 ..BoosterConfig::default()
@@ -2267,6 +2627,24 @@ mod tests {
         assert_eq!(b1, bytes(8));
     }
 
+    /// Regression for the leaf-refinement lr bug: the incremental Newton step MUST be
+    /// `lr`-scaled like a grown leaf (`leaf_values` uses `lr·w`). Without it the step is the
+    /// full `lr = 1.0` optimum, which un-shrinks every leaf and overfits (the Armijo guard
+    /// cannot catch it — the un-shrunk step still lowers train deviance).
+    #[test]
+    fn leaf_refine_delta_is_learning_rate_scaled() {
+        let full = incremental_leaf_delta(10.0, 10.0, 0.0, 0.0, None, 1.0).unwrap();
+        let shrunk = incremental_leaf_delta(10.0, 10.0, 0.0, 0.0, None, 0.1).unwrap();
+        assert!(
+            (full - (-1.0)).abs() < 1e-6,
+            "lr=1 ⇒ full Newton step −G/(H+λ)"
+        );
+        assert!(
+            (shrunk - (-0.1)).abs() < 1e-6,
+            "lr=0.1 ⇒ exactly 0.1× the full step"
+        );
+    }
+
     /// §07.2/§07.6: credibility floors are a candidate mask and `path_smooth` is a
     /// value-level clamp on a fixed oblivious structure, so a model fit with both stays
     /// `Exact` and decomposes — and `path_smooth` measurably changes the served leaves.
@@ -2292,6 +2670,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         };
         let sqe = SquaredError;
@@ -2341,6 +2726,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         };
         let refit_cfg = Config {
@@ -2410,6 +2802,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         };
         let refit_cfg = Config {
@@ -2462,6 +2861,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: BoosterConfig {
                 nesterov: NesterovSpec::Agbm {
                     momentum_correction: false,
@@ -2515,6 +2921,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: BoosterConfig {
                 nesterov: NesterovSpec::Agbm {
                     momentum_correction: true,
@@ -2545,6 +2958,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         };
         let dart_cfg = Config {
@@ -2592,6 +3012,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: BoosterConfig {
                 dart: Some(DartSpec {
                     drop_rate: 0.45,
@@ -2651,6 +3078,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: BoosterConfig {
                 ensemble: EnsembleSpec::OuterBag { n_bags: 3 },
                 ..BoosterConfig::default()
@@ -2702,6 +3136,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: BoosterConfig::default(),
         };
         let mut bag_cfg = base_cfg.clone();
@@ -2741,6 +3182,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: BoosterConfig {
                 ensemble: EnsembleSpec::GreedySelect {
                     library_size: 4,
@@ -2795,6 +3243,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: BoosterConfig {
                 ensemble: EnsembleSpec::GreedySelect {
                     library_size: 1,
@@ -2836,6 +3291,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         });
         let sqe = SquaredError;
@@ -2865,6 +3327,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         });
 
@@ -2914,6 +3383,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         });
         assert!(matches!(
@@ -3017,6 +3493,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         });
         let sqe = SquaredError;
@@ -3055,6 +3538,13 @@ mod tests {
             max_delta_step: None,
             sampling: Sampling::Full,
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: BoosterConfig {
                 refit_leaves: RefitSpec::Ridge {
                     l2: 0.1,
@@ -3099,6 +3589,13 @@ mod tests {
                 min_rows: 4,
             },
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         })
         .fit(&x, &y, &sp)
@@ -3206,6 +3703,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         });
         let model = booster
@@ -3251,6 +3755,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
@@ -3283,6 +3794,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
@@ -3321,6 +3839,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         })
         .fit(&x, &y, &s)
@@ -3348,6 +3873,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         })
         .fit(&x, &y, &s)
@@ -3373,6 +3905,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         };
         let anchored_cfg = Config {
@@ -3431,6 +3970,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
@@ -3517,6 +4063,13 @@ mod tests {
                 min_rows: 40,
             },
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         };
         let sqe = SquaredError;
@@ -3541,6 +4094,147 @@ mod tests {
     }
 
     #[test]
+    fn new_accuracy_knobs_stay_exact_and_thread_deterministic() {
+        let n = 220usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 9 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 7 + 1) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let x3: Vec<f32> = (0..n).map(|i| (i % 4 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                let a = if x0[i] <= 4.0 { 2.5 } else { -1.0 };
+                let b = if x1[i] <= 3.0 { 1.25 } else { -0.75 };
+                let c = if x2[i] <= 2.0 { 0.8 } else { -0.2 };
+                a + b + c + (i % 11) as f32 * 0.01
+            })
+            .collect();
+        let x = binned(&[x0, x1, x2, x3]);
+        let cfg = Config {
+            n_trees: 45,
+            learning_rate: 0.25,
+            lambda: 1.0,
+            l1_leaf: 0.02,
+            colsample_bytree: 0.6,
+            learning_rate_decay: 0.05,
+            validation_fraction: Some(0.2),
+            early_stopping_rounds: 4,
+            ..Config::default()
+        };
+        let sqe = SquaredError;
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(cfg.clone())
+                    .fit(&x, &y, &spec(&sqe))
+                    .unwrap();
+                assert_eq!(model.mode, ExactnessMode::Exact);
+                assert!(!model.trees.is_empty());
+                assert!(model.trees.len() <= cfg.n_trees as usize);
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn leaf_refinement_stays_exact_and_does_not_increase_deviance() {
+        let n = 180usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 8 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                let a = if x0[i] <= 4.0 { 0.8 } else { 1.6 };
+                let b = if x1[i] <= 2.0 { 1.2 } else { 0.7 };
+                a * b + (i % 7) as f32 * 0.03
+            })
+            .collect();
+        let x = binned(&[x0, x1]);
+        let base_cfg = Config {
+            n_trees: 12,
+            learning_rate: 0.3,
+            lambda: 1.0,
+            ..Config::default()
+        };
+        let refined_cfg = Config {
+            leaf_refine_steps: 2,
+            leaf_refine_backtracks: 4,
+            ..base_cfg.clone()
+        };
+        let gamma = Gamma;
+        let base = Booster::with_config(base_cfg)
+            .fit(&x, &y, &spec(&gamma))
+            .unwrap();
+        let refined = Booster::with_config(refined_cfg)
+            .fit(&x, &y, &spec(&gamma))
+            .unwrap();
+        let mut base_raw = vec![0.0_f32; n];
+        let mut refined_raw = vec![0.0_f32; n];
+        base.score_trees(&x, None, &mut base_raw).unwrap();
+        refined.score_trees(&x, None, &mut refined_raw).unwrap();
+        let w = vec![1.0_f32; n];
+        let base_dev = gamma.deviance(&y, &base_raw, &w).unwrap();
+        let refined_dev = gamma.deviance(&y, &refined_raw, &w).unwrap();
+        assert!(
+            refined_dev <= base_dev + 1.0e-6,
+            "leaf refinement worsened deviance: {refined_dev} > {base_dev}"
+        );
+
+        let serve = crate::data::ServeBinnedMatrix(x);
+        let bank = refined.explain(&serve, RefMeasure::default()).unwrap();
+        assert_exact_decomposition(&refined, &bank, &serve).unwrap();
+    }
+
+    #[test]
+    fn new_accuracy_config_validation_is_fail_closed() {
+        for cfg in [
+            Config {
+                l1_leaf: -1.0,
+                ..Config::default()
+            },
+            Config {
+                colsample_bytree: 0.0,
+                ..Config::default()
+            },
+            Config {
+                colsample_bytree: 1.1,
+                ..Config::default()
+            },
+            Config {
+                learning_rate_decay: -0.1,
+                ..Config::default()
+            },
+            Config {
+                validation_fraction: Some(0.0),
+                ..Config::default()
+            },
+            Config {
+                validation_fraction: Some(1.0),
+                ..Config::default()
+            },
+            Config {
+                validation_fraction: Some(0.2),
+                early_stopping_rounds: 0,
+                ..Config::default()
+            },
+            Config {
+                leaf_refine_steps: 1,
+                leaf_refine_backtracks: 0,
+                ..Config::default()
+            },
+        ] {
+            assert!(matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })));
+        }
+    }
+
+    #[test]
     fn quantized_hist_fit_stays_exact_and_thread_deterministic() {
         let n = 160usize;
         let x0: Vec<f32> = (0..n).map(|i| (i % 8 + 1) as f32).collect();
@@ -3559,6 +4253,13 @@ mod tests {
             max_delta_step: None,
             sampling: Sampling::Full,
             hist_precision: HistPrecision::QuantizedI32,
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         };
         let sqe = SquaredError;
