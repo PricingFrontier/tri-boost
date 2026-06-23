@@ -653,19 +653,23 @@ pub(crate) struct MergedGrids {
 }
 
 impl MergedGrids {
-    /// Build the merged grids from a fitted `model`. v1: requires numeric axes with a
-    /// 1-to-1 raw↔axis mapping whose raw ids fill `0..n_features` (the green-spine
-    /// invariant); categorical or many-to-one provenance is rejected (`InvalidConfig`).
+    /// Build the merged grids from a fitted `model`. v1: requires a 1-to-1 raw↔axis
+    /// mapping whose raw ids fill `0..n_features` (the green-spine invariant). Both
+    /// [`AxisKind::Numeric`] and [`AxisKind::CategoricalTS`] axes are accepted — a
+    /// categorical is a Target-Statistic-encoded ordinal axis carrying a normal
+    /// [`BorderGrid`] (§04), so the merged-grid logic and the five I2 checks apply to it
+    /// identically (the bank is audited on a `ServeBinnedMatrix` re-encoded through the
+    /// frozen full-data encoders, R-CATSERVE). The reserved [`AxisKind::Missing`] axis is
+    /// not a model feature and is rejected; many-to-one provenance is unsupported in v1.
     pub(crate) fn from_model(model: &Model) -> Result<Self, PbError> {
         use crate::data::AxisKind;
         let n_features = model.provenance.len();
         // axis_of_raw[raw] = the single model axis carrying that raw feature.
         let mut axis_of_raw: Vec<Option<usize>> = vec![None; n_features];
         for (a, prov) in model.provenance.iter().enumerate() {
-            if !matches!(prov.kind, AxisKind::Numeric) {
+            if matches!(prov.kind, AxisKind::Missing) {
                 return Err(PbError::InvalidConfig {
-                    what: "v1 explain supports numeric axes only (categoricals arrive with §04)"
-                        .into(),
+                    what: "explain does not support a standalone Missing axis kind".into(),
                 });
             }
             let r = prov.raw.0 as usize;
