@@ -5,7 +5,9 @@
 //! `f0 = link(weighted mean)` (the fANOVA intercept), then each round: one
 //! full-precision `grad_hess` pass w.r.t. the current raw score → `grow_oblivious_tree`
 //! → `update_raw`, until `n_trees` rounds or a round cannot split (graceful stop).
-//! Every tree carries `alpha = 1.0`. The loop emits `ExactnessMode::Exact`.
+//! Every tree carries `alpha = 1.0` on the green path. Optional §09 boosters may
+//! rewrite only leaf scalars / alphas / the intercept; the emitted model remains
+//! `ExactnessMode::Exact`.
 //!
 //! v1 simplifications (the green spine): `subsample = 1.0` (all rows), no column
 //! sampling, full-precision histograms, single Newton leaf step, early stopping off.
@@ -20,6 +22,7 @@
 //! between the two scorers (same `low_bit` routing); only the accumulation width differs.
 
 use crate::backend::{pb_rng, pb_seed, Stage};
+use crate::boosters::RefitSpec;
 use crate::cat::CatEncoderStore;
 use crate::constraints::MonoSign;
 use crate::data::{compute_offset, BinnedMatrix};
@@ -38,6 +41,10 @@ fn invalid_config(what: &'static str) -> PbError {
 fn invalid_input(what: String) -> PbError {
     PbError::InvalidInput { what }
 }
+
+const REFIT_ACCEPT_TOL: f64 = 1.0e-10;
+const REFIT_MAX_BACKTRACKS: usize = 32;
+const REFIT_CHOLESKY_JITTERS: [f64; 4] = [0.0, 1.0e-12, 1.0e-10, 1.0e-8];
 
 fn validate_fit_spec(spec: &FitSpec<'_>) -> Result<(), PbError> {
     if !(1..=3).contains(&spec.interaction.max_order) {
@@ -279,6 +286,7 @@ pub(crate) fn fit(
 
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
     let mut gh = GradHess::default();
+    let mut last_refit_tree_count = 0usize;
     for t in 0..config.n_trees {
         // Per-round deterministic re-seed — the seam for MVS/subsampling (M5-QHIST,
         // v1.5).
@@ -294,11 +302,48 @@ pub(crate) fn fit(
                 }
                 update_raw(&mut raw, x, &tree)?;
                 trees.push((1.0, tree));
+                if should_refit_after_round(&config.boosters.refit_leaves, trees.len())? {
+                    let problem = RefitProblem {
+                        spec,
+                        x,
+                        y,
+                        weight,
+                        offset: offset.as_deref(),
+                        f0: f0_f32,
+                    };
+                    fully_corrective_refit(
+                        &config.boosters.refit_leaves,
+                        &problem,
+                        &mut trees,
+                        &mut raw,
+                    )?;
+                    last_refit_tree_count = trees.len();
+                }
             }
             // No admissible split clears the floor (e.g. converged / constant target):
             // stop early with what we have — a valid (possibly empty) Exact model.
             None => break,
         }
+    }
+    if should_refit_at_end(
+        &config.boosters.refit_leaves,
+        trees.len(),
+        last_refit_tree_count,
+    ) {
+        let problem = RefitProblem {
+            spec,
+            x,
+            y,
+            weight,
+            offset: offset.as_deref(),
+            f0: f0_f32,
+        };
+        fully_corrective_refit(
+            &config.boosters.refit_leaves,
+            &problem,
+            &mut trees,
+            &mut raw,
+        )?;
     }
 
     let f0_model = if config.boosters.reanchor {
@@ -331,6 +376,515 @@ pub(crate) fn fit(
         schema,
         schema_version: SCHEMA_VERSION,
     })
+}
+
+fn should_refit_after_round(refit: &RefitSpec, n_trees: usize) -> Result<bool, PbError> {
+    match refit {
+        RefitSpec::Ridge {
+            every_k_trees: Some(k),
+            ..
+        } => {
+            let k = usize::try_from(*k).map_err(|_| PbError::Internal {
+                what: "refit every_k_trees exceeded usize".into(),
+            })?;
+            Ok(n_trees > 0 && n_trees % k == 0)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn should_refit_at_end(refit: &RefitSpec, n_trees: usize, last_refit_tree_count: usize) -> bool {
+    matches!(refit, RefitSpec::Ridge { .. }) && n_trees > 0 && last_refit_tree_count != n_trees
+}
+
+struct RefitProblem<'a, 's> {
+    spec: &'a FitSpec<'s>,
+    x: &'a BinnedMatrix,
+    y: &'a [f32],
+    weight: &'a [f32],
+    offset: Option<&'a [f32]>,
+    f0: f32,
+}
+
+fn fully_corrective_refit(
+    refit: &RefitSpec,
+    problem: &RefitProblem<'_, '_>,
+    trees: &mut [(f32, ObliviousTree)],
+    raw: &mut [f32],
+) -> Result<(), PbError> {
+    let RefitSpec::Ridge { l2, max_iter, .. } = refit else {
+        return Ok(());
+    };
+    if trees.is_empty() {
+        return Ok(());
+    }
+    let memberships = leaf_memberships(problem.x, trees)?;
+    let n_trees = trees.len();
+    let n_cols = n_trees.checked_mul(8).ok_or_else(|| PbError::Internal {
+        what: "refit column count overflow".into(),
+    })?;
+    let mut gh = GradHess::default();
+    for _ in 0..*max_iter {
+        problem
+            .spec
+            .loss
+            .grad_hess(problem.y, raw, problem.weight, &mut gh)?;
+        let (normal, rhs) = refit_normal_equations(
+            problem,
+            &gh,
+            raw,
+            trees,
+            &memberships,
+            n_cols,
+            f64::from(*l2),
+        )?;
+        let target = solve_refit_system(&normal, &rhs, n_cols)?;
+        let current = collect_leaf_theta(trees, n_cols)?;
+        let current_deviance =
+            f64::from(problem.spec.loss.deviance(problem.y, raw, problem.weight)?);
+        let mut step = 1.0_f64;
+        let mut accepted: Option<(Vec<f64>, Vec<f32>, f64)> = None;
+        for _ in 0..REFIT_MAX_BACKTRACKS {
+            let candidate_theta = interpolate_theta(&current, &target, step)?;
+            let candidate_raw = raw_from_theta(
+                problem.offset,
+                problem.f0,
+                trees,
+                &memberships,
+                &candidate_theta,
+            )?;
+            let deviance = f64::from(problem.spec.loss.deviance(
+                problem.y,
+                &candidate_raw,
+                problem.weight,
+            )?);
+            if deviance.is_finite()
+                && deviance <= current_deviance + REFIT_ACCEPT_TOL * (1.0 + current_deviance.abs())
+            {
+                accepted = Some((candidate_theta, candidate_raw, deviance));
+                break;
+            }
+            step *= 0.5;
+        }
+        let Some((theta, candidate_raw, accepted_deviance)) = accepted else {
+            break;
+        };
+        write_leaf_theta(trees, &theta)?;
+        if raw.len() != candidate_raw.len() {
+            return Err(PbError::Internal {
+                what: "refit raw length changed".into(),
+            });
+        }
+        for (dst, src) in raw.iter_mut().zip(candidate_raw) {
+            *dst = src;
+        }
+        if (current_deviance - accepted_deviance).abs()
+            <= REFIT_ACCEPT_TOL * (1.0 + current_deviance.abs())
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn leaf_memberships(x: &BinnedMatrix, trees: &[(f32, ObliviousTree)]) -> Result<Vec<u8>, PbError> {
+    let n_rows = x.n_rows as usize;
+    let n_trees = trees.len();
+    let cells = n_rows
+        .checked_mul(n_trees)
+        .ok_or_else(|| PbError::Internal {
+            what: "leaf membership shape overflow".into(),
+        })?;
+    let mut memberships: Vec<u8> = crate::engine::Hist::try_zeroed_vec(cells, "leaf membership")?;
+    for row in 0..n_rows {
+        for (tree_idx, (_, tree)) in trees.iter().enumerate() {
+            let leaf =
+                u8::try_from(leaf_index_for_row(tree, x, row)?).map_err(|_| PbError::Internal {
+                    what: "leaf index exceeded u8".into(),
+                })?;
+            let slot = membership_offset(row, tree_idx, n_trees)?;
+            *memberships.get_mut(slot).ok_or_else(|| PbError::Internal {
+                what: "leaf membership offset escaped".into(),
+            })? = leaf;
+        }
+    }
+    Ok(memberships)
+}
+
+fn membership_offset(row: usize, tree_idx: usize, n_trees: usize) -> Result<usize, PbError> {
+    row.checked_mul(n_trees)
+        .and_then(|o| o.checked_add(tree_idx))
+        .ok_or_else(|| PbError::Internal {
+            what: "leaf membership offset overflow".into(),
+        })
+}
+
+fn refit_col(tree_idx: usize, leaf: usize) -> Result<usize, PbError> {
+    tree_idx
+        .checked_mul(8)
+        .and_then(|o| o.checked_add(leaf))
+        .ok_or_else(|| PbError::Internal {
+            what: "refit column offset overflow".into(),
+        })
+}
+
+fn leaf_from_membership(
+    memberships: &[u8],
+    row: usize,
+    tree_idx: usize,
+    n_trees: usize,
+) -> Result<usize, PbError> {
+    let offset = membership_offset(row, tree_idx, n_trees)?;
+    let leaf = usize::from(*memberships.get(offset).ok_or_else(|| PbError::Internal {
+        what: "leaf membership lookup escaped".into(),
+    })?);
+    if leaf >= 8 {
+        return Err(PbError::Internal {
+            what: "leaf membership value escaped 0..8".into(),
+        });
+    }
+    Ok(leaf)
+}
+
+fn base_raw(offset: Option<&[f32]>, f0: f32, row: usize) -> Result<f64, PbError> {
+    let mut out = f64::from(f0);
+    if let Some(off) = offset {
+        out += f64::from(*off.get(row).ok_or_else(|| PbError::Internal {
+            what: "refit offset row escaped".into(),
+        })?);
+    }
+    Ok(out)
+}
+
+fn refit_normal_equations(
+    problem: &RefitProblem<'_, '_>,
+    gh: &GradHess,
+    raw: &[f32],
+    trees: &[(f32, ObliviousTree)],
+    memberships: &[u8],
+    n_cols: usize,
+    l2: f64,
+) -> Result<(Vec<f64>, Vec<f64>), PbError> {
+    let n_rows = raw.len();
+    if gh.g.len() != n_rows || gh.h.len() != n_rows {
+        return Err(PbError::ShapeMismatch {
+            what: "refit GradHess length does not match raw".into(),
+        });
+    }
+    let cells = n_cols
+        .checked_mul(n_cols)
+        .ok_or_else(|| PbError::Internal {
+            what: "refit normal matrix shape overflow".into(),
+        })?;
+    let mut normal: Vec<f64> = crate::engine::Hist::try_zeroed_vec(cells, "refit normal matrix")?;
+    let mut rhs: Vec<f64> = crate::engine::Hist::try_zeroed_vec(n_cols, "refit rhs")?;
+    let n_trees = trees.len();
+    for row in 0..n_rows {
+        let g = f64::from(*gh.g.get(row).ok_or_else(|| PbError::Internal {
+            what: "refit gradient row escaped".into(),
+        })?);
+        let h = f64::from(*gh.h.get(row).ok_or_else(|| PbError::Internal {
+            what: "refit hessian row escaped".into(),
+        })?);
+        if !g.is_finite() || !h.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: "refit gradients must be finite".into(),
+            });
+        }
+        if h <= 0.0 {
+            continue;
+        }
+        let z_centered = f64::from(*raw.get(row).ok_or_else(|| PbError::Internal {
+            what: "refit raw row escaped".into(),
+        })?) - g / h
+            - base_raw(problem.offset, problem.f0, row)?;
+        for (a_idx, (alpha_a, _)) in trees.iter().enumerate() {
+            let alpha_a = f64::from(*alpha_a);
+            if !alpha_a.is_finite() {
+                return Err(PbError::InvalidInput {
+                    what: "refit tree alpha must be finite".into(),
+                });
+            }
+            let col_a = refit_col(
+                a_idx,
+                leaf_from_membership(memberships, row, a_idx, n_trees)?,
+            )?;
+            add_vec(&mut rhs, col_a, h * alpha_a * z_centered)?;
+            for (b_idx, (alpha_b, _)) in trees.iter().enumerate() {
+                let alpha_b = f64::from(*alpha_b);
+                if !alpha_b.is_finite() {
+                    return Err(PbError::InvalidInput {
+                        what: "refit tree alpha must be finite".into(),
+                    });
+                }
+                let col_b = refit_col(
+                    b_idx,
+                    leaf_from_membership(memberships, row, b_idx, n_trees)?,
+                )?;
+                add_matrix(&mut normal, n_cols, col_a, col_b, h * alpha_a * alpha_b)?;
+            }
+        }
+    }
+    for col in 0..n_cols {
+        add_matrix(&mut normal, n_cols, col, col, l2)?;
+    }
+    Ok((normal, rhs))
+}
+
+fn raw_from_theta(
+    offset: Option<&[f32]>,
+    f0: f32,
+    trees: &[(f32, ObliviousTree)],
+    memberships: &[u8],
+    theta: &[f64],
+) -> Result<Vec<f32>, PbError> {
+    let n_trees = trees.len();
+    let n_rows = if n_trees == 0 {
+        0
+    } else {
+        memberships
+            .len()
+            .checked_div(n_trees)
+            .ok_or_else(|| PbError::Internal {
+                what: "refit membership row count overflow".into(),
+            })?
+    };
+    let mut out: Vec<f32> = crate::engine::Hist::try_zeroed_vec(n_rows, "refit raw")?;
+    for row in 0..n_rows {
+        let mut score = base_raw(offset, f0, row)?;
+        for (tree_idx, (alpha, _)) in trees.iter().enumerate() {
+            let leaf = leaf_from_membership(memberships, row, tree_idx, n_trees)?;
+            let col = refit_col(tree_idx, leaf)?;
+            score += f64::from(*alpha)
+                * *theta.get(col).ok_or_else(|| PbError::Internal {
+                    what: "refit theta lookup escaped".into(),
+                })?;
+        }
+        if !score.is_finite() || score < f64::from(f32::MIN) || score > f64::from(f32::MAX) {
+            return Err(PbError::InvalidInput {
+                what: "refit raw score is not finite/representable as f32".into(),
+            });
+        }
+        *out.get_mut(row).ok_or_else(|| PbError::Internal {
+            what: "refit raw write escaped".into(),
+        })? = score as f32;
+    }
+    Ok(out)
+}
+
+fn collect_leaf_theta(trees: &[(f32, ObliviousTree)], n_cols: usize) -> Result<Vec<f64>, PbError> {
+    let mut theta: Vec<f64> = Vec::new();
+    theta
+        .try_reserve_exact(n_cols)
+        .map_err(|_| PbError::Internal {
+            what: "refit theta allocation failed".into(),
+        })?;
+    for (_, tree) in trees {
+        for &leaf in &tree.leaves {
+            theta.push(f64::from(leaf));
+        }
+    }
+    if theta.len() != n_cols {
+        return Err(PbError::Internal {
+            what: "refit theta length mismatch".into(),
+        });
+    }
+    Ok(theta)
+}
+
+fn interpolate_theta(current: &[f64], target: &[f64], step: f64) -> Result<Vec<f64>, PbError> {
+    if current.len() != target.len() {
+        return Err(PbError::ShapeMismatch {
+            what: "refit theta interpolation length mismatch".into(),
+        });
+    }
+    let mut out: Vec<f64> = Vec::new();
+    out.try_reserve_exact(current.len())
+        .map_err(|_| PbError::Internal {
+            what: "refit theta interpolation allocation failed".into(),
+        })?;
+    for (&a, &b) in current.iter().zip(target) {
+        out.push(a + step * (b - a));
+    }
+    Ok(out)
+}
+
+fn write_leaf_theta(trees: &mut [(f32, ObliviousTree)], theta: &[f64]) -> Result<(), PbError> {
+    for (tree_idx, (_, tree)) in trees.iter_mut().enumerate() {
+        for leaf in 0..8usize {
+            let col = refit_col(tree_idx, leaf)?;
+            let value = *theta.get(col).ok_or_else(|| PbError::Internal {
+                what: "refit theta write lookup escaped".into(),
+            })?;
+            if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+                return Err(PbError::InvalidInput {
+                    what: "refit leaf value is not finite/representable as f32".into(),
+                });
+            }
+            *tree.leaves.get_mut(leaf).ok_or_else(|| PbError::Internal {
+                what: "refit leaf write escaped".into(),
+            })? = value as f32;
+        }
+    }
+    Ok(())
+}
+
+fn matrix_offset(n: usize, row: usize, col: usize) -> Result<usize, PbError> {
+    if row >= n || col >= n {
+        return Err(PbError::Internal {
+            what: "matrix coordinate out of range".into(),
+        });
+    }
+    row.checked_mul(n)
+        .and_then(|o| o.checked_add(col))
+        .ok_or_else(|| PbError::Internal {
+            what: "matrix offset overflow".into(),
+        })
+}
+
+fn matrix_get(a: &[f64], n: usize, row: usize, col: usize) -> Result<f64, PbError> {
+    let offset = matrix_offset(n, row, col)?;
+    a.get(offset).copied().ok_or_else(|| PbError::Internal {
+        what: "matrix lookup escaped".into(),
+    })
+}
+
+fn matrix_set(a: &mut [f64], n: usize, row: usize, col: usize, value: f64) -> Result<(), PbError> {
+    let offset = matrix_offset(n, row, col)?;
+    *a.get_mut(offset).ok_or_else(|| PbError::Internal {
+        what: "matrix write escaped".into(),
+    })? = value;
+    Ok(())
+}
+
+fn add_matrix(a: &mut [f64], n: usize, row: usize, col: usize, delta: f64) -> Result<(), PbError> {
+    let offset = matrix_offset(n, row, col)?;
+    let slot = a.get_mut(offset).ok_or_else(|| PbError::Internal {
+        what: "matrix add escaped".into(),
+    })?;
+    *slot += delta;
+    Ok(())
+}
+
+fn add_vec(v: &mut [f64], idx: usize, delta: f64) -> Result<(), PbError> {
+    let slot = v.get_mut(idx).ok_or_else(|| PbError::Internal {
+        what: "vector add escaped".into(),
+    })?;
+    *slot += delta;
+    Ok(())
+}
+
+fn clone_f64_slice(input: &[f64], what: &'static str) -> Result<Vec<f64>, PbError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(input.len())
+        .map_err(|_| PbError::Internal {
+            what: format!("{what} allocation failed"),
+        })?;
+    out.extend_from_slice(input);
+    Ok(out)
+}
+
+fn solve_refit_system(normal: &[f64], rhs: &[f64], n: usize) -> Result<Vec<f64>, PbError> {
+    if rhs.len() != n {
+        return Err(PbError::ShapeMismatch {
+            what: "refit rhs length mismatch".into(),
+        });
+    }
+    if normal.len()
+        != n.checked_mul(n).ok_or_else(|| PbError::Internal {
+            what: "refit solve shape overflow".into(),
+        })?
+    {
+        return Err(PbError::ShapeMismatch {
+            what: "refit normal matrix length mismatch".into(),
+        });
+    }
+    let mut diag_scale = 1.0_f64;
+    for i in 0..n {
+        diag_scale = diag_scale.max(matrix_get(normal, n, i, i)?.abs());
+    }
+    for jitter in REFIT_CHOLESKY_JITTERS {
+        let mut a = clone_f64_slice(normal, "refit solve matrix")?;
+        if jitter > 0.0 {
+            for i in 0..n {
+                add_matrix(&mut a, n, i, i, jitter * diag_scale)?;
+            }
+        }
+        if let Some(solution) = cholesky_solve(&a, rhs, n)? {
+            return Ok(solution);
+        }
+    }
+    Err(PbError::InvalidInput {
+        what: "refit normal equations are not positive definite".into(),
+    })
+}
+
+fn cholesky_solve(a: &[f64], rhs: &[f64], n: usize) -> Result<Option<Vec<f64>>, PbError> {
+    let cells = n.checked_mul(n).ok_or_else(|| PbError::Internal {
+        what: "Cholesky matrix shape overflow".into(),
+    })?;
+    let mut l: Vec<f64> = crate::engine::Hist::try_zeroed_vec(cells, "Cholesky factor")?;
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = matrix_get(a, n, i, j)?;
+            for k in 0..j {
+                sum -= matrix_get(&l, n, i, k)? * matrix_get(&l, n, j, k)?;
+            }
+            if i == j {
+                if sum <= 0.0 || !sum.is_finite() {
+                    return Ok(None);
+                }
+                matrix_set(&mut l, n, i, j, sum.sqrt())?;
+            } else {
+                let diag = matrix_get(&l, n, j, j)?;
+                if diag <= 0.0 || !diag.is_finite() {
+                    return Ok(None);
+                }
+                matrix_set(&mut l, n, i, j, sum / diag)?;
+            }
+        }
+    }
+
+    let mut y: Vec<f64> = crate::engine::Hist::try_zeroed_vec(n, "Cholesky forward solve")?;
+    for i in 0..n {
+        let mut sum = *rhs.get(i).ok_or_else(|| PbError::Internal {
+            what: "Cholesky rhs lookup escaped".into(),
+        })?;
+        for k in 0..i {
+            sum -= matrix_get(&l, n, i, k)?
+                * *y.get(k).ok_or_else(|| PbError::Internal {
+                    what: "Cholesky y lookup escaped".into(),
+                })?;
+        }
+        let diag = matrix_get(&l, n, i, i)?;
+        if diag <= 0.0 || !diag.is_finite() {
+            return Ok(None);
+        }
+        *y.get_mut(i).ok_or_else(|| PbError::Internal {
+            what: "Cholesky y write escaped".into(),
+        })? = sum / diag;
+    }
+
+    let mut x: Vec<f64> = crate::engine::Hist::try_zeroed_vec(n, "Cholesky back solve")?;
+    for i in (0..n).rev() {
+        let mut sum = *y.get(i).ok_or_else(|| PbError::Internal {
+            what: "Cholesky y back lookup escaped".into(),
+        })?;
+        for k in (i + 1)..n {
+            sum -= matrix_get(&l, n, k, i)?
+                * *x.get(k).ok_or_else(|| PbError::Internal {
+                    what: "Cholesky x lookup escaped".into(),
+                })?;
+        }
+        let diag = matrix_get(&l, n, i, i)?;
+        if diag <= 0.0 || !diag.is_finite() {
+            return Ok(None);
+        }
+        *x.get_mut(i).ok_or_else(|| PbError::Internal {
+            what: "Cholesky x write escaped".into(),
+        })? = sum / diag;
+    }
+    Ok(Some(x))
 }
 
 fn inverse_link_f64(link: Link, raw: f64) -> f64 {
@@ -488,6 +1042,16 @@ fn update_raw(raw: &mut [f32], x: &BinnedMatrix, tree: &ObliviousTree) -> Result
 /// Score one row against one tree by column-major reads, folding the leaf index with
 /// the SAME canonical `low_bit` rule as [`ObliviousTree::lookup`] and the grower.
 fn tree_value_for_row(tree: &ObliviousTree, x: &BinnedMatrix, r: usize) -> Result<f32, PbError> {
+    let idx = leaf_index_for_row(tree, x, r)?;
+    tree.leaves
+        .get(idx)
+        .copied()
+        .ok_or_else(|| PbError::Internal {
+            what: "update_raw: leaf index escaped 0..8".into(),
+        })
+}
+
+fn leaf_index_for_row(tree: &ObliviousTree, x: &BinnedMatrix, r: usize) -> Result<usize, PbError> {
     let mut idx = 0usize;
     for (level, split) in tree.splits.iter().enumerate() {
         let bin = *x
@@ -502,12 +1066,12 @@ fn tree_value_for_row(tree: &ObliviousTree, x: &BinnedMatrix, r: usize) -> Resul
             })?;
         idx |= usize::from(low_bit(bin, split.bin_le, split.missing_left)) << level;
     }
-    tree.leaves
-        .get(idx)
-        .copied()
-        .ok_or_else(|| PbError::Internal {
+    if idx >= 8 {
+        return Err(PbError::Internal {
             what: "update_raw: leaf index escaped 0..8".into(),
-        })
+        });
+    }
+    Ok(idx)
 }
 
 #[cfg(test)]
@@ -520,7 +1084,7 @@ mod tests {
         clippy::float_cmp
     )]
     use super::*;
-    use crate::boosters::BoosterConfig;
+    use crate::boosters::{BoosterConfig, RefitSpec};
     use crate::cat::{CatEncoderStore, LeakageScheme, Smooth, TsConfig, TsEncodingId};
     use crate::constraints::MonoSign;
     use crate::data::{
@@ -700,6 +1264,128 @@ mod tests {
         assert!(!b1.is_empty());
         assert_eq!(b1, bytes(2));
         assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn ridge_refit_improves_deviance_and_preserves_exact_determinism() {
+        let n = 180usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 6 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 4 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                (if x0[i] <= 3.0 { -2.0 } else { 2.5 })
+                    + if x1[i] <= 2.0 { 1.25 } else { -0.75 }
+                    + if x2[i] <= 2.0 { 0.5 } else { -0.25 }
+                    + (i % 9) as f32 * 0.02
+            })
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let base_cfg = Config {
+            n_trees: 8,
+            learning_rate: 0.12,
+            lambda: 2.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: Default::default(),
+        };
+        let refit_cfg = Config {
+            boosters: BoosterConfig {
+                refit_leaves: RefitSpec::Ridge {
+                    l2: 1.0e-3,
+                    max_iter: 3,
+                    every_k_trees: None,
+                },
+                ..BoosterConfig::default()
+            },
+            ..base_cfg.clone()
+        };
+        let sqe = SquaredError;
+        let base = Booster::with_config(base_cfg)
+            .fit(&x, &y, &spec(&sqe))
+            .unwrap();
+        let refit = Booster::with_config(refit_cfg.clone())
+            .fit(&x, &y, &spec(&sqe))
+            .unwrap();
+        let w = vec![1.0_f32; y.len()];
+        let base_pred = base.predict_binned(&x, None).unwrap();
+        let refit_pred = refit.predict_binned(&x, None).unwrap();
+        let base_dev = sqe.deviance(&y, &base_pred, &w).unwrap();
+        let refit_dev = sqe.deviance(&y, &refit_pred, &w).unwrap();
+        assert!(
+            refit_dev < base_dev,
+            "refit deviance {refit_dev} should improve base {base_dev}"
+        );
+
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(refit_cfg.clone())
+                    .fit(&x, &y, &spec(&sqe))
+                    .unwrap();
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn ridge_refit_is_near_noop_on_exact_fit() {
+        let n = 64usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 2 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| ((i / 2) % 2 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                (if x0[i] <= 1.0 { -2.0 } else { 3.0 }) + if x1[i] <= 1.0 { 0.5 } else { -1.5 }
+            })
+            .collect();
+        let x = binned(&[x0, x1]);
+        let base_cfg = Config {
+            n_trees: 4,
+            learning_rate: 1.0,
+            lambda: 0.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: Default::default(),
+        };
+        let refit_cfg = Config {
+            boosters: BoosterConfig {
+                refit_leaves: RefitSpec::Ridge {
+                    l2: 0.0,
+                    max_iter: 2,
+                    every_k_trees: Some(2),
+                },
+                ..BoosterConfig::default()
+            },
+            ..base_cfg.clone()
+        };
+        let sqe = SquaredError;
+        let base = Booster::with_config(base_cfg)
+            .fit(&x, &y, &spec(&sqe))
+            .unwrap();
+        let refit = Booster::with_config(refit_cfg)
+            .fit(&x, &y, &spec(&sqe))
+            .unwrap();
+        let base_pred = base.predict_binned(&x, None).unwrap();
+        let refit_pred = refit.predict_binned(&x, None).unwrap();
+        for (a, b) in base_pred.iter().zip(refit_pred) {
+            assert!(
+                (f64::from(*a) - f64::from(b)).abs() < 1.0e-5,
+                "refit moved an exact score: {a} vs {b}"
+            );
+        }
     }
 
     #[test]
