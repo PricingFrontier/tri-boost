@@ -262,13 +262,19 @@ pub struct RatingTable {
 ```
 
 ```rust
-/// Optional per-axis reference selection for the rating-view re-basing. `None`
-/// ⇒ the PURE zero-mean fANOVA export (no re-centering). `Some(map)` ⇒ for each
-/// listed table, the chosen reference cell is re-centered to read 1.000 and the
-/// removed shift is folded into f0 — an EXACT basis re-centering (sum conserved).
+/// Optional per-axis reference selection for the rating-view re-basing. An empty
+/// `reference` ⇒ the PURE zero-mean fANOVA export (no re-centering). A non-empty one
+/// ⇒ for each listed table the chosen reference cell is re-centered to read 1.000 and
+/// the removed shift is folded into f0 — an EXACT basis re-centering (sum conserved).
+///
+/// NOTE: `reference` is a SEQUENCE of (feature_set, coord) entries, NOT a
+/// `BTreeMap<FeatureSet, _>`. A `FeatureSet` serializes as a JSON array, which is not a
+/// valid JSON object key, so a map-keyed form cannot round-trip through `serde_json`
+/// (the canonical wire format / the `basis_json` public API). The sequence form is
+/// JSON-representable; lookups are O(#entries) point matches by sorted raw ids.
+pub struct RatingReference { pub feature_set: Vec<u32>, pub coord: Vec<u32> }
 pub struct RatingBasis {
-    /// Per table (keyed by its FeatureSet), the per-axis reference cell index.
-    pub reference: BTreeMap<FeatureSet, Vec<usize>>,
+    pub reference: Vec<RatingReference>,
 }
 
 impl TableBank {

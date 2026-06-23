@@ -219,14 +219,50 @@ impl Model {
     }
 }
 
+/// One reference-cell selector: a table support (sorted distinct raw feature ids) and
+/// the merged-cell coordinate within that table that should read as neutral.
+///
+/// A flat struct of `Vec<u32>` fields (rather than a `FeatureSet`-keyed map) so the
+/// enclosing [`RatingBasis`] round-trips through JSON — a `FeatureSet` (a sequence) is
+/// not a valid JSON object key, so the former `BTreeMap<FeatureSet, _>` could not be
+/// authored as `basis_json` through the public Python API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RatingReference {
+    /// The table support, as sorted distinct raw feature ids.
+    pub feature_set: Vec<u32>,
+    /// The reference coordinate within that table (one merged-cell id per axis).
+    pub coord: Vec<u32>,
+}
+
 /// Optional reference-cell selector for rating-view exports. Each entry identifies a
 /// table support and the coordinate within that table that should read as neutral
 /// (`0.0` in score space, `1.000` as a log-link relativity). The shifted mass is
 /// folded into the exported intercept, so reconstructed scores are unchanged.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RatingBasis {
-    /// Per-table reference coordinates keyed by feature set.
-    pub reference: BTreeMap<FeatureSet, Vec<u32>>,
+    /// Per-table reference coordinates. JSON-representable (a sequence of entries, not a
+    /// non-string-keyed map).
+    pub reference: Vec<RatingReference>,
+}
+
+impl RatingBasis {
+    /// The reference coordinate for a table support `u`, matched by its sorted raw ids.
+    #[must_use]
+    pub fn coord_for(&self, u: &FeatureSet) -> Option<&[u32]> {
+        self.reference.iter().find_map(|entry| {
+            let matches = entry.feature_set.len() == u.0.len()
+                && entry
+                    .feature_set
+                    .iter()
+                    .zip(u.0.iter())
+                    .all(|(&f, raw)| f == raw.0);
+            if matches {
+                Some(entry.coord.as_slice())
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// One exported rating-table axis.
@@ -311,7 +347,7 @@ impl TableBank {
         let mut tables = Vec::with_capacity(self.tables.len());
         for table in &self.tables {
             let mut values = table.values.clone();
-            if let Some(coord) = basis.and_then(|b| b.reference.get(&table.u)) {
+            if let Some(coord) = basis.and_then(|b| b.coord_for(&table.u)) {
                 if coord.len() != table.u.order() {
                     return Err(PbError::ShapeMismatch {
                         what: format!(
@@ -407,7 +443,6 @@ mod tests {
     use super::*;
     use crate::engine::ExactnessMode;
     use crate::explain::{fixture_serve, RefMeasure};
-    use std::collections::BTreeMap;
 
     #[test]
     fn bincode_round_trip_is_bit_identical() {
@@ -543,8 +578,14 @@ mod tests {
         let coord = vec![0_u32; first.u.order()];
         let shift = first.values.at(&vec![0_usize; first.u.order()]).unwrap();
         let basis = RatingBasis {
-            reference: BTreeMap::from([(first.u.clone(), coord)]),
+            reference: vec![RatingReference {
+                feature_set: first.u.0.iter().map(|f| f.0).collect(),
+                coord,
+            }],
         };
+        // A NON-EMPTY RatingBasis must round-trip through JSON (the public basis_json path).
+        let json = serde_json::to_string(&basis).unwrap();
+        let basis: RatingBasis = serde_json::from_str(&json).unwrap();
         let rebased = bank
             .to_rating_export(model.link, &model.mode, &model.schema, Some(&basis))
             .unwrap();
