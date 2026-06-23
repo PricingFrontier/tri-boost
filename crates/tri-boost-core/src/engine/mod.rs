@@ -703,9 +703,11 @@ impl Default for Sampling {
 }
 
 /// The optimizer configuration (spec §06.1). v1 green-spine subset: the full §06.1
-/// knob set (`colsample_*`, `hist_precision`, credibility floors, `accel`, LR schedule,
-/// early stopping) lands with its features — v1.5 adds row sampling via
-/// [`Sampling::Mvs`]. FLAG: `Config` remains a subset of the full §06.1 type for now.
+/// knob set (`colsample_*`, credibility floors, LR schedule, early stopping) lands
+/// with its features — v1.5 adds row sampling via [`Sampling::Mvs`], quantized
+/// histograms via [`HistPrecision::QuantizedI32`], and §09 registers inert
+/// predictiveness knobs through [`crate::boosters::BoosterConfig`]. FLAG: `Config`
+/// remains a subset of the full §06.1 type for now.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Number of boosting rounds (upper bound; growth also stops if a round can't split).
@@ -724,6 +726,8 @@ pub struct Config {
     pub sampling: Sampling,
     /// Histogram precision used for split search.
     pub hist_precision: HistPrecision,
+    /// Exactness-preserving predictiveness boosters (§09). Defaults are all inert.
+    pub boosters: crate::boosters::BoosterConfig,
 }
 
 impl Default for Config {
@@ -736,6 +740,7 @@ impl Default for Config {
             max_delta_step: None,
             sampling: Sampling::Full,
             hist_precision: HistPrecision::FullF64,
+            boosters: crate::boosters::BoosterConfig::default(),
         }
     }
 }
@@ -795,6 +800,7 @@ impl Config {
                 }
             }
         }
+        self.boosters.validate()?;
         Ok(())
     }
 }

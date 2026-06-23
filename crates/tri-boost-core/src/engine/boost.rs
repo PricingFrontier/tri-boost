@@ -414,6 +414,7 @@ mod tests {
         clippy::float_cmp
     )]
     use super::*;
+    use crate::boosters::BoosterConfig;
     use crate::cat::{CatEncoderStore, LeakageScheme, Smooth, TsConfig, TsEncodingId};
     use crate::constraints::MonoSign;
     use crate::data::{
@@ -468,6 +469,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -500,6 +502,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -531,6 +534,7 @@ mod tests {
                     max_delta_step: None,
                     sampling: Default::default(),
                     hist_precision: Default::default(),
+                    boosters: Default::default(),
                 });
                 let sqe = SquaredError;
                 let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -560,6 +564,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -588,6 +593,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         });
 
         // (1) Constant target ⇒ no split ⇒ 0 trees ⇒ every prediction == f0 == mean.
@@ -636,6 +642,18 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
+        });
+        assert!(matches!(
+            bad.fit(&x, &[1.0, 2.0], &spec(&sqe)),
+            Err(PbError::InvalidConfig { .. })
+        ));
+        let bad = Booster::with_config(Config {
+            boosters: BoosterConfig {
+                random_strength: -1.0,
+                ..BoosterConfig::default()
+            },
+            ..Config::default()
         });
         assert!(matches!(
             bad.fit(&x, &[1.0, 2.0], &spec(&sqe)),
@@ -713,6 +731,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         });
         let sqe = SquaredError;
 
@@ -823,6 +842,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         });
         let model = booster
             .fit_train(&fitted.train, &y, &spec(&sqe), fitted.cat_encoders.clone())
@@ -867,6 +887,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -898,6 +919,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -935,6 +957,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -961,6 +984,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -996,6 +1020,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -1081,6 +1106,7 @@ mod tests {
                 min_rows: 40,
             },
             hist_precision: Default::default(),
+            boosters: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {
@@ -1122,6 +1148,7 @@ mod tests {
             max_delta_step: None,
             sampling: Sampling::Full,
             hist_precision: HistPrecision::QuantizedI32,
+            boosters: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {

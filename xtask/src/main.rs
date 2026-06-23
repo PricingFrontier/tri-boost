@@ -201,6 +201,7 @@ fn run_accuracy_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
             min_rows: 96,
         },
         hist_precision: HistPrecision::QuantizedI32,
+        boosters: Default::default(),
     });
     let spec = FitSpec {
         loss: &loss,

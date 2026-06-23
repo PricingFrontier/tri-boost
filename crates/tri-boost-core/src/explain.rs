@@ -2250,6 +2250,7 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            boosters: Default::default(),
         }
     }
 

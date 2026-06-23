@@ -158,6 +158,7 @@ impl PyBooster {
             max_delta_step,
             sampling: Sampling::Full,
             hist_precision: Default::default(),
+            boosters: Default::default(),
         };
         config.validate().map_err(py_err)?;
         let bin_config = BinConfig {

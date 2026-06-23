@@ -38,6 +38,7 @@ fn cfg() -> Config {
         max_delta_step: None,
         sampling: Default::default(),
         hist_precision: Default::default(),
+        boosters: Default::default(),
     }
 }
 
@@ -119,6 +120,7 @@ fn poisson_default_fit_is_max_delta_step_stabilized() {
         max_delta_step: None, // ⇒ falls back to Poisson's Some(0.7)
         sampling: Default::default(),
         hist_precision: Default::default(),
+        boosters: Default::default(),
     })
     .fit(&x, &y, &spec(&Poisson, None))
     .unwrap();
