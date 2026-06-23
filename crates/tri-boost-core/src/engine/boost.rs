@@ -22,7 +22,7 @@
 //! between the two scorers (same `low_bit` routing); only the accumulation width differs.
 
 use crate::backend::{pb_rng, pb_seed, Stage};
-use crate::boosters::{DartSpec, NesterovSpec, RefitSpec};
+use crate::boosters::{DartSpec, EnsembleSpec, HpGrid, NesterovSpec, RefitSpec};
 use crate::cat::CatEncoderStore;
 use crate::constraints::MonoSign;
 use crate::data::{compute_offset, BinnedMatrix};
@@ -204,6 +204,35 @@ fn validate_binned_matrix(x: &BinnedMatrix) -> Result<(), PbError> {
 /// [`PbError::InvalidConfig`] on a bad config; [`PbError::ShapeMismatch`] on a
 /// `y`/`weight` length mismatch; plus any propagated `Loss`/binning/grow error.
 pub(crate) fn fit(
+    config: &Config,
+    x: &BinnedMatrix,
+    y: &[f32],
+    spec: &FitSpec,
+) -> Result<Model, PbError> {
+    match &config.boosters.ensemble {
+        EnsembleSpec::Off => fit_single(config, x, y, spec),
+        EnsembleSpec::OuterBag { n_bags } => fit_outer_bag(config, x, y, spec, *n_bags),
+        EnsembleSpec::GreedySelect {
+            library_size,
+            hp_grid,
+            selection_bags,
+            seed_top_n,
+        } => fit_greedy_select(
+            config,
+            x,
+            y,
+            spec,
+            GreedyParams {
+                library_size: *library_size,
+                hp_grid,
+                selection_bags: *selection_bags,
+                seed_top_n: *seed_top_n,
+            },
+        ),
+    }
+}
+
+fn fit_single(
     config: &Config,
     x: &BinnedMatrix,
     y: &[f32],
@@ -453,6 +482,651 @@ pub(crate) fn fit(
         schema,
         schema_version: SCHEMA_VERSION,
     })
+}
+
+const ENSEMBLE_WEIGHT_TOL: f64 = 1.0e-6;
+
+struct OwnedFitData {
+    x: BinnedMatrix,
+    y: Vec<f32>,
+    weight: Option<Vec<f32>>,
+    exposure: Option<Vec<f32>>,
+}
+
+struct WeightedModel {
+    alpha: f64,
+    model: Model,
+}
+
+struct LibraryMember {
+    model: Model,
+    holdout_raw: Vec<f32>,
+    deviance: f64,
+}
+
+struct GreedyParams<'a> {
+    library_size: u16,
+    hp_grid: &'a HpGrid,
+    selection_bags: u16,
+    seed_top_n: u8,
+}
+
+#[derive(Clone, Copy)]
+struct HpChoice {
+    max_bin: u16,
+    lambda: f32,
+    learning_rate: f32,
+    n_trees: u32,
+    max_order: u8,
+    random_strength: f32,
+}
+
+fn ensemble_base_config(config: &Config) -> Config {
+    let mut base = config.clone();
+    base.boosters.ensemble = EnsembleSpec::Off;
+    base
+}
+
+fn validate_ensemble_fit_inputs(
+    config: &Config,
+    x: &BinnedMatrix,
+    y: &[f32],
+    spec: &FitSpec,
+) -> Result<(), PbError> {
+    config.validate()?;
+    validate_fit_spec(spec)?;
+    validate_binned_matrix(x)?;
+    let n = x.n_rows as usize;
+    if y.len() != n {
+        return Err(PbError::ShapeMismatch {
+            what: format!("y len {} != n_rows {n}", y.len()),
+        });
+    }
+    if let Some(weight) = spec.weight {
+        if weight.len() != n {
+            return Err(PbError::ShapeMismatch {
+                what: format!("weight len {} != n_rows {n}", weight.len()),
+            });
+        }
+    }
+    if let Some(exposure) = spec.exposure {
+        if exposure.len() != n {
+            return Err(PbError::ShapeMismatch {
+                what: format!("exposure len {} != n_rows {n}", exposure.len()),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn fit_outer_bag(
+    config: &Config,
+    x: &BinnedMatrix,
+    y: &[f32],
+    spec: &FitSpec,
+    n_bags: u16,
+) -> Result<Model, PbError> {
+    validate_ensemble_fit_inputs(config, x, y, spec)?;
+    let base_config = ensemble_base_config(config);
+    if n_bags == 1 {
+        return fit_single(&base_config, x, y, spec);
+    }
+
+    let n_rows = x.n_rows as usize;
+    let mut members = Vec::new();
+    members
+        .try_reserve_exact(usize::from(n_bags))
+        .map_err(|_| PbError::Internal {
+            what: "OuterBag member allocation failed".into(),
+        })?;
+    let alpha = 1.0_f64 / f64::from(n_bags);
+    for bag in 0..n_bags {
+        let bag_round = u32::from(bag);
+        let rows = bootstrap_rows(spec.seed, bag_round, n_rows, n_rows)?;
+        let data = row_subset(x, y, spec.weight, spec.exposure, &rows)?;
+        let bag_seed = pb_seed(spec.seed, bag_round, Stage::Sample as u32, 0);
+        let bag_spec = FitSpec {
+            loss: spec.loss,
+            weight: data.weight.as_deref(),
+            exposure: data.exposure.as_deref(),
+            monotone: spec.monotone.clone(),
+            interaction: spec.interaction.clone(),
+            seed: bag_seed,
+        };
+        let model = fit_single(&base_config, &data.x, &data.y, &bag_spec)?;
+        members.push(WeightedModel { alpha, model });
+    }
+    soup_models(&members)
+}
+
+fn fit_greedy_select(
+    config: &Config,
+    x: &BinnedMatrix,
+    y: &[f32],
+    spec: &FitSpec,
+    params: GreedyParams<'_>,
+) -> Result<Model, PbError> {
+    validate_ensemble_fit_inputs(config, x, y, spec)?;
+    let base_config = ensemble_base_config(config);
+    let (train_rows, holdout_rows) = holdout_split(spec.seed, x.n_rows as usize)?;
+    let train = row_subset(x, y, spec.weight, spec.exposure, &train_rows)?;
+    let holdout = row_subset(x, y, spec.weight, spec.exposure, &holdout_rows)?;
+    let holdout_weight = effective_weight(&holdout);
+
+    let library_size = usize::from(params.library_size);
+    let mut library = Vec::new();
+    library
+        .try_reserve_exact(library_size)
+        .map_err(|_| PbError::Internal {
+            what: "GreedySelect library allocation failed".into(),
+        })?;
+    for ordinal in 0..params.library_size {
+        let choice = hp_choice_at(params.hp_grid, usize::from(ordinal))?;
+        let mut member_config = base_config.clone();
+        member_config.lambda = choice.lambda;
+        member_config.learning_rate = choice.learning_rate;
+        member_config.n_trees = choice.n_trees;
+        member_config.boosters.random_strength = choice.random_strength;
+        member_config.validate()?;
+
+        let mut interaction = spec.interaction.clone();
+        interaction.max_order = choice.max_order;
+        // FLAG (M4/M5 seam): this core entrypoint consumes a frozen BinnedMatrix, so
+        // HpGrid::max_bins cannot rebuild raw-data grids here. It is still validated
+        // by BoosterConfig and folded into the deterministic member seed; raw callers
+        // can materialize distinct grids before crossing this binned seam.
+        let hp_block = u32::from(choice.max_bin)
+            .checked_add(u32::from(ordinal))
+            .ok_or_else(|| PbError::Internal {
+                what: "GreedySelect HP seed block overflow".into(),
+            })?;
+        let member_seed = pb_seed(
+            spec.seed,
+            u32::from(ordinal),
+            Stage::Sample as u32,
+            hp_block,
+        );
+        let member_spec = FitSpec {
+            loss: spec.loss,
+            weight: train.weight.as_deref(),
+            exposure: train.exposure.as_deref(),
+            monotone: spec.monotone.clone(),
+            interaction,
+            seed: member_seed,
+        };
+        let model = fit_single(&member_config, &train.x, &train.y, &member_spec)?;
+        let holdout_raw = raw_predictions(&model, &holdout.x)?;
+        let deviance = f64::from(
+            spec.loss
+                .deviance(&holdout.y, &holdout_raw, &holdout_weight)?,
+        );
+        library.push(LibraryMember {
+            model,
+            holdout_raw,
+            deviance,
+        });
+    }
+
+    let weights = greedy_selection_weights(
+        &library,
+        &holdout.y,
+        &holdout_weight,
+        spec.loss,
+        spec.seed,
+        usize::from(params.selection_bags),
+        usize::from(params.seed_top_n),
+    )?;
+    let mut members = Vec::new();
+    members
+        .try_reserve_exact(library.len())
+        .map_err(|_| PbError::Internal {
+            what: "GreedySelect soup allocation failed".into(),
+        })?;
+    for (alpha, member) in weights.into_iter().zip(library) {
+        if alpha > 0.0 {
+            members.push(WeightedModel {
+                alpha,
+                model: member.model,
+            });
+        }
+    }
+    soup_models(&members)
+}
+
+fn row_subset(
+    x: &BinnedMatrix,
+    y: &[f32],
+    weight: Option<&[f32]>,
+    exposure: Option<&[f32]>,
+    rows: &[u32],
+) -> Result<OwnedFitData, PbError> {
+    let n_rows = u32::try_from(rows.len()).map_err(|_| PbError::InvalidInput {
+        what: "row subset has more than u32::MAX rows".into(),
+    })?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(x.data.len())
+        .map_err(|_| PbError::Internal {
+            what: "row subset column allocation failed".into(),
+        })?;
+    for col in &x.data {
+        let mut out = Vec::new();
+        out.try_reserve_exact(rows.len())
+            .map_err(|_| PbError::Internal {
+                what: "row subset data allocation failed".into(),
+            })?;
+        for &row in rows {
+            let idx = row as usize;
+            out.push(*col.get(idx).ok_or_else(|| PbError::Internal {
+                what: "row subset escaped binned column".into(),
+            })?);
+        }
+        data.push(out);
+    }
+    Ok(OwnedFitData {
+        x: BinnedMatrix {
+            data,
+            n_rows,
+            grids: x.grids.clone(),
+            provenance: x.provenance.clone(),
+        },
+        y: gather_f32("y", y, rows)?,
+        weight: match weight {
+            Some(values) => Some(gather_f32("weight", values, rows)?),
+            None => None,
+        },
+        exposure: match exposure {
+            Some(values) => Some(gather_f32("exposure", values, rows)?),
+            None => None,
+        },
+    })
+}
+
+fn gather_f32(label: &'static str, values: &[f32], rows: &[u32]) -> Result<Vec<f32>, PbError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(rows.len())
+        .map_err(|_| PbError::Internal {
+            what: format!("{label} subset allocation failed"),
+        })?;
+    for &row in rows {
+        out.push(*values.get(row as usize).ok_or_else(|| PbError::Internal {
+            what: format!("{label} subset escaped source rows"),
+        })?);
+    }
+    Ok(out)
+}
+
+fn bootstrap_rows(
+    seed: u64,
+    round: u32,
+    n_rows: usize,
+    sample_len: usize,
+) -> Result<Vec<u32>, PbError> {
+    if n_rows == 0 {
+        return Ok(Vec::new());
+    }
+    let n_u64 = u64::try_from(n_rows).map_err(|_| PbError::InvalidInput {
+        what: "bootstrap supports at most u64::MAX rows".into(),
+    })?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(sample_len)
+        .map_err(|_| PbError::Internal {
+            what: "bootstrap row allocation failed".into(),
+        })?;
+    for i in 0..sample_len {
+        let block = u32::try_from(i).map_err(|_| PbError::InvalidInput {
+            what: "bootstrap supports at most u32::MAX sampled rows".into(),
+        })?;
+        let row = pb_seed(seed, round, Stage::Sample as u32, block) % n_u64;
+        rows.push(u32::try_from(row).map_err(|_| PbError::Internal {
+            what: "bootstrap row exceeded u32".into(),
+        })?);
+    }
+    Ok(rows)
+}
+
+fn holdout_split(seed: u64, n_rows: usize) -> Result<(Vec<u32>, Vec<u32>), PbError> {
+    if n_rows < 2 {
+        return Err(PbError::InvalidInput {
+            what: "GreedySelect requires at least two rows for a held-out deviance split".into(),
+        });
+    }
+    let mut keyed = Vec::new();
+    keyed
+        .try_reserve_exact(n_rows)
+        .map_err(|_| PbError::Internal {
+            what: "holdout split allocation failed".into(),
+        })?;
+    for row in 0..n_rows {
+        let row_u32 = u32::try_from(row).map_err(|_| PbError::InvalidInput {
+            what: "GreedySelect supports at most u32::MAX rows".into(),
+        })?;
+        keyed.push((pb_seed(seed, 0, Stage::Sample as u32, row_u32), row_u32));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let holdout_len = (n_rows / 5).max(1).min(n_rows - 1);
+    let mut holdout: Vec<u32> = keyed
+        .iter()
+        .take(holdout_len)
+        .map(|(_, row)| *row)
+        .collect();
+    let mut train: Vec<u32> = keyed
+        .iter()
+        .skip(holdout_len)
+        .map(|(_, row)| *row)
+        .collect();
+    holdout.sort_unstable();
+    train.sort_unstable();
+    Ok((train, holdout))
+}
+
+fn effective_weight(data: &OwnedFitData) -> Vec<f32> {
+    data.weight
+        .clone()
+        .unwrap_or_else(|| vec![1.0_f32; data.y.len()])
+}
+
+fn hp_choice_at(grid: &HpGrid, ordinal: usize) -> Result<HpChoice, PbError> {
+    fn take<T: Copy>(values: &[T], cursor: &mut usize) -> Result<T, PbError> {
+        if values.is_empty() {
+            return Err(PbError::InvalidConfig {
+                what: "HpGrid candidate lists must be non-empty".into(),
+            });
+        }
+        let idx = *cursor % values.len();
+        *cursor /= values.len();
+        values.get(idx).copied().ok_or_else(|| PbError::Internal {
+            what: "HpGrid index escaped candidate list".into(),
+        })
+    }
+
+    let mut cursor = ordinal;
+    Ok(HpChoice {
+        max_bin: take(&grid.max_bins, &mut cursor)?,
+        lambda: take(&grid.lambdas, &mut cursor)?,
+        learning_rate: take(&grid.learning_rates, &mut cursor)?,
+        n_trees: take(&grid.n_trees, &mut cursor)?,
+        max_order: take(&grid.max_interaction_orders, &mut cursor)?,
+        random_strength: take(&grid.random_strengths, &mut cursor)?,
+    })
+}
+
+fn raw_predictions(model: &Model, x: &BinnedMatrix) -> Result<Vec<f32>, PbError> {
+    let mut raw = vec![0.0_f32; x.n_rows as usize];
+    model.score_trees(x, None, &mut raw)?;
+    Ok(raw)
+}
+
+fn greedy_selection_weights(
+    library: &[LibraryMember],
+    y: &[f32],
+    weight: &[f32],
+    loss: &dyn crate::loss::Loss,
+    seed: u64,
+    selection_bags: usize,
+    seed_top_n: usize,
+) -> Result<Vec<f64>, PbError> {
+    if library.is_empty() {
+        return Err(PbError::InvalidConfig {
+            what: "GreedySelect requires at least one library member".into(),
+        });
+    }
+    if selection_bags == 0 || seed_top_n == 0 || seed_top_n > library.len() {
+        return Err(PbError::InvalidConfig {
+            what: "GreedySelect selection_bags and seed_top_n are inconsistent".into(),
+        });
+    }
+    let mut order: Vec<usize> = (0..library.len()).collect();
+    order.sort_by(|&a, &b| {
+        library
+            .get(a)
+            .map(|m| m.deviance)
+            .unwrap_or(f64::INFINITY)
+            .total_cmp(&library.get(b).map(|m| m.deviance).unwrap_or(f64::INFINITY))
+            .then_with(|| a.cmp(&b))
+    });
+    let mut totals = vec![0.0_f64; library.len()];
+    for bag in 0..selection_bags {
+        let eval = bootstrap_indices(
+            seed,
+            u32::try_from(bag).map_err(|_| PbError::InvalidInput {
+                what: "GreedySelect supports at most u32::MAX selection bags".into(),
+            })?,
+            y.len(),
+        )?;
+        let mut counts = vec![0u32; library.len()];
+        let mut best_seed = *order.first().ok_or_else(|| PbError::Internal {
+            what: "GreedySelect empty ordering".into(),
+        })?;
+        let mut best_loss = f64::INFINITY;
+        for &candidate in order.iter().take(seed_top_n) {
+            let score = deviance_for_rows(
+                loss,
+                y,
+                &library_member(library, candidate)?.holdout_raw,
+                weight,
+                &eval,
+            )?;
+            if score < best_loss || (score == best_loss && candidate < best_seed) {
+                best_loss = score;
+                best_seed = candidate;
+            }
+        }
+        let mut current = library_member(library, best_seed)?.holdout_raw.clone();
+        let slot = counts.get_mut(best_seed).ok_or_else(|| PbError::Internal {
+            what: "GreedySelect seed escaped counts".into(),
+        })?;
+        *slot = slot.checked_add(1).ok_or_else(|| PbError::Internal {
+            what: "GreedySelect count overflow".into(),
+        })?;
+        for step in 1..library.len() {
+            let denom = (step + 1) as f32;
+            let prior = step as f32;
+            let mut best_candidate = 0usize;
+            let mut best_score = f64::INFINITY;
+            let mut best_raw = Vec::new();
+            for candidate in 0..library.len() {
+                let cand_raw = &library_member(library, candidate)?.holdout_raw;
+                let mixed = mix_raw(&current, prior, cand_raw, denom)?;
+                let score = deviance_for_rows(loss, y, &mixed, weight, &eval)?;
+                if score < best_score || (score == best_score && candidate < best_candidate) {
+                    best_score = score;
+                    best_candidate = candidate;
+                    best_raw = mixed;
+                }
+            }
+            current = best_raw;
+            let slot = counts
+                .get_mut(best_candidate)
+                .ok_or_else(|| PbError::Internal {
+                    what: "GreedySelect candidate escaped counts".into(),
+                })?;
+            *slot = slot.checked_add(1).ok_or_else(|| PbError::Internal {
+                what: "GreedySelect count overflow".into(),
+            })?;
+        }
+        let denom = library.len() as f64;
+        for (total, count) in totals.iter_mut().zip(counts) {
+            *total += f64::from(count) / denom;
+        }
+    }
+    let bags = selection_bags as f64;
+    for total in &mut totals {
+        *total /= bags;
+    }
+    Ok(totals)
+}
+
+fn library_member(library: &[LibraryMember], idx: usize) -> Result<&LibraryMember, PbError> {
+    library.get(idx).ok_or_else(|| PbError::Internal {
+        what: "GreedySelect library index escaped".into(),
+    })
+}
+
+fn bootstrap_indices(seed: u64, round: u32, n: usize) -> Result<Vec<usize>, PbError> {
+    if n == 0 {
+        return Err(PbError::InvalidInput {
+            what: "GreedySelect holdout set must be non-empty".into(),
+        });
+    }
+    let n_u64 = u64::try_from(n).map_err(|_| PbError::InvalidInput {
+        what: "GreedySelect holdout size exceeded u64".into(),
+    })?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(n).map_err(|_| PbError::Internal {
+        what: "GreedySelect bootstrap allocation failed".into(),
+    })?;
+    for i in 0..n {
+        let block = u32::try_from(i).map_err(|_| PbError::InvalidInput {
+            what: "GreedySelect bootstrap supports at most u32::MAX rows".into(),
+        })?;
+        let idx = pb_seed(seed, round, Stage::Sample as u32, block) % n_u64;
+        out.push(usize::try_from(idx).map_err(|_| PbError::Internal {
+            what: "GreedySelect bootstrap index exceeded usize".into(),
+        })?);
+    }
+    Ok(out)
+}
+
+fn mix_raw(left: &[f32], left_scale: f32, right: &[f32], denom: f32) -> Result<Vec<f32>, PbError> {
+    if left.len() != right.len() {
+        return Err(PbError::ShapeMismatch {
+            what: "GreedySelect raw vectors have different lengths".into(),
+        });
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(left.len())
+        .map_err(|_| PbError::Internal {
+            what: "GreedySelect raw mix allocation failed".into(),
+        })?;
+    for (&a, &b) in left.iter().zip(right) {
+        let value = (left_scale * a + b) / denom;
+        if !value.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: "GreedySelect mixed raw score is not finite".into(),
+            });
+        }
+        out.push(value);
+    }
+    Ok(out)
+}
+
+fn deviance_for_rows(
+    loss: &dyn crate::loss::Loss,
+    y: &[f32],
+    raw: &[f32],
+    weight: &[f32],
+    rows: &[usize],
+) -> Result<f64, PbError> {
+    let mut y_sub = Vec::new();
+    let mut raw_sub = Vec::new();
+    let mut weight_sub = Vec::new();
+    y_sub
+        .try_reserve_exact(rows.len())
+        .map_err(|_| PbError::Internal {
+            what: "GreedySelect y eval allocation failed".into(),
+        })?;
+    raw_sub
+        .try_reserve_exact(rows.len())
+        .map_err(|_| PbError::Internal {
+            what: "GreedySelect raw eval allocation failed".into(),
+        })?;
+    weight_sub
+        .try_reserve_exact(rows.len())
+        .map_err(|_| PbError::Internal {
+            what: "GreedySelect weight eval allocation failed".into(),
+        })?;
+    for &row in rows {
+        y_sub.push(*y.get(row).ok_or_else(|| PbError::Internal {
+            what: "GreedySelect y eval row escaped".into(),
+        })?);
+        raw_sub.push(*raw.get(row).ok_or_else(|| PbError::Internal {
+            what: "GreedySelect raw eval row escaped".into(),
+        })?);
+        weight_sub.push(*weight.get(row).ok_or_else(|| PbError::Internal {
+            what: "GreedySelect weight eval row escaped".into(),
+        })?);
+    }
+    Ok(f64::from(loss.deviance(&y_sub, &raw_sub, &weight_sub)?))
+}
+
+fn soup_models(members: &[WeightedModel]) -> Result<Model, PbError> {
+    let first = members.first().ok_or_else(|| PbError::InvalidConfig {
+        what: "model soup requires at least one member".into(),
+    })?;
+    let mut alpha_sum = 0.0_f64;
+    let mut f0 = 0.0_f64;
+    let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
+    for (idx, member) in members.iter().enumerate() {
+        if !member.alpha.is_finite() || member.alpha < 0.0 {
+            return Err(PbError::InvalidConfig {
+                what: format!("model soup member {idx} alpha must be finite and >= 0"),
+            });
+        }
+        validate_soup_member(&first.model, &member.model)?;
+        alpha_sum += member.alpha;
+        f0 += member.alpha * f64::from(member.model.f0);
+        trees
+            .try_reserve(member.model.trees.len())
+            .map_err(|_| PbError::Internal {
+                what: "model soup tree allocation failed".into(),
+            })?;
+        for (tree_alpha, tree) in &member.model.trees {
+            let scaled = member.alpha * f64::from(*tree_alpha);
+            if scaled != 0.0 {
+                if !scaled.is_finite()
+                    || scaled < f64::from(f32::MIN)
+                    || scaled > f64::from(f32::MAX)
+                {
+                    return Err(PbError::InvalidInput {
+                        what: "model soup tree alpha is not representable as f32".into(),
+                    });
+                }
+                trees.push((scaled as f32, tree.clone()));
+            }
+        }
+    }
+    if (alpha_sum - 1.0).abs() > ENSEMBLE_WEIGHT_TOL {
+        return Err(PbError::InvalidConfig {
+            what: format!("model soup alphas must sum to 1.0, got {alpha_sum}"),
+        });
+    }
+    if !f0.is_finite() || f0 < f64::from(f32::MIN) || f0 > f64::from(f32::MAX) {
+        return Err(PbError::InvalidInput {
+            what: "model soup intercept is not representable as f32".into(),
+        });
+    }
+    let model = Model {
+        f0: f0 as f32,
+        trees,
+        grids: first.model.grids.clone(),
+        provenance: first.model.provenance.clone(),
+        link: first.model.link,
+        mode: ExactnessMode::Exact,
+        schema: first.model.schema.clone(),
+        schema_version: first.model.schema_version,
+    };
+    model.validate()?;
+    Ok(model)
+}
+
+fn validate_soup_member(reference: &Model, member: &Model) -> Result<(), PbError> {
+    if !matches!(member.mode, ExactnessMode::Exact) {
+        return Err(PbError::ExactnessFirewall(
+            "model soup accepts only Exact members".into(),
+        ));
+    }
+    if member.grids != reference.grids
+        || member.provenance != reference.provenance
+        || member.link != reference.link
+        || member.schema.objective != reference.schema.objective
+        || member.schema_version != reference.schema_version
+    {
+        return Err(PbError::ShapeMismatch {
+            what: "model soup members must share grids, provenance, link, objective, and schema version"
+                .into(),
+        });
+    }
+    member.validate()
 }
 
 fn should_refit_after_round(refit: &RefitSpec, n_trees: usize) -> Result<bool, PbError> {
@@ -1347,7 +2021,7 @@ mod tests {
         clippy::float_cmp
     )]
     use super::*;
-    use crate::boosters::{BoosterConfig, DartSpec, NesterovSpec, RefitSpec};
+    use crate::boosters::{BoosterConfig, DartSpec, EnsembleSpec, HpGrid, NesterovSpec, RefitSpec};
     use crate::cat::{CatEncoderStore, LeakageScheme, Smooth, TsConfig, TsEncodingId};
     use crate::constraints::MonoSign;
     use crate::data::{
@@ -1355,7 +2029,7 @@ mod tests {
     };
     use crate::engine::{Booster, HistPrecision};
     use crate::explain::{assert_exact_decomposition, FeatureSet, RefMeasure};
-    use crate::loss::{Loss, Poisson, SquaredError};
+    use crate::loss::{Loss, LossId, Poisson, SquaredError};
 
     fn spec<'a>(loss: &'a dyn Loss) -> FitSpec<'a> {
         FitSpec {
@@ -1837,6 +2511,197 @@ mod tests {
         let b1 = bytes(1);
         assert_eq!(b1, bytes(2));
         assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn outer_bag_model_soup_stays_exact_and_thread_deterministic() {
+        let n = 180usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 9 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 7 + 1) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                (if x0[i] <= 4.0 { 1.5 } else { -2.0 })
+                    + if x1[i] <= 3.0 { 2.0 } else { -0.5 }
+                    + if x2[i] <= 2.0 { 0.75 } else { -0.25 }
+                    + (i % 11) as f32 * 0.03
+            })
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let cfg = Config {
+            n_trees: 25,
+            learning_rate: 0.25,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: BoosterConfig {
+                ensemble: EnsembleSpec::OuterBag { n_bags: 3 },
+                ..BoosterConfig::default()
+            },
+        };
+        let sqe = SquaredError;
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(cfg.clone())
+                    .fit(&x, &y, &spec(&sqe))
+                    .unwrap();
+                assert!(
+                    model
+                        .trees
+                        .iter()
+                        .any(|(alpha, _)| (*alpha - 1.0).abs() > 1.0e-6),
+                    "OuterBag should fold convex member weights into tree alphas"
+                );
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn outer_bag_single_member_is_byte_identical_to_inert_fit() {
+        let n = 96usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 6 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 4 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| (if x0[i] <= 3.0 { 2.0 } else { -1.0 }) + x1[i] * 0.2)
+            .collect();
+        let x = binned(&[x0, x1]);
+        let sqe = SquaredError;
+        let base_cfg = Config {
+            n_trees: 20,
+            learning_rate: 0.2,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: BoosterConfig::default(),
+        };
+        let mut bag_cfg = base_cfg.clone();
+        bag_cfg.boosters.ensemble = EnsembleSpec::OuterBag { n_bags: 1 };
+        let base = Booster::with_config(base_cfg)
+            .fit(&x, &y, &spec(&sqe))
+            .unwrap();
+        let bag = Booster::with_config(bag_cfg)
+            .fit(&x, &y, &spec(&sqe))
+            .unwrap();
+        assert_eq!(
+            crate::serialize::encode_model(&base).unwrap(),
+            crate::serialize::encode_model(&bag).unwrap()
+        );
+    }
+
+    #[test]
+    fn greedy_select_uses_deviance_and_stays_exact_deterministic() {
+        let n = 150usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 10 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 6 + 1) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                let a = if x0[i] <= 5.0 { 0.8 } else { 3.2 };
+                let b = if x1[i] <= 3.0 { 0.4 } else { 1.1 };
+                let c = if x2[i] <= 2.0 { 0.2 } else { 0.7 };
+                a + b + c
+            })
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let cfg = Config {
+            n_trees: 12,
+            learning_rate: 0.2,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: BoosterConfig {
+                ensemble: EnsembleSpec::GreedySelect {
+                    library_size: 4,
+                    hp_grid: HpGrid {
+                        max_bins: vec![32],
+                        lambdas: vec![0.0, 1.0],
+                        learning_rates: vec![0.15, 0.25],
+                        n_trees: vec![6],
+                        max_interaction_orders: vec![2],
+                        random_strengths: vec![0.0],
+                    },
+                    selection_bags: 3,
+                    seed_top_n: 2,
+                },
+                ..BoosterConfig::default()
+            },
+        };
+        let poisson = Poisson;
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(cfg.clone())
+                    .fit(&x, &y, &spec(&poisson))
+                    .unwrap();
+                assert_eq!(model.schema.objective.loss, LossId::Poisson);
+                assert!(!model.trees.is_empty());
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
+                let pred = model.predict_binned(&x, None).unwrap();
+                assert!(pred.iter().all(|v| v.is_finite() && *v > 0.0));
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn greedy_select_requires_a_holdout_row() {
+        let x = binned(&[vec![1.0]]);
+        let y = vec![1.0];
+        let cfg = Config {
+            n_trees: 2,
+            learning_rate: 0.2,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: BoosterConfig {
+                ensemble: EnsembleSpec::GreedySelect {
+                    library_size: 1,
+                    hp_grid: HpGrid {
+                        max_bins: vec![32],
+                        lambdas: vec![1.0],
+                        learning_rates: vec![0.2],
+                        n_trees: vec![2],
+                        max_interaction_orders: vec![1],
+                        random_strengths: vec![0.0],
+                    },
+                    selection_bags: 1,
+                    seed_top_n: 1,
+                },
+                ..BoosterConfig::default()
+            },
+        };
+        let sqe = SquaredError;
+        assert!(matches!(
+            Booster::with_config(cfg).fit(&x, &y, &spec(&sqe)),
+            Err(PbError::InvalidInput { .. })
+        ));
     }
 
     #[test]
