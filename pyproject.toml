@@ -11,9 +11,10 @@ name = "tri-boost"
 description = "A depth-3 oblivious GBM that is exactly decomposable into ≤3rd-order fANOVA tables."
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
+# numpy is the ONLY hard runtime dependency — it is the array-interchange type at the
+# Rust FFI boundary. All computation lives in the Rust core; Python is a thin orchestrator.
 dependencies = [
   "numpy>=1.23",
-  "scikit-learn>=1.2",
 ]
 classifiers = [
   "Programming Language :: Rust",
@@ -21,6 +22,23 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
 ]
 dynamic = ["version"]
+
+[project.optional-dependencies]
+# scikit-learn is OPT-IN: the TriBoostRegressor/Classifier estimators must literally be
+# sklearn objects (the `__sklearn_tags__` contract) to drop into Pipeline/GridSearchCV/
+# cross_val_score, so they require sklearn present — but the raw _Booster/_Model API does
+# not, so we don't force scikit-learn (+scipy/joblib) onto the core install path.
+sklearn = ["scikit-learn>=1.2"]
+# Benchmark / dev tooling: rival GBMs + data wrangling for the §13 accuracy benchmarks
+# (e.g. French MTPL frequency/severity). Never part of the published runtime.
+bench = [
+  "scikit-learn>=1.2",
+  "pandas>=1.5",
+  "pyarrow>=10.0",
+  "xgboost>=2.0",
+  "lightgbm>=4.0",
+  "catboost>=1.2",
+]
 
 [tool.maturin]
 # Separated layout: pure-Python sources here, the compiled module built from the py crate.
