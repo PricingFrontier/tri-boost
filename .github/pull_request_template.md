@@ -23,6 +23,7 @@ Implements: §
 - [ ] **NoPyo3 / Wasm** — core stays Python-free and wasm32-buildable
 - [ ] **Determinism** — byte-equal across `n_threads ∈ {1,2,8}` (if training paths touched)
 - [ ] **Invariants** — the five I2 checks + I1 budget still pass (if model/tables touched)
+- [ ] **M6 internal preflight** — `cargo run -p xtask -- release-preflight --seed 7`
 - [ ] **Grep-gates** — `cargo run -p xtask -- check-all`
 
 ## Invariant / firewall impact

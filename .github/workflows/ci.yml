@@ -82,6 +82,31 @@ jobs:
       - name: Overflow-checks liveness
         run: cargo test -p tri-boost-core --test overflow_trap
 
+  # ---- Dev-only M6 harness: exactness-gated accuracy + budget preflight ---
+  m6-preflight:
+    name: M6 internal preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: xtask harness unit tests
+        run: cargo test -p xtask
+      - name: Accuracy smoke artifact
+        run: cargo run -p xtask -- accuracy --seed 7 --output target/accuracy-smoke.json
+      - name: Adversarial table-budget artifact
+        run: cargo run -p xtask -- accuracy --seed 7 --adversarial --output target/adversarial-budget.json
+      - name: Release preflight checkpoint
+        run: cargo run -p xtask -- release-preflight --seed 7 --output target/release-preflight.json
+      - name: Upload preflight artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: m6-internal-preflight
+          path: |
+            target/accuracy-smoke.json
+            target/adversarial-budget.json
+            target/release-preflight.json
+
   # ---- MSRV: build + test on exactly the pinned floor --------------------
   msrv:
     name: MSRV (1.74)
