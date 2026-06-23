@@ -60,6 +60,7 @@ class _BaseTriBoost(BaseEstimator):
         tweedie_rho: float = 1.5,
         seed: int = 0,
         n_jobs: int | None = None,
+        monotone_constraints: Any = None,
     ) -> None:
         self.n_trees = n_trees
         self.learning_rate = learning_rate
@@ -71,6 +72,7 @@ class _BaseTriBoost(BaseEstimator):
         self.tweedie_rho = tweedie_rho
         self.seed = seed
         self.n_jobs = n_jobs
+        self.monotone_constraints = monotone_constraints
 
     def set_params(self, **params: Any):
         result = super().set_params(**params)
@@ -103,6 +105,50 @@ class _BaseTriBoost(BaseEstimator):
             cores = os.cpu_count() or 1
             n = max(1, cores + 1 + n)
         return n
+
+    def _resolve_monotone(
+        self, n_features: int, feature_names: list[str] | None
+    ) -> list[int] | None:
+        """Resolve ``monotone_constraints`` into a positional sign vector (-1/0/+1).
+
+        Accepts a length-``n_features`` sequence (positional) or a dict keyed by feature
+        name (matched against ``feature_names`` or the canonical ``f{i}``) or integer
+        index. Returns ``None`` when no constraint is active.
+        """
+        mc = self.monotone_constraints
+        if mc is None:
+            return None
+        signs = [0] * n_features
+        if isinstance(mc, dict):
+            name_to_idx = (
+                {name: i for i, name in enumerate(feature_names)}
+                if feature_names is not None
+                else {}
+            )
+            for key, val in mc.items():
+                if isinstance(key, str):
+                    if key in name_to_idx:
+                        idx = name_to_idx[key]
+                    elif key.startswith("f") and key[1:].isdigit():
+                        idx = int(key[1:])
+                    else:
+                        raise ValueError(f"unknown monotone feature {key!r}")
+                else:
+                    idx = int(key)
+                if not 0 <= idx < n_features:
+                    raise ValueError(f"monotone feature index {idx} out of range")
+                signs[idx] = int(val)
+        else:
+            seq = list(mc)
+            if len(seq) != n_features:
+                raise ValueError(
+                    f"monotone_constraints length {len(seq)} != n_features {n_features}"
+                )
+            signs = [int(v) for v in seq]
+        for s in signs:
+            if s not in (-1, 0, 1):
+                raise ValueError(f"monotone sign {s} must be -1, 0, or 1")
+        return signs if any(signs) else None
 
     def _new_booster(self) -> _Booster:
         return _Booster(
@@ -146,6 +192,7 @@ class _BaseTriBoost(BaseEstimator):
                 raise ValueError(
                     f"exposure has {exposure32.shape[0]} rows but y has {y32.shape[0]}"
                 )
+        monotone = self._resolve_monotone(x32.shape[1], feature_names)
         model = self._new_booster().fit(
             x32,
             y32,
@@ -153,6 +200,7 @@ class _BaseTriBoost(BaseEstimator):
             exposure=exposure32,
             feature_names=feature_names,
             class_labels=class_labels,
+            monotone=monotone,
         )
         self._model = model
         self.n_features_in_ = x32.shape[1]

@@ -27,7 +27,7 @@ use crate::cat::CatEncoderStore;
 use crate::constraints::MonoSign;
 use crate::data::{compute_offset, BinnedMatrix};
 use crate::engine::split::{
-    grow_oblivious_tree, refit_tree_leaves, GrowConfig, TableBudgetPenalty,
+    clamp_monotone, grow_oblivious_tree, refit_tree_leaves, GrowConfig, TableBudgetPenalty,
 };
 use crate::engine::{
     low_bit, Config, ExactnessMode, FitSpec, Model, ModelSchema, ObliviousTree, Sampling,
@@ -393,6 +393,7 @@ fn fit_single(
                         weight,
                         offset: offset.as_deref(),
                         f0: f0_f32,
+                        monotone: monotone_ref,
                     };
                     fully_corrective_refit(
                         &config.boosters.refit_leaves,
@@ -428,6 +429,7 @@ fn fit_single(
                                 weight,
                                 offset: offset.as_deref(),
                                 f0: f0_f32,
+                                monotone: monotone_ref,
                             };
                             fully_corrective_refit(
                                 &config.boosters.refit_leaves,
@@ -462,6 +464,7 @@ fn fit_single(
             weight,
             offset: offset.as_deref(),
             f0: f0_f32,
+            monotone: monotone_ref,
         };
         fully_corrective_refit(
             &config.boosters.refit_leaves,
@@ -1360,6 +1363,9 @@ struct RefitProblem<'a, 's> {
     weight: &'a [f32],
     offset: Option<&'a [f32]>,
     f0: f32,
+    /// Resolved per-axis monotone signs (§07.5); the ridge solve is unconstrained, so the
+    /// final leaves are projected onto the monotone cone and `raw` re-derived to match.
+    monotone: Option<&'a [Option<MonoSign>]>,
 }
 
 fn fully_corrective_refit(
@@ -1438,6 +1444,35 @@ fn fully_corrective_refit(
             <= REFIT_ACCEPT_TOL * (1.0 + current_deviance.abs())
         {
             break;
+        }
+    }
+    // The ridge solve is UNCONSTRAINED, so a monotone constraint can be inverted by the
+    // refit. Project each tree's leaves back onto the monotone cone (§07.5) and re-derive
+    // `raw` from the clamped leaves so the served model and the next round's gradients
+    // stay consistent (the projection trades a little deviance for the guarantee).
+    if let Some(signs) = problem.monotone {
+        let mut clamped = false;
+        for (_, tree) in trees.iter_mut() {
+            let before = tree.leaves;
+            clamp_monotone(
+                &mut tree.leaves,
+                &tree.splits,
+                usize::from(tree.depth),
+                Some(signs),
+            )?;
+            if tree.leaves != before {
+                clamped = true;
+            }
+        }
+        if clamped {
+            let theta = collect_leaf_theta(trees, n_cols)?;
+            let new_raw = raw_from_theta(problem.offset, problem.f0, trees, &memberships, &theta)?;
+            if raw.len() != new_raw.len() {
+                return Err(PbError::Internal {
+                    what: "refit raw length changed after monotone clamp".into(),
+                });
+            }
+            raw.copy_from_slice(&new_raw);
         }
     }
     Ok(())
@@ -2939,6 +2974,84 @@ mod tests {
             "anti-monotone split should terminate gracefully"
         );
         assert_eq!(predict(&model, &x, 0), predict(&model, &x, 2));
+    }
+
+    #[test]
+    fn monotone_holds_under_ridge_refit() {
+        // The §09 fully-corrective ridge refit re-solves leaves UNCONSTRAINED; the §07.5
+        // clamp at the end of the refit must keep the served total score monotone.
+        let sqe = SquaredError;
+        let vals: Vec<f32> = (1..=8).map(|i| i as f32).collect();
+        let x = binned(&[vals]);
+        let y = [0.0_f32, 2.0, 1.0, 4.0, 3.0, 6.0, 5.0, 9.0]; // increasing with local dips
+        let mut sp = spec(&sqe);
+        sp.monotone.insert("f0".into(), MonoSign::Increasing);
+        let model = Booster::with_config(Config {
+            n_trees: 30,
+            learning_rate: 0.5,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Sampling::Full,
+            hist_precision: Default::default(),
+            boosters: BoosterConfig {
+                refit_leaves: RefitSpec::Ridge {
+                    l2: 0.1,
+                    max_iter: 4,
+                    every_k_trees: None,
+                },
+                ..Default::default()
+            },
+        })
+        .fit(&x, &y, &sp)
+        .unwrap();
+        let preds: Vec<f64> = (0..8).map(|i| predict(&model, &x, i)).collect();
+        for i in 1..8 {
+            assert!(
+                preds[i - 1] <= preds[i] + 1e-4,
+                "ridge refit broke monotonicity: {preds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn monotone_holds_under_mvs_sampling() {
+        // MVS grows structure on a sampled subset then refits leaves on ALL rows; the
+        // §07.5 clamp in refit_tree_leaves must keep the served total score monotone.
+        let sqe = SquaredError;
+        let n = 40usize;
+        let vals: Vec<f32> = (0..n).map(|i| (i % 8 + 1) as f32).collect();
+        let x = binned(&[vals]);
+        let y: Vec<f32> = (0..n)
+            .map(|i| (i % 8) as f32 + if i % 3 == 0 { 2.0 } else { 0.0 })
+            .collect();
+        let mut sp = spec(&sqe);
+        sp.monotone.insert("f0".into(), MonoSign::Increasing);
+        let model = Booster::with_config(Config {
+            n_trees: 30,
+            learning_rate: 0.5,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Sampling::Mvs {
+                rate: 0.5,
+                min_rows: 4,
+            },
+            hist_precision: Default::default(),
+            boosters: Default::default(),
+        })
+        .fit(&x, &y, &sp)
+        .unwrap();
+        let mut by_level: Vec<(u8, f64)> = (0..n)
+            .map(|i| (x.data[0][i], predict(&model, &x, i)))
+            .collect();
+        by_level.sort_by_key(|&(b, _)| b);
+        for w in by_level.windows(2) {
+            assert!(
+                w[0].1 <= w[1].1 + 1e-4,
+                "MVS refit broke monotonicity: {by_level:?}"
+            );
+        }
     }
 
     #[test]

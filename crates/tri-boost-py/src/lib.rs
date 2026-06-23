@@ -15,7 +15,7 @@ use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Arc;
-use tri_boost_core::constraints::{InteractionPolicy, MonotoneMap};
+use tri_boost_core::constraints::{InteractionPolicy, MonoSign, MonotoneMap};
 use tri_boost_core::data::{bin, bin_columns, BinConfig, BinnedMatrix};
 use tri_boost_core::engine::{Booster, Config, FitSpec, Model, Sampling};
 use tri_boost_core::error::{Invariant, PbError};
@@ -185,7 +185,7 @@ impl PyBooster {
         })
     }
 
-    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None))]
+    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None))]
     #[allow(clippy::too_many_arguments)]
     fn fit(
         &self,
@@ -196,6 +196,7 @@ impl PyBooster {
         exposure: Option<PyReadonlyArray1<'_, f32>>,
         feature_names: Option<Vec<String>>,
         class_labels: Option<Vec<String>>,
+        monotone: Option<Vec<i8>>,
     ) -> PyResult<PyModel> {
         let columns = raw_columns_from_array(x)?;
         let y = array1_to_vec(y, "y")?;
@@ -212,6 +213,7 @@ impl PyBooster {
                     exposure,
                     feature_names,
                     class_labels,
+                    monotone,
                 )
             })
             .map_err(py_err)?;
@@ -418,6 +420,36 @@ impl PyTableBank {
     }
 }
 
+/// Build a name-keyed [`MonotoneMap`] from a positional sign vector (`-1`/`0`/`+1` per
+/// feature). Keyed `f{i}` to match the fit-time schema names (the user's `feature_names`
+/// are applied to the schema only AFTER fit, so monotone resolution runs against `f{i}`).
+fn build_monotone_map(signs: Option<&[i8]>, n_features: usize) -> Result<MonotoneMap, PbError> {
+    let mut map = MonotoneMap::new();
+    let Some(signs) = signs else {
+        return Ok(map);
+    };
+    if signs.len() != n_features {
+        return Err(PbError::ShapeMismatch {
+            what: format!("monotone len {} != n_features {n_features}", signs.len()),
+        });
+    }
+    for (i, &s) in signs.iter().enumerate() {
+        let sign = match s {
+            0 => continue,
+            1 => MonoSign::Increasing,
+            -1 => MonoSign::Decreasing,
+            other => {
+                return Err(PbError::InvalidConfig {
+                    what: format!("monotone[{i}] must be -1, 0, or 1, got {other}"),
+                })
+            }
+        };
+        map.insert(format!("f{i}"), sign);
+    }
+    Ok(map)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn fit_owned(
     state: PyBooster,
     columns: Vec<Vec<f32>>,
@@ -426,16 +458,18 @@ fn fit_owned(
     exposure: Option<Vec<f32>>,
     feature_names: Option<Vec<String>>,
     class_labels: Option<Vec<String>>,
+    monotone: Option<Vec<i8>>,
 ) -> Result<Model, PbError> {
     let refs: Vec<&[f32]> = columns.iter().map(Vec::as_slice).collect();
     let x = bin_columns(&refs, weight.as_deref(), &state.bin_config, state.seed)?;
+    let monotone_map = build_monotone_map(monotone.as_deref(), columns.len())?;
     let run = || {
         let loss = state.objective.instantiate()?;
         let spec = FitSpec {
             loss: loss.as_loss(),
             weight: weight.as_deref(),
             exposure: exposure.as_deref(),
-            monotone: MonotoneMap::new(),
+            monotone: monotone_map.clone(),
             interaction: InteractionPolicy::default(),
             seed: state.seed,
         };

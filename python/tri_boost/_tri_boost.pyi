@@ -35,6 +35,7 @@ class _Booster:
         exposure: np.ndarray | None = None,
         feature_names: Sequence[str] | None = None,
         class_labels: Sequence[str] | None = None,
+        monotone: Sequence[int] | None = None,
     ) -> _Model: ...
 
 

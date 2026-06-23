@@ -247,6 +247,82 @@ fn candidate_monotone_ok(
     Ok(true)
 }
 
+/// Project an 8-leaf vector onto the monotone cone (§07.5) so every constrained level's
+/// cousin pairs satisfy the required ordering, IN PLACE. The grow-time candidate filter
+/// ([`candidate_monotone_ok`]) keeps the chosen STRUCTURE feasible, but any path that
+/// RECOMPUTES leaves (MVS refit on full rows, the §09 fully-corrective ridge refit, or a
+/// quantized-histogram round-off) can invert a cousin pair; applying this clamp at every
+/// leaf-finalization site guarantees the monotone guarantee holds on the served model
+/// (not just the freshly-grown one). Iterative cousin-pair pooling (POCS over the
+/// half-space constraints) converges to a feasible point — the cone is non-empty (the
+/// all-equal vector is always feasible). Leaf-VALUE only on a fixed structure, so I2 is
+/// untouched. No-op when no constrained level is present.
+pub(crate) fn clamp_monotone(
+    leaves: &mut [f32; 8],
+    splits: &[Split],
+    depth: usize,
+    axis_signs: Option<&[Option<MonoSign>]>,
+) -> Result<(), PbError> {
+    let Some(axis_signs) = axis_signs else {
+        return Ok(());
+    };
+    // Resolve the per-level sign from each level's split axis; bail if none constrained.
+    let mut level_sign: [Option<MonoSign>; 3] = [None; 3];
+    let mut any = false;
+    for (level, split) in splits.iter().enumerate().take(depth.min(3)) {
+        let s = axis_signs
+            .get(split.axis as usize)
+            .copied()
+            .flatten()
+            .filter(|s| matches!(s, MonoSign::Increasing | MonoSign::Decreasing));
+        if s.is_some() {
+            *level_sign
+                .get_mut(level)
+                .ok_or_else(internal("level sign"))? = s;
+            any = true;
+        }
+    }
+    if !any {
+        return Ok(());
+    }
+    let n_leaves = 1usize << depth.min(3);
+    for _iter in 0..64 {
+        let mut changed = false;
+        for (level, sign) in level_sign.iter().enumerate().take(depth.min(3)) {
+            let Some(sign) = sign else {
+                continue;
+            };
+            let bit = 1usize << level;
+            for high in 0..n_leaves {
+                if high & bit != 0 {
+                    continue; // `high` = bit_level 0 = HIGH feature value
+                }
+                let low = high | bit; // `low` = bit_level 1 = LOW feature value
+                let lo_v = *leaves.get(low).ok_or_else(internal("clamp low"))?;
+                let hi_v = *leaves.get(high).ok_or_else(internal("clamp high"))?;
+                // Increasing: low feature value ⇒ low response ⇒ lo_v <= hi_v.
+                let violated = match sign {
+                    MonoSign::Increasing => lo_v > hi_v,
+                    MonoSign::Decreasing => lo_v < hi_v,
+                    MonoSign::None => false,
+                };
+                if violated {
+                    let avg = 0.5 * (lo_v + hi_v);
+                    *leaves.get_mut(low).ok_or_else(internal("clamp low set"))? = avg;
+                    *leaves
+                        .get_mut(high)
+                        .ok_or_else(internal("clamp high set"))? = avg;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Scan one level's histogram for the best shared `(axis, bin_le, missing_left)`
 /// split (spec §06.2). `axes[p]` is the global axis of histogram column `p`, and
 /// `n_data_bins[p]` is that axis's data-bin count (candidate `bin_le ∈ 1..=ndb-1`).
@@ -523,6 +599,14 @@ pub(crate) fn refit_tree_leaves(
         cfg.lr,
         cfg.max_delta_step,
     )?;
+    // Re-enforce monotonicity: the structure was chosen on the sampled subset, but these
+    // leaves were just recomputed on the FULL rows and could invert a cousin pair.
+    clamp_monotone(
+        &mut tree.leaves,
+        &tree.splits,
+        usize::from(tree.depth),
+        cfg.monotone,
+    )?;
     Ok(())
 }
 
@@ -666,7 +750,7 @@ pub(crate) fn grow_oblivious_tree(
         return Ok(None);
     }
     let depth = splits.len();
-    let leaves = leaf_values(
+    let mut leaves = leaf_values(
         gh,
         rows,
         &leaf_of_row,
@@ -675,6 +759,9 @@ pub(crate) fn grow_oblivious_tree(
         cfg.lr,
         cfg.max_delta_step,
     )?;
+    // Project onto the monotone cone — a no-op when the structure was grown feasible, but
+    // a guard against quantized-histogram round-off inverting a cousin pair (§07.5).
+    clamp_monotone(&mut leaves, &splits, depth, cfg.monotone)?;
     Ok(Some(ObliviousTree::try_new(splits, leaves, &x.provenance)?))
 }
 
@@ -936,6 +1023,45 @@ mod tests {
             leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 1.0, None),
             Err(PbError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn clamp_monotone_projects_inverted_leaves_onto_the_cone() {
+        // depth-2, both levels Increasing. leaf idx = bit0 | bit1<<1; bit=1 ⇒ LOW feature
+        // value (must have the LOWER response for Increasing). Start fully inverted.
+        let splits = vec![
+            Split {
+                axis: 0,
+                bin_le: 1,
+                missing_left: false,
+            },
+            Split {
+                axis: 1,
+                bin_le: 1,
+                missing_left: false,
+            },
+        ];
+        // idx 0=(hi0,hi1) 1=(lo0,hi1) 2=(hi0,lo1) 3=(lo0,lo1): low-value leaves set HIGH.
+        let mut leaves = [0.0_f32, 10.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0];
+        let signs = [Some(MonoSign::Increasing), Some(MonoSign::Increasing)];
+        clamp_monotone(&mut leaves, &splits, 2, Some(&signs)).unwrap();
+        // Level 0 cousins (differ in bit0): w[bit0=1] <= w[bit0=0].
+        assert!(leaves[1] <= leaves[0] + 1e-6);
+        assert!(leaves[3] <= leaves[2] + 1e-6);
+        // Level 1 cousins (differ in bit1): w[bit1=1] <= w[bit1=0].
+        assert!(leaves[2] <= leaves[0] + 1e-6);
+        assert!(leaves[3] <= leaves[1] + 1e-6);
+        // Decreasing flips the required direction.
+        let mut dec = [0.0_f32, -10.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0];
+        let dsigns = [Some(MonoSign::Decreasing), None];
+        clamp_monotone(&mut dec, &splits, 2, Some(&dsigns)).unwrap();
+        assert!(dec[1] >= dec[0] - 1e-6); // Decreasing: low-value leaf >= high-value leaf
+        assert!(dec[3] >= dec[2] - 1e-6);
+        // No signs ⇒ untouched.
+        let mut none = [5.0_f32, 1.0, 9.0, 2.0, 0.0, 0.0, 0.0, 0.0];
+        let before = none;
+        clamp_monotone(&mut none, &splits, 2, None).unwrap();
+        assert_eq!(none, before);
     }
 
     /// A clean depth-2 fixture: two informative features ⇒ the engine grows a depth-2
