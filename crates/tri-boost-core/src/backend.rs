@@ -68,7 +68,7 @@ pub(crate) trait Backend: Send + Sync {
     /// never `.expect`.
     ///
     /// # Errors
-    /// Propagates [`Loss::grad_hess`] failures; [`PbError`] (Phase 0 stub).
+    /// Propagates [`Loss::grad_hess`] failures.
     fn grad_hess(
         &self,
         loss: &dyn Loss,
@@ -81,7 +81,7 @@ pub(crate) trait Backend: Send + Sync {
     /// Branch-free 8-cell leaf lookup + table-sum scoring for a row block.
     ///
     /// # Errors
-    /// [`PbError`] on shape mismatch or an unimplemented backend (Phase 0).
+    /// [`PbError`] on shape mismatch or row-index overflow.
     fn predict_block(
         &self,
         model: &Model,
@@ -93,7 +93,9 @@ pub(crate) trait Backend: Send + Sync {
 
 /// The v1 backend: rayon per-thread padded `Hist`s + fixed-order reduce,
 /// multiversion-dispatched dense kernels (spec §02.5). The only `Backend` in v1.
-/// Phase-0 stub: the kernels are not yet implemented.
+/// The row-local kernels delegate to the canonical core path; histogram/split methods
+/// remain fail-closed until the backend trait is reconciled with the implemented §06
+/// leaf-assignment/axis-aware engine.
 #[derive(Debug, Clone)]
 pub struct CpuBackend {
     /// Worker-thread count. The output MUST be byte-identical across values of this
@@ -143,10 +145,7 @@ impl Backend for CpuBackend {
         weight: &[f32],
         out: &mut GradHess,
     ) -> Result<(), PbError> {
-        let _ = (loss, y, raw, weight, out);
-        Err(PbError::Internal {
-            what: "CpuBackend::grad_hess is not implemented in Phase 0 (§06)".into(),
-        })
+        loss.grad_hess(y, raw, weight, out)
     }
 
     fn predict_block(
@@ -156,10 +155,26 @@ impl Backend for CpuBackend {
         rows: &[u32],
         out: &mut [f32],
     ) -> Result<(), PbError> {
-        let _ = (model, x, rows, out);
-        Err(PbError::Internal {
-            what: "CpuBackend::predict_block is not implemented in Phase 0 (§10/§11)".into(),
-        })
+        if out.len() != rows.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "predict_block out len {} != rows len {}",
+                    out.len(),
+                    rows.len()
+                ),
+            });
+        }
+        let mut full = vec![0.0_f32; x.n_rows as usize];
+        model.score_trees(x, None, &mut full)?;
+        for (dst, &row) in out.iter_mut().zip(rows) {
+            let score = *full
+                .get(row as usize)
+                .ok_or_else(|| PbError::InvalidInput {
+                    what: format!("predict_block row {row} outside n_rows {}", x.n_rows),
+                })?;
+            *dst = score;
+        }
+        Ok(())
     }
 }
 
@@ -244,17 +259,27 @@ mod tests {
     }
 
     #[test]
-    fn cpu_backend_stub_errs_not_panics() {
+    fn cpu_backend_delegates_row_kernels_and_fail_closes_unreconciled_methods() {
         let be = CpuBackend::new(1);
-        let mut out = vec![0.0_f32; 0];
         let m = crate::explain::fixture_model();
-        let x = BinnedMatrix {
-            data: vec![],
-            n_rows: 0,
-            grids: vec![],
-            provenance: vec![],
-        };
-        // The point: a not-yet-implemented kernel returns Err, never panics.
-        assert!(be.predict_block(&m, &x, &[], &mut out).is_err());
+        let x = crate::explain::fixture_serve().0;
+        let mut out = vec![0.0_f32; 2];
+        be.predict_block(&m, &x, &[0, 3], &mut out).unwrap();
+        let mut full = vec![0.0_f32; x.n_rows as usize];
+        m.score_trees(&x, None, &mut full).unwrap();
+        assert_eq!(out, vec![full[0], full[3]]);
+
+        let loss = crate::loss::SquaredError;
+        let mut gh = crate::loss::GradHess::default();
+        be.grad_hess(&loss, &[1.0, 2.0], &[1.5, 1.0], &[1.0, 2.0], &mut gh)
+            .unwrap();
+        assert_eq!(gh.g, vec![0.5, -2.0]);
+        assert_eq!(gh.h, vec![1.0, 2.0]);
+
+        let mut hist = Hist::try_zeros(1, 1, 2).unwrap();
+        assert!(be.build_histograms(&x, &gh, &[0, 1], &mut hist).is_err());
+        assert!(be
+            .best_level_split(&hist, 1.0, &LevelConstraints::default())
+            .is_err());
     }
 }
