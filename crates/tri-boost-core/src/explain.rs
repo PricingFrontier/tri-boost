@@ -2524,6 +2524,7 @@ mod tests {
             exposure: None,
             monotone: crate::constraints::MonotoneMap::new(),
             interaction: crate::constraints::InteractionPolicy::default(),
+            credibility: crate::constraints::CredibilityFloor::default(),
             seed: 0,
         }
     }

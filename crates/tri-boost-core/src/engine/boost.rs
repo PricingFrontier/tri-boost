@@ -88,6 +88,7 @@ fn validate_fit_spec(spec: &FitSpec<'_>) -> Result<(), PbError> {
             what: "interaction.table_budget_cells must be > 0".into(),
         });
     }
+    spec.credibility.validate()?;
     Ok(())
 }
 
@@ -330,6 +331,7 @@ fn fit_single(
             f64::from(spec.interaction.table_budget_beta),
             spec.interaction.table_budget_cells,
         ),
+        credibility: spec.credibility,
     };
 
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
@@ -370,7 +372,7 @@ fn fit_single(
         let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
         let mut round_grow_cfg = grow_cfg.clone();
         round_grow_cfg.round = t;
-        match grow_oblivious_tree(x, &gh, &sampled_rows, &axes, &round_grow_cfg)? {
+        match grow_oblivious_tree(x, &gh, &sampled_rows, &axes, &round_grow_cfg, weight)? {
             Some(mut tree) => {
                 if sampled_rows.len() != rows.len() {
                     refit_tree_leaves(x, &gh, &rows, &mut tree, &round_grow_cfg)?;
@@ -413,9 +415,14 @@ fn fit_single(
                     let correction_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
                     let mut correction_cfg = grow_cfg.clone();
                     correction_cfg.round = t;
-                    if let Some(mut correction) =
-                        grow_oblivious_tree(x, &gh, &correction_rows, &axes, &correction_cfg)?
-                    {
+                    if let Some(mut correction) = grow_oblivious_tree(
+                        x,
+                        &gh,
+                        &correction_rows,
+                        &axes,
+                        &correction_cfg,
+                        weight,
+                    )? {
                         if correction_rows.len() != rows.len() {
                             refit_tree_leaves(x, &gh, &rows, &mut correction, &correction_cfg)?;
                         }
@@ -613,6 +620,7 @@ fn fit_outer_bag(
             exposure: data.exposure.as_deref(),
             monotone: spec.monotone.clone(),
             interaction: spec.interaction.clone(),
+            credibility: spec.credibility,
             seed: bag_seed,
         };
         let model = fit_single(&base_config, &data.x, &data.y, &bag_spec)?;
@@ -674,6 +682,7 @@ fn fit_greedy_select(
             exposure: train.exposure.as_deref(),
             monotone: spec.monotone.clone(),
             interaction,
+            credibility: spec.credibility,
             seed: member_seed,
         };
         let model = fit_single(&member_config, &train.x, &train.y, &member_spec)?;
@@ -2077,7 +2086,7 @@ mod tests {
     use super::*;
     use crate::boosters::{BoosterConfig, DartSpec, EnsembleSpec, HpGrid, NesterovSpec, RefitSpec};
     use crate::cat::{CatEncoderStore, LeakageScheme, Smooth, TsConfig, TsEncodingId};
-    use crate::constraints::MonoSign;
+    use crate::constraints::{CredibilityFloor, MonoSign};
     use crate::data::{
         bin_columns, bin_train_columns, BinConfig, CategoricalColumn, NumericColumn,
     };
@@ -2092,6 +2101,7 @@ mod tests {
             exposure: None,
             monotone: crate::constraints::MonotoneMap::new(),
             interaction: crate::constraints::InteractionPolicy::default(),
+            credibility: crate::constraints::CredibilityFloor::default(),
             seed: 0,
         }
     }
@@ -2255,6 +2265,57 @@ mod tests {
         assert!(!b1.is_empty());
         assert_eq!(b1, bytes(2));
         assert_eq!(b1, bytes(8));
+    }
+
+    /// §07.2/§07.6: credibility floors are a candidate mask and `path_smooth` is a
+    /// value-level clamp on a fixed oblivious structure, so a model fit with both stays
+    /// `Exact` and decomposes — and `path_smooth` measurably changes the served leaves.
+    #[test]
+    fn credibility_floors_and_path_smooth_stay_exact_and_decompose() {
+        let n = 160usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 6 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 4 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                (if x0[i] <= 3.0 { -2.0 } else { 2.5 })
+                    + if x1[i] <= 2.0 { 1.25 } else { -0.75 }
+                    + if x2[i] <= 2.0 { 0.5 } else { -0.25 }
+            })
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let cfg = Config {
+            n_trees: 25,
+            learning_rate: 0.2,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: Default::default(),
+        };
+        let sqe = SquaredError;
+        let fit = |floor: CredibilityFloor| -> Model {
+            let mut s = spec(&sqe);
+            s.credibility = floor;
+            let model = Booster::with_config(cfg.clone()).fit(&x, &y, &s).unwrap();
+            assert_eq!(model.mode, ExactnessMode::Exact);
+            let serve = crate::data::ServeBinnedMatrix(x.clone());
+            let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+            assert_exact_decomposition(&model, &bank, &serve).unwrap();
+            model
+        };
+        let plain = fit(CredibilityFloor::default());
+        let floored = fit(CredibilityFloor {
+            min_data_in_leaf: 4,
+            min_sum_hessian_in_leaf: 1.0,
+            min_weight_sum_in_leaf: 4.0,
+            path_smooth: 1.5,
+        });
+        // Both produced real ensembles, and path_smooth shifted at least one prediction.
+        let differs =
+            (0..n).any(|i| (predict(&plain, &x, i) - predict(&floored, &x, i)).abs() > 1e-6);
+        assert!(differs, "path_smooth must change the served leaves");
     }
 
     #[test]

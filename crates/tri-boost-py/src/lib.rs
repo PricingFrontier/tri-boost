@@ -15,7 +15,7 @@ use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Arc;
-use tri_boost_core::constraints::{InteractionPolicy, MonoSign, MonotoneMap};
+use tri_boost_core::constraints::{CredibilityFloor, InteractionPolicy, MonoSign, MonotoneMap};
 use tri_boost_core::data::{bin, bin_columns, BinConfig, BinnedMatrix};
 use tri_boost_core::engine::{Booster, Config, FitSpec, Model, Sampling};
 use tri_boost_core::error::{Invariant, PbError};
@@ -122,6 +122,7 @@ struct PyBooster {
     config: Config,
     bin_config: BinConfig,
     objective: Objective,
+    credibility: CredibilityFloor,
     seed: u64,
     n_jobs: Option<usize>,
 }
@@ -139,6 +140,10 @@ impl PyBooster {
         max_bin=254,
         objective=None,
         tweedie_rho=1.5,
+        min_data_in_leaf=0,
+        min_sum_hessian_in_leaf=0.0,
+        min_weight_sum_in_leaf=0.0,
+        path_smooth=0.0,
         seed=0,
         n_jobs=None
     ))]
@@ -151,6 +156,10 @@ impl PyBooster {
         max_bin: u8,
         objective: Option<String>,
         tweedie_rho: f32,
+        min_data_in_leaf: u32,
+        min_sum_hessian_in_leaf: f32,
+        min_weight_sum_in_leaf: f32,
+        path_smooth: f32,
         seed: u64,
         n_jobs: Option<usize>,
     ) -> PyResult<Self> {
@@ -170,6 +179,13 @@ impl PyBooster {
             ..BinConfig::default()
         };
         bin_config.validate().map_err(py_err)?;
+        let credibility = CredibilityFloor {
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            min_weight_sum_in_leaf,
+            path_smooth,
+        };
+        credibility.validate().map_err(py_err)?;
         let objective = Objective::parse(objective, tweedie_rho).map_err(py_err)?;
         if matches!(n_jobs, Some(0)) {
             return Err(py_err(PbError::InvalidConfig {
@@ -180,6 +196,7 @@ impl PyBooster {
             config,
             bin_config,
             objective,
+            credibility,
             seed,
             n_jobs,
         })
@@ -471,6 +488,7 @@ fn fit_owned(
             exposure: exposure.as_deref(),
             monotone: monotone_map.clone(),
             interaction: InteractionPolicy::default(),
+            credibility: state.credibility,
             seed: state.seed,
         };
         Booster::with_config(state.config.clone()).fit(&x, &y, &spec)

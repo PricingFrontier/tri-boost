@@ -18,8 +18,8 @@ use tri_boost_core::explain::{
 };
 use tri_boost_core::{
     assert_exact_decomposition, bin_columns, check_feature_budget, BinConfig, Booster, Config,
-    FitSpec, InteractionPolicy, Invariant, Model, MonotoneMap, PbError, RefMeasure,
-    ServeBinnedMatrix, SquaredError,
+    CredibilityFloor, FitSpec, InteractionPolicy, Invariant, Model, MonotoneMap, PbError,
+    RefMeasure, ServeBinnedMatrix, SquaredError,
 };
 
 fn fit_additive() -> (Model, ServeBinnedMatrix) {
@@ -42,6 +42,7 @@ fn fit_additive() -> (Model, ServeBinnedMatrix) {
         exposure: None,
         monotone: MonotoneMap::new(),
         interaction: InteractionPolicy::default(),
+        credibility: CredibilityFloor::default(),
         seed: 0,
     };
     let model = Booster::with_config(Config {

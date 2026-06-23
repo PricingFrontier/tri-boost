@@ -107,3 +107,32 @@ def test_python_fit_is_thread_count_deterministic() -> None:
     a = small_regressor(n_jobs=1).fit(x.astype(np.float32), y).to_bytes()
     b = small_regressor(n_jobs=2).fit(x.astype(np.float32), y).to_bytes()
     assert a == b
+
+
+def test_credibility_floor_params_round_trip_and_path_smooth_shrinks() -> None:
+    x, y = regression_fixture()
+    x32 = x.astype(np.float32)
+    # Credibility kwargs survive get_params / clone (the sklearn config contract).
+    est = small_regressor(
+        min_data_in_leaf=4,
+        min_sum_hessian_in_leaf=1.0,
+        min_weight_sum_in_leaf=4.0,
+        path_smooth=2.0,
+    )
+    params = est.get_params()
+    assert params["min_data_in_leaf"] == 4
+    assert params["path_smooth"] == 2.0
+    assert clone(est).get_params()["min_weight_sum_in_leaf"] == 4.0
+
+    # path_smooth is value-level: same structure, but it shifts the served predictions,
+    # and the model stays exactly decomposable.
+    plain = small_regressor().fit(x32, y)
+    floored = est.fit(x32, y)
+    assert json.loads(floored.tables(x32, ref_measure="uniform"))["mode"] == "Exact"
+    assert not np.allclose(plain.predict(x32), floored.predict(x32))
+
+
+def test_negative_credibility_floor_is_rejected() -> None:
+    x, y = regression_fixture()
+    with pytest.raises(Exception):
+        small_regressor(min_sum_hessian_in_leaf=-1.0).fit(x.astype(np.float32), y)

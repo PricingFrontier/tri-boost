@@ -86,6 +86,17 @@ pub struct CredibilityFloor {
 }
 ```
 
+**FLAG (build reconciliation).** v1 threads `CredibilityFloor` through **`FitSpec`** (the per-fit
+constraint bundle that already carries `monotone` + `interaction`), not the §06 `Config`. The two
+other §07 constraints live there, the floors depend on the data's weight/exposure semantics, and
+this keeps `Config` as the pure §06 optimizer-hyperparameter set — so the struct is owned by §07
+exactly as specified and merely *referenced* from the fit path through `FitSpec` instead of `Config`.
+The split-finder reads it via `GrowConfig.credibility` (resolved from `spec.credibility`). To enforce
+`min_weight_sum_in_leaf` exactly, the per-`(leaf,axis,bin)` histogram (§06.3) carries a `wsum` (`Σw`)
+plane alongside `g`/`h`/`count`, accumulated in the same fixed-order fold (determinism preserved); it
+equals `count` when no `sample_weight` is supplied. The Python sklearn estimators expose the four
+fields as constructor kwargs.
+
 `FeatureSet` is the §02 shared type (sorted distinct raw ids, size 0..=3); `FeatureMask` is a §07-local bitset alias over raw `FeatureId`s. §07 supplies the *masking* and *scoring* closures; §06 owns the search loop.
 
 ### 07.3 Integration with the split-finder (the seam)

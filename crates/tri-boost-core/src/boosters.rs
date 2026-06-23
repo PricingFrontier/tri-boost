@@ -972,7 +972,7 @@ mod tests {
     }
 
     fn fit_main_effect_bank(vals: &[f32]) -> TableBank {
-        use crate::constraints::{InteractionPolicy, MonotoneMap};
+        use crate::constraints::{CredibilityFloor, InteractionPolicy, MonotoneMap};
         use crate::data::{bin_columns, BinConfig, ServeBinnedMatrix};
         use crate::engine::{Booster, Config, FitSpec};
         use crate::explain::RefMeasure;
@@ -986,6 +986,7 @@ mod tests {
             exposure: None,
             monotone: MonotoneMap::new(),
             interaction: InteractionPolicy::default(),
+            credibility: CredibilityFloor::default(),
             seed: 0,
         };
         let model = Booster::with_config(Config {

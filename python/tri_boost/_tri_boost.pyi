@@ -1,8 +1,19 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Sequence, final
 
 import numpy as np
+
+__all__ = [
+    "TriBoostError",
+    "InvariantError",
+    "ExactnessError",
+    "SerializationError",
+    "InternalError",
+    "_Booster",
+    "_Model",
+    "_TableBank",
+]
 
 
 class TriBoostError(Exception): ...
@@ -12,9 +23,10 @@ class SerializationError(TriBoostError): ...
 class InternalError(TriBoostError): ...
 
 
+@final
 class _Booster:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         n_trees: int = 1000,
         learning_rate: float = 0.05,
         lambda_: float = 1.0,
@@ -23,9 +35,13 @@ class _Booster:
         max_bin: int = 254,
         objective: str | None = None,
         tweedie_rho: float = 1.5,
+        min_data_in_leaf: int = 0,
+        min_sum_hessian_in_leaf: float = 0.0,
+        min_weight_sum_in_leaf: float = 0.0,
+        path_smooth: float = 0.0,
         seed: int = 0,
         n_jobs: int | None = None,
-    ) -> None: ...
+    ) -> _Booster: ...
 
     def fit(
         self,
@@ -39,6 +55,7 @@ class _Booster:
     ) -> _Model: ...
 
 
+@final
 class _Model:
     @staticmethod
     def from_json(s: str) -> _Model: ...
@@ -81,6 +98,7 @@ class _Model:
     def to_bytes(self) -> bytes: ...
 
 
+@final
 class _TableBank:
     @property
     def f0(self) -> float: ...

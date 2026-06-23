@@ -4,7 +4,7 @@
 //! engine ([`hist`]); the split-finder and `fit` loop land in M1.4/M1.5.
 
 use crate::cat::CatEncoderStore;
-use crate::constraints::{InteractionPolicy, MonotoneMap};
+use crate::constraints::{CredibilityFloor, InteractionPolicy, MonotoneMap};
 use crate::data::{AxisKind, AxisProvenance, BinnedMatrix, BorderGrid, TrainBinnedMatrix};
 use crate::error::{Invariant, PbError};
 use crate::loss::{Link, Loss, ObjectiveTag};
@@ -164,6 +164,10 @@ pub struct Hist {
     pub g: Vec<f64>,
     /// Per-cell hessian sums.
     pub h: Vec<f64>,
+    /// Per-cell sample-weight sums `Σw` (§07 credibility `min_weight_sum_in_leaf`).
+    /// Accumulated in the same fixed-order f64 fold as `g`/`h` (thread-count independent).
+    /// Unit when no `sample_weight` is supplied (so it then equals `count` as `f64`).
+    pub wsum: Vec<f64>,
     /// Per-cell row counts.
     pub count: Vec<u32>,
     /// Number of leaves at this level (`2^depth`).
@@ -186,6 +190,7 @@ impl Hist {
         Ok(Self {
             g: Self::try_zeroed_vec(cells, "histogram g")?,
             h: Self::try_zeroed_vec(cells, "histogram h")?,
+            wsum: Self::try_zeroed_vec(cells, "histogram wsum")?,
             count: Self::try_zeroed_vec(cells, "histogram count")?,
             n_leaves,
             n_axes,
@@ -702,10 +707,11 @@ impl Default for Sampling {
 }
 
 /// The optimizer configuration (spec §06.1). v1 green-spine subset: the full §06.1
-/// knob set (`colsample_*`, credibility floors, LR schedule, early stopping) lands
-/// with its features. The v1.5 levers are exposed here as row sampling via
-/// [`Sampling::Mvs`] and quantized histograms via [`HistPrecision::QuantizedI32`];
-/// §09 predictiveness knobs live in [`crate::boosters::BoosterConfig`]. FLAG:
+/// knob set (`colsample_*`, LR schedule, early stopping) lands with its features. The
+/// v1.5 levers are exposed here as row sampling via [`Sampling::Mvs`] and quantized
+/// histograms via [`HistPrecision::QuantizedI32`]; §09 predictiveness knobs live in
+/// [`crate::boosters::BoosterConfig`]; the §07 leaf-credibility floors + `path_smooth`
+/// live on [`FitSpec::credibility`] (alongside the other §07 constraints). FLAG:
 /// `Config` remains a subset of the full §06.1 type for now.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -880,6 +886,9 @@ pub struct FitSpec<'a> {
     pub monotone: MonotoneMap,
     /// Interaction-order limit + optional group whitelist.
     pub interaction: InteractionPolicy,
+    /// Per-leaf credibility floors + `path_smooth` (§07). Threaded here alongside the
+    /// other §07 constraints (`monotone`, `interaction`); the default is exactly inert.
+    pub credibility: CredibilityFloor,
     /// The deterministic base seed threaded through every randomized stage.
     pub seed: u64,
 }

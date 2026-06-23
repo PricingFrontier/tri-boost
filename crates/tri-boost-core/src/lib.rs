@@ -62,7 +62,8 @@ pub use engine::{
 };
 
 pub use constraints::{
-    inverse_wht8_uniform, wht8_uniform, InteractionPolicy, MonoSign, MonotoneMap, Wht8,
+    inverse_wht8_uniform, wht8_uniform, CredibilityFloor, InteractionPolicy, MonoSign, MonotoneMap,
+    Wht8,
 };
 
 pub use explain::{

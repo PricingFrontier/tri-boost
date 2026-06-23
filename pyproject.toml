@@ -29,3 +29,16 @@ module-name = "tri_boost._tri_boost"
 manifest-path = "crates/tri-boost-py/Cargo.toml"
 # abi3 → one wheel per platform, not per interpreter.
 features = ["pyo3/extension-module"]
+
+# The §12.8 stub/lint gate: `mypy --strict` over the typed package + stubtest against
+# the compiled module (run in CI's `python` job).
+[tool.mypy]
+python_version = "3.10"
+strict = true
+
+# scikit-learn ships no `py.typed` marker, so its base classes/mixins resolve to `Any`.
+# Importing it stays dynamically typed; the three `BaseEstimator`/mixin subclasses carry a
+# targeted `# type: ignore[misc]` for the unavoidable subclass-of-`Any` under `--strict`.
+[[tool.mypy.overrides]]
+module = ["sklearn.*"]
+ignore_missing_imports = true

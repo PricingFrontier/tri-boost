@@ -47,7 +47,7 @@ def _as_float32_1d(x: Any, name: str) -> np.ndarray:
     return arr
 
 
-class _BaseTriBoost(BaseEstimator):
+class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (no py.typed)
     def __init__(
         self,
         n_trees: int = 1000,
@@ -58,6 +58,10 @@ class _BaseTriBoost(BaseEstimator):
         max_bin: int = 254,
         objective: str = "squared_error",
         tweedie_rho: float = 1.5,
+        min_data_in_leaf: int = 0,
+        min_sum_hessian_in_leaf: float = 0.0,
+        min_weight_sum_in_leaf: float = 0.0,
+        path_smooth: float = 0.0,
         seed: int = 0,
         n_jobs: int | None = None,
         monotone_constraints: Any = None,
@@ -70,12 +74,16 @@ class _BaseTriBoost(BaseEstimator):
         self.max_bin = max_bin
         self.objective = objective
         self.tweedie_rho = tweedie_rho
+        self.min_data_in_leaf = min_data_in_leaf
+        self.min_sum_hessian_in_leaf = min_sum_hessian_in_leaf
+        self.min_weight_sum_in_leaf = min_weight_sum_in_leaf
+        self.path_smooth = path_smooth
         self.seed = seed
         self.n_jobs = n_jobs
         self.monotone_constraints = monotone_constraints
 
-    def set_params(self, **params: Any):
-        result = super().set_params(**params)
+    def set_params(self, **params: Any) -> "_BaseTriBoost":
+        result: _BaseTriBoost = super().set_params(**params)
         for name in (
             "_model",
             "_precision_warning_emitted_",
@@ -160,6 +168,10 @@ class _BaseTriBoost(BaseEstimator):
             max_bin=int(self.max_bin),
             objective=self.objective,
             tweedie_rho=float(self.tweedie_rho),
+            min_data_in_leaf=int(self.min_data_in_leaf),
+            min_sum_hessian_in_leaf=float(self.min_sum_hessian_in_leaf),
+            min_weight_sum_in_leaf=float(self.min_weight_sum_in_leaf),
+            path_smooth=float(self.path_smooth),
             seed=int(self.seed),
             n_jobs=self._resolve_n_jobs(),
         )
@@ -226,7 +238,7 @@ class _BaseTriBoost(BaseEstimator):
             self.feature_names_in_ = np.asarray(names, dtype=object)
 
 
-class TriBoostRegressor(RegressorMixin, _BaseTriBoost):
+class TriBoostRegressor(RegressorMixin, _BaseTriBoost):  # type: ignore[misc]
     """Exact depth-3 oblivious boosting regressor."""
 
     @classmethod
@@ -247,7 +259,7 @@ class TriBoostRegressor(RegressorMixin, _BaseTriBoost):
         y: Any,
         sample_weight: Any | None = None,
         exposure: Any | None = None,
-    ):
+    ) -> "TriBoostRegressor":
         self._fit_model(
             X,
             y,
@@ -292,7 +304,7 @@ class TriBoostRegressor(RegressorMixin, _BaseTriBoost):
         )
 
 
-class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
+class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):  # type: ignore[misc]
     """Binary exact depth-3 oblivious boosting classifier."""
 
     @classmethod
@@ -317,8 +329,13 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
         max_bin: int = 254,
         objective: str = "logistic",
         tweedie_rho: float = 1.5,
+        min_data_in_leaf: int = 0,
+        min_sum_hessian_in_leaf: float = 0.0,
+        min_weight_sum_in_leaf: float = 0.0,
+        path_smooth: float = 0.0,
         seed: int = 0,
         n_jobs: int | None = None,
+        monotone_constraints: Any = None,
     ) -> None:
         super().__init__(
             n_trees=n_trees,
@@ -329,8 +346,13 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
             max_bin=max_bin,
             objective=objective,
             tweedie_rho=tweedie_rho,
+            min_data_in_leaf=min_data_in_leaf,
+            min_sum_hessian_in_leaf=min_sum_hessian_in_leaf,
+            min_weight_sum_in_leaf=min_weight_sum_in_leaf,
+            path_smooth=path_smooth,
             seed=seed,
             n_jobs=n_jobs,
+            monotone_constraints=monotone_constraints,
         )
 
     def fit(
@@ -339,7 +361,7 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
         y: Any,
         sample_weight: Any | None = None,
         exposure: Any | None = None,
-    ):
+    ) -> "TriBoostClassifier":
         if str(self.objective).replace("-", "_").lower() != "logistic":
             raise ValueError("TriBoostClassifier currently requires objective='logistic'")
         y_arr = np.asarray(y)

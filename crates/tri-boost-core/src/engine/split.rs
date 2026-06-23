@@ -15,7 +15,7 @@
 //! histogram build (`engine::hist`). Determinism is therefore structural.
 
 use crate::backend::{pb_seed, Stage};
-use crate::constraints::MonoSign;
+use crate::constraints::{CredibilityFloor, MonoSign};
 use crate::data::BinnedMatrix;
 use crate::engine::hist::{build_histogram, build_quantized_histogram, QuantizeContext};
 use crate::engine::{low_bit, Hist, HistPrecision, ObliviousTree, Split};
@@ -27,10 +27,9 @@ fn internal(what: &'static str) -> impl Fn() -> PbError {
     move || PbError::Internal { what: what.into() }
 }
 
-/// The split-finder's parameters (the slice of the §06 `Config` the green-spine
-/// grower needs; M1.5's `Config` produces one). Credibility floors
-/// (`min_sum_hessian_in_leaf`, `min_data_in_leaf`) and monotone bounds are §07/M1.5
-/// and land then.
+/// The split-finder's parameters (resolved from the §06 `Config` and the per-fit
+/// `FitSpec`). Monotone bounds (§07.5) and credibility floors (§07.2/§07.6) are wired
+/// through `monotone` and `credibility`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GrowConfig<'a> {
     /// L2 leaf regularizer `λ` (in `w* = −G/(H+λ)` and the gain).
@@ -60,6 +59,10 @@ pub(crate) struct GrowConfig<'a> {
     /// Optional soft table-size admission prior (§07.3/§07.4). It changes only the
     /// ranking score; raw Newton gain still gates and is stored.
     pub table_budget_penalty: Option<TableBudgetPenalty>,
+    /// Per-leaf credibility floors + `path_smooth` (§07.2/§07.6). All-zero is exactly
+    /// inert. The three hard floors veto a candidate whose level produces any
+    /// under-supported cell; `path_smooth` shrinks final leaves toward their parent.
+    pub credibility: CredibilityFloor,
 }
 
 /// A candidate level split with its summed Newton gain.
@@ -341,9 +344,17 @@ pub(crate) fn best_level_split(
     lambda: f64,
     min_split_gain: f64,
     ranking: RankingContext<'_>,
+    credibility: &CredibilityFloor,
 ) -> Result<Option<Candidate>, PbError> {
     let nl = hist.n_leaves;
     let mut best: Option<(Candidate, f64)> = None;
+    // §07.3 step 2: per-cell credibility floors are a HARD reject. Only track per-cell
+    // count/Σw support (alongside the always-present Σh) when a floor can actually bind,
+    // so a default (inert) floor leaves the selected candidate byte-identical.
+    let check_cred = !credibility.rejects_nothing();
+    let min_data = u64::from(credibility.min_data_in_leaf);
+    let min_hess = f64::from(credibility.min_sum_hessian_in_leaf);
+    let min_wsum = f64::from(credibility.min_weight_sum_in_leaf);
 
     for p in 0..hist.n_axes {
         let axis = *axes.get(p).ok_or_else(internal("axis index"))?;
@@ -359,15 +370,27 @@ pub(crate) fn best_level_split(
         let mut total_h = vec![0.0_f64; nl];
         let mut miss_g = vec![0.0_f64; nl];
         let mut miss_h = vec![0.0_f64; nl];
+        // Per-leaf count/Σw totals + missing mass for the credibility floor (only filled
+        // when a floor can bind, so the inert path keeps its exact arithmetic).
+        let mut total_c = vec![0u64; nl];
+        let mut total_w = vec![0.0_f64; nl];
+        let mut miss_c = vec![0u64; nl];
+        let mut miss_w = vec![0.0_f64; nl];
         for leaf in 0..nl {
             let mut tg = 0.0_f64;
             let mut th = 0.0_f64;
+            let mut tc = 0u64;
+            let mut tw = 0.0_f64;
             for b in 0..hist.n_bins {
                 let o = hist
                     .offset(leaf, p, b)
                     .ok_or_else(internal("scan offset"))?;
                 tg += *hist.g.get(o).ok_or_else(internal("scan g"))?;
                 th += *hist.h.get(o).ok_or_else(internal("scan h"))?;
+                if check_cred {
+                    tc += u64::from(*hist.count.get(o).ok_or_else(internal("scan count"))?);
+                    tw += *hist.wsum.get(o).ok_or_else(internal("scan wsum"))?;
+                }
             }
             let leaf_g = total_g.get_mut(leaf).ok_or_else(internal("total_g"))?;
             *leaf_g = tg;
@@ -380,6 +403,14 @@ pub(crate) fn best_level_split(
                 *hist.g.get(o0).ok_or_else(internal("miss g"))?;
             *miss_h.get_mut(leaf).ok_or_else(internal("miss_h"))? =
                 *hist.h.get(o0).ok_or_else(internal("miss h"))?;
+            if check_cred {
+                *total_c.get_mut(leaf).ok_or_else(internal("total_c"))? = tc;
+                *total_w.get_mut(leaf).ok_or_else(internal("total_w"))? = tw;
+                *miss_c.get_mut(leaf).ok_or_else(internal("miss_c"))? =
+                    u64::from(*hist.count.get(o0).ok_or_else(internal("miss count"))?);
+                *miss_w.get_mut(leaf).ok_or_else(internal("miss_w"))? =
+                    *hist.wsum.get(o0).ok_or_else(internal("miss wsum"))?;
+            }
         }
         let parent: f64 = (0..nl)
             .map(|l| {
@@ -394,6 +425,8 @@ pub(crate) fn best_level_split(
         // Prefix the data bins 1..=v as v advances; evaluate both missing directions.
         let mut data_l_g = vec![0.0_f64; nl];
         let mut data_l_h = vec![0.0_f64; nl];
+        let mut data_l_c = vec![0u64; nl];
+        let mut data_l_w = vec![0.0_f64; nl];
         for v in 1..ndb {
             for leaf in 0..nl {
                 let o = hist
@@ -403,6 +436,12 @@ pub(crate) fn best_level_split(
                     *hist.g.get(o).ok_or_else(internal("prefix g"))?;
                 *data_l_h.get_mut(leaf).ok_or_else(internal("data_l_h"))? +=
                     *hist.h.get(o).ok_or_else(internal("prefix h"))?;
+                if check_cred {
+                    *data_l_c.get_mut(leaf).ok_or_else(internal("data_l_c"))? +=
+                        u64::from(*hist.count.get(o).ok_or_else(internal("prefix count"))?);
+                    *data_l_w.get_mut(leaf).ok_or_else(internal("data_l_w"))? +=
+                        *hist.wsum.get(o).ok_or_else(internal("prefix wsum"))?;
+                }
             }
             // NOTE: this is the AGGREGATE dual of the canonical `low_bit` rule —
             // `ml=true` routes the missing bin into the left sum exactly as
@@ -412,6 +451,10 @@ pub(crate) fn best_level_split(
             // guards that. A change to the routing rule must touch both.
             for &ml in &[false, true] {
                 let mut acc = 0.0_f64;
+                // Credibility (§07.3 step 2): a candidate is rejected if ANY of its child
+                // cells across ALL current leaves falls under a floor — the symmetric
+                // whole-level credibility guarantee.
+                let mut credible = true;
                 for leaf in 0..nl {
                     let dlg = *data_l_g.get(leaf).ok_or_else(internal("dlg"))?;
                     let dlh = *data_l_h.get(leaf).ok_or_else(internal("dlh"))?;
@@ -426,10 +469,37 @@ pub(crate) fn best_level_split(
                     let tg = *total_g.get(leaf).ok_or_else(internal("tg"))?;
                     let th = *total_h.get(leaf).ok_or_else(internal("th"))?;
                     acc += newton_term(lg, lh, lambda) + newton_term(tg - lg, th - lh, lambda);
+                    if check_cred && credible {
+                        let dlc = *data_l_c.get(leaf).ok_or_else(internal("dlc"))?;
+                        let dlw = *data_l_w.get(leaf).ok_or_else(internal("dlw"))?;
+                        let (cl, wl) = if ml {
+                            (
+                                dlc + *miss_c.get(leaf).ok_or_else(internal("mc"))?,
+                                dlw + *miss_w.get(leaf).ok_or_else(internal("mw"))?,
+                            )
+                        } else {
+                            (dlc, dlw)
+                        };
+                        let tc = *total_c.get(leaf).ok_or_else(internal("tc cred"))?;
+                        let tw = *total_w.get(leaf).ok_or_else(internal("tw cred"))?;
+                        // h_low = lh, h_high = th − lh (the two child cells of this leaf).
+                        if cl < min_data
+                            || tc.saturating_sub(cl) < min_data
+                            || lh < min_hess
+                            || th - lh < min_hess
+                            || wl < min_wsum
+                            || tw - wl < min_wsum
+                        {
+                            credible = false;
+                        }
+                    }
                 }
                 let gain = 0.5 * (acc - parent);
                 if !gain.is_finite() || gain <= min_split_gain {
                     continue;
+                }
+                if check_cred && !credible {
+                    continue; // hard credibility reject (§07.3 step 2)
                 }
                 if let Some(scan) = ranking.monotone {
                     let mut signs = Vec::with_capacity(scan.level + 1);
@@ -559,6 +629,120 @@ pub(crate) fn leaf_values(
     Ok(leaves)
 }
 
+/// Per-leaf full-precision `(Σg, Σh, count)` aggregates over `rows` — the inputs to
+/// `path_smooth`'s per-node Newton outputs. Mirrors the `leaf_values` fold but also keeps
+/// the row counts. Sequential f64 fold ⇒ thread-count independent.
+///
+/// # Errors
+/// [`PbError::Internal`] on an out-of-range leaf id or row index.
+#[allow(clippy::type_complexity)]
+fn leaf_aggregates(
+    gh: &GradHess,
+    rows: &[u32],
+    leaf_of_row: &[u8],
+    depth: usize,
+) -> Result<([f64; 8], [f64; 8], [u64; 8]), PbError> {
+    let n_leaves = 1usize << depth.min(3);
+    let mut g = [0.0_f64; 8];
+    let mut h = [0.0_f64; 8];
+    let mut c = [0u64; 8];
+    for &r in rows {
+        let ru = r as usize;
+        let leaf = usize::from(*leaf_of_row.get(ru).ok_or_else(internal("ps leaf map"))?);
+        if leaf >= n_leaves {
+            return Err(PbError::Internal {
+                what: "leaf id out of range in leaf_aggregates".into(),
+            });
+        }
+        *g.get_mut(leaf).ok_or_else(internal("ps g"))? +=
+            f64::from(*gh.g.get(ru).ok_or_else(internal("ps gh.g"))?);
+        *h.get_mut(leaf).ok_or_else(internal("ps h"))? +=
+            f64::from(*gh.h.get(ru).ok_or_else(internal("ps gh.h"))?);
+        *c.get_mut(leaf).ok_or_else(internal("ps c"))? += 1;
+    }
+    Ok((g, h, c))
+}
+
+/// Shrink each leaf toward its oblivious-tree parent node (§07.6 `path_smooth`):
+/// `s[node] = (v[node]·n + s[parent]·ps) / (n + ps)`, recursively from the root (whose
+/// parent contributes `s = 0`). Internal-node values `v` are the raw lr-scaled Newton step
+/// on that node's rows; the depth-level (leaf) `v` are the (already monotone-clamped)
+/// `leaves` passed in, so smoothing composes with the clamp. A node at level `L` is
+/// identified by the first `L` split bits, and its parent drops the bit added at level
+/// `L-1`. No-op when `ps <= 0`. VALUE-LEVEL on a fixed structure — depth, the ≤3-feature
+/// support, and I2 are untouched.
+///
+/// # Errors
+/// [`PbError::Internal`] on an index escape; [`PbError::InvalidInput`] if a smoothed leaf
+/// is not finite/representable as `f32`.
+#[allow(clippy::too_many_arguments)]
+fn apply_path_smooth(
+    leaves: &mut [f32; 8],
+    leaf_g: &[f64; 8],
+    leaf_h: &[f64; 8],
+    leaf_count: &[u64; 8],
+    depth: usize,
+    lambda: f64,
+    lr: f64,
+    max_delta_step: Option<f64>,
+    path_smooth: f64,
+) -> Result<(), PbError> {
+    if !(path_smooth.is_finite() && path_smooth > 0.0) {
+        return Ok(());
+    }
+    let depth = depth.min(3);
+    let n_leaves = 1usize << depth;
+    // Smoothed outputs of the previous (shallower) level, indexed by that level's node id.
+    let mut s_parent: Vec<f64> = Vec::new();
+    let mut parent_is_virtual = true; // level 0's parent is the virtual `s = 0` root.
+    for level in 0..=depth {
+        let n_nodes = 1usize << level;
+        let node_mask = n_nodes - 1;
+        let mut s_cur = vec![0.0_f64; n_nodes];
+        for j in 0..n_nodes {
+            // Aggregate this node's rows from the leaves beneath it.
+            let mut g = 0.0_f64;
+            let mut h = 0.0_f64;
+            let mut cnt = 0u64;
+            for leaf in 0..n_leaves {
+                if leaf & node_mask == j {
+                    g += *leaf_g.get(leaf).ok_or_else(internal("ps node g"))?;
+                    h += *leaf_h.get(leaf).ok_or_else(internal("ps node h"))?;
+                    cnt += *leaf_count.get(leaf).ok_or_else(internal("ps node c"))?;
+                }
+            }
+            let v = if level == depth {
+                f64::from(*leaves.get(j).ok_or_else(internal("ps leaf v"))?)
+            } else {
+                newton_leaf(g, h, lambda, lr, max_delta_step)
+            };
+            let parent_s = if parent_is_virtual {
+                0.0
+            } else {
+                *s_parent
+                    .get(j & (node_mask >> 1))
+                    .ok_or_else(internal("ps parent s"))?
+            };
+            let n = cnt as f64;
+            *s_cur.get_mut(j).ok_or_else(internal("ps s_cur"))? =
+                (v * n + parent_s * path_smooth) / (n + path_smooth);
+        }
+        s_parent = s_cur;
+        parent_is_virtual = false;
+    }
+    // `s_parent` now holds the depth-level (leaf) smoothed values.
+    for j in 0..n_leaves {
+        let val = *s_parent.get(j).ok_or_else(internal("ps out"))?;
+        if !val.is_finite() || val < f64::from(f32::MIN) || val > f64::from(f32::MAX) {
+            return Err(PbError::InvalidInput {
+                what: "path_smooth leaf value is not finite/representable as f32".into(),
+            });
+        }
+        *leaves.get_mut(j).ok_or_else(internal("ps write"))? = val as f32;
+    }
+    Ok(())
+}
+
 /// Refit an already-chosen tree structure from full-precision gradients over `rows`.
 ///
 /// MVS uses a sampled row set only to choose the split structure; the leaf values are
@@ -601,12 +785,24 @@ pub(crate) fn refit_tree_leaves(
     )?;
     // Re-enforce monotonicity: the structure was chosen on the sampled subset, but these
     // leaves were just recomputed on the FULL rows and could invert a cousin pair.
-    clamp_monotone(
-        &mut tree.leaves,
-        &tree.splits,
-        usize::from(tree.depth),
-        cfg.monotone,
-    )?;
+    let depth = usize::from(tree.depth);
+    clamp_monotone(&mut tree.leaves, &tree.splits, depth, cfg.monotone)?;
+    // path_smooth applies to the FINAL (full-row) leaves too, after the clamp (§07.6).
+    if cfg.credibility.path_smooth > 0.0 {
+        let (lg, lh, lc) = leaf_aggregates(gh, rows, &leaf_of_row, depth)?;
+        apply_path_smooth(
+            &mut tree.leaves,
+            &lg,
+            &lh,
+            &lc,
+            depth,
+            cfg.lambda,
+            cfg.lr,
+            cfg.max_delta_step,
+            f64::from(cfg.credibility.path_smooth),
+        )?;
+        clamp_monotone(&mut tree.leaves, &tree.splits, depth, cfg.monotone)?;
+    }
     Ok(())
 }
 
@@ -627,6 +823,7 @@ pub(crate) fn grow_oblivious_tree(
     rows: &[u32],
     axes: &[u32],
     cfg: &GrowConfig<'_>,
+    weight: &[f32],
 ) -> Result<Option<ObliviousTree>, PbError> {
     let n_rows = x.n_rows as usize;
     let mut leaf_of_row: Vec<u8> = Hist::try_zeroed_vec(n_rows, "leaf assignment")?;
@@ -670,7 +867,7 @@ pub(crate) fn grow_oblivious_tree(
         let n_leaves = 1usize << level;
         let hist = match cfg.hist_precision {
             HistPrecision::FullF64 => {
-                build_histogram(x, gh, rows, &leaf_of_row, n_leaves, &admissible)?
+                build_histogram(x, gh, rows, &leaf_of_row, n_leaves, &admissible, weight)?
             }
             HistPrecision::QuantizedI32 => build_quantized_histogram(
                 x,
@@ -683,6 +880,7 @@ pub(crate) fn grow_oblivious_tree(
                     seed: cfg.quant_seed,
                     round: cfg.round,
                 },
+                weight,
             )?,
         };
         let candidate_axis_signs: Vec<Option<MonoSign>> = match cfg.monotone {
@@ -710,6 +908,7 @@ pub(crate) fn grow_oblivious_tree(
                 noise: SplitNoise::new(cfg.quant_seed, cfg.round, level, cfg.random_strength),
                 table_penalties: ranking_penalties.as_deref(),
             },
+            &cfg.credibility,
         )? {
             Some(c) => c,
             None => break, // graceful early-termination (depth < 3)
@@ -762,6 +961,23 @@ pub(crate) fn grow_oblivious_tree(
     // Project onto the monotone cone — a no-op when the structure was grown feasible, but
     // a guard against quantized-histogram round-off inverting a cousin pair (§07.5).
     clamp_monotone(&mut leaves, &splits, depth, cfg.monotone)?;
+    // §07.6 path_smooth: shrink each leaf toward its oblivious-tree parent, AFTER the
+    // monotone clamp, then re-clamp so smoothing cannot cross a monotone bound.
+    if cfg.credibility.path_smooth > 0.0 {
+        let (lg, lh, lc) = leaf_aggregates(gh, rows, &leaf_of_row, depth)?;
+        apply_path_smooth(
+            &mut leaves,
+            &lg,
+            &lh,
+            &lc,
+            depth,
+            cfg.lambda,
+            cfg.lr,
+            cfg.max_delta_step,
+            f64::from(cfg.credibility.path_smooth),
+        )?;
+        clamp_monotone(&mut leaves, &splits, depth, cfg.monotone)?;
+    }
     Ok(Some(ObliviousTree::try_new(splits, leaves, &x.provenance)?))
 }
 
@@ -851,9 +1067,17 @@ mod tests {
         set(&mut hist, 1, 4.0, 2.0, 1);
         set(&mut hist, 2, -6.0, 3.0, 1);
 
-        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, RankingContext::default())
-            .unwrap()
-            .unwrap();
+        let best = best_level_split(
+            &hist,
+            &[0],
+            &[2],
+            1.0,
+            0.0,
+            RankingContext::default(),
+            &CredibilityFloor::default(),
+        )
+        .unwrap()
+        .unwrap();
         // Only candidate is v=1. total_g=0,total_h=6 ⇒ parent=0²/7=0.
         //   ml=false: L=bin1 (4,2)→16/3; R=bin2+miss (-4,4)→16/5; gain=½(16/3+16/5)=4.2667.
         //   ml=true:  L=bin1+miss (6,3)→9;  R=bin2 (-6,3)→9;      gain=½(9+9)=9.
@@ -894,6 +1118,7 @@ mod tests {
                 noise,
                 ..RankingContext::default()
             },
+            &CredibilityFloor::default(),
         )
         .unwrap()
         .unwrap();
@@ -929,10 +1154,17 @@ mod tests {
         set_axis(&mut hist, 0, (20.0_f64).sqrt());
         set_axis(&mut hist, 1, (18.0_f64).sqrt());
 
-        let raw_best =
-            best_level_split(&hist, &[0, 1], &[2, 2], 1.0, 0.0, RankingContext::default())
-                .unwrap()
-                .unwrap();
+        let raw_best = best_level_split(
+            &hist,
+            &[0, 1],
+            &[2, 2],
+            1.0,
+            0.0,
+            RankingContext::default(),
+            &CredibilityFloor::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(raw_best.axis, 0);
         assert!((raw_best.gain - 10.0).abs() < 1.0e-9);
 
@@ -946,6 +1178,7 @@ mod tests {
                 table_penalties: Some(&[0.5, 1.0]),
                 ..RankingContext::default()
             },
+            &CredibilityFloor::default(),
         )
         .unwrap()
         .unwrap();
@@ -969,11 +1202,17 @@ mod tests {
         hist.g[o] = 1.0;
         hist.h[o] = 1.0;
         // Single populated bin ⇒ any split is degenerate (gain 0); a positive floor rejects it.
-        assert!(
-            best_level_split(&hist, &[0], &[2], 1.0, 1.0, RankingContext::default())
-                .unwrap()
-                .is_none()
-        );
+        assert!(best_level_split(
+            &hist,
+            &[0],
+            &[2],
+            1.0,
+            1.0,
+            RankingContext::default(),
+            &CredibilityFloor::default()
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -1080,7 +1319,139 @@ mod tests {
             groups: None,
             monotone: None,
             table_budget_penalty: None,
+            credibility: CredibilityFloor::default(),
         }
+    }
+
+    /// Unit weights of length `n` for `grow_oblivious_tree` calls that don't exercise
+    /// the `min_weight_sum_in_leaf` floor.
+    fn ones(n: usize) -> Vec<f32> {
+        vec![1.0_f32; n]
+    }
+
+    /// A `GrowConfig` like `cfg(1.0, 0.1, 0.0, 3)` but carrying a credibility floor.
+    fn cfg_cred(floor: CredibilityFloor) -> GrowConfig<'static> {
+        GrowConfig {
+            credibility: floor,
+            ..cfg(1.0, 0.1, 0.0, 3)
+        }
+    }
+
+    #[test]
+    fn credibility_floors_reject_under_supported_children() {
+        // 1 leaf, 1 axis, 3 bins. The only candidate (bin_le=1) splits into bin1 (well
+        // supported) and bin2 (count 2, Σh 2, Σw 2) — a thin cell each floor can veto.
+        let mut hist = Hist::try_zeros(1, 1, 3).unwrap();
+        let set = |hist: &mut Hist, bin: usize, g: f64, h: f64, c: u32, w: f64| {
+            let o = hist.offset(0, 0, bin).unwrap();
+            hist.g[o] = g;
+            hist.h[o] = h;
+            hist.count[o] = c;
+            hist.wsum[o] = w;
+        };
+        set(&mut hist, 0, 0.0, 0.0, 0, 0.0); // missing: empty
+        set(&mut hist, 1, -5.0, 10.0, 10, 10.0);
+        set(&mut hist, 2, 5.0, 2.0, 2, 2.0);
+        let split = |floor: &CredibilityFloor| {
+            best_level_split(
+                &hist,
+                &[0],
+                &[2],
+                1.0,
+                0.0,
+                RankingContext::default(),
+                floor,
+            )
+            .unwrap()
+        };
+        // No floor ⇒ the informative split is found.
+        assert!(split(&CredibilityFloor::default()).is_some());
+        // Each floor independently vetoes the under-supported bin-2 child ⇒ no candidate.
+        assert!(split(&CredibilityFloor {
+            min_data_in_leaf: 5,
+            ..CredibilityFloor::default()
+        })
+        .is_none());
+        assert!(split(&CredibilityFloor {
+            min_sum_hessian_in_leaf: 3.0,
+            ..CredibilityFloor::default()
+        })
+        .is_none());
+        assert!(split(&CredibilityFloor {
+            min_weight_sum_in_leaf: 5.0,
+            ..CredibilityFloor::default()
+        })
+        .is_none());
+        // A floor at or below the thin cell's support still admits the split.
+        assert!(split(&CredibilityFloor {
+            min_data_in_leaf: 2,
+            min_sum_hessian_in_leaf: 2.0,
+            min_weight_sum_in_leaf: 2.0,
+            ..CredibilityFloor::default()
+        })
+        .is_some());
+    }
+
+    #[test]
+    fn path_smooth_shrinks_leaves_toward_parent_node() {
+        // depth 1: leaf0 raw value +1, leaf1 raw value −1, each n=10; root value 0.
+        // λ=0, lr=1 ⇒ newton_leaf(g,h) = −g/h matches the leaf values below.
+        let lg = [-10.0_f64, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let lh = [10.0_f64, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let lc = [10u64, 10, 0, 0, 0, 0, 0, 0];
+        let base = [1.0_f32, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        // ps = 0 ⇒ exact no-op.
+        let mut a = base;
+        apply_path_smooth(&mut a, &lg, &lh, &lc, 1, 0.0, 1.0, None, 0.0).unwrap();
+        assert_eq!(a, base);
+        // ps = 2 ⇒ each leaf shrinks toward the root (0) by the factor n/(n+ps)=10/12.
+        let mut s = base;
+        apply_path_smooth(&mut s, &lg, &lh, &lc, 1, 0.0, 1.0, None, 2.0).unwrap();
+        assert!((s[0] - 10.0 / 12.0).abs() < 1e-6);
+        assert!((s[1] + 10.0 / 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn grow_with_large_path_smooth_collapses_leaf_spread() {
+        // Distinct per-quadrant gradients ⇒ an informative depth-2 tree.
+        let c0: Vec<u8> = vec![1, 1, 1, 1, 2, 2, 2, 2];
+        let c1: Vec<u8> = vec![1, 1, 2, 2, 1, 1, 2, 2];
+        let x = matrix(vec![c0, c1], &[3, 3]);
+        let g = [-3.0_f32, -3.0, 1.0, 1.0, 2.0, 2.0, 6.0, 6.0];
+        let gh = gradhess(&g, &[1.0; 8]);
+        let rows: Vec<u32> = (0..8).collect();
+        let w = ones(x.n_rows as usize);
+        let base = grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &cfg(1.0, 0.1, 0.0, 3), &w)
+            .unwrap()
+            .expect("a tree");
+        let smooth = grow_oblivious_tree(
+            &x,
+            &gh,
+            &rows,
+            &[0, 1],
+            &cfg_cred(CredibilityFloor {
+                path_smooth: 1e6,
+                ..CredibilityFloor::default()
+            }),
+            &w,
+        )
+        .unwrap()
+        .expect("a tree");
+        // path_smooth is value-level: identical structure, but the leaves collapse toward
+        // the (near-zero) parent/root under heavy smoothing.
+        assert_eq!(base.splits, smooth.splits);
+        let spread = |t: &ObliviousTree| {
+            let lo = t.leaves.iter().copied().fold(f32::INFINITY, f32::min);
+            let hi = t.leaves.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            hi - lo
+        };
+        assert!(spread(&base) > 1e-3, "base tree must be informative");
+        assert!(
+            spread(&smooth) < spread(&base),
+            "heavy path_smooth must compress the leaf spread: base {} vs smooth {}",
+            spread(&base),
+            spread(&smooth)
+        );
     }
 
     #[test]
@@ -1093,9 +1464,16 @@ mod tests {
         let g = [-3.0_f32, -3.0, 1.0, 1.0, 2.0, 2.0, 6.0, 6.0];
         let gh = gradhess(&g, &[1.0; 8]);
         let rows: Vec<u32> = (0..8).collect();
-        let tree = grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &cfg(1.0, 1.0, 0.0, 3))
-            .unwrap()
-            .expect("a tree should grow");
+        let tree = grow_oblivious_tree(
+            &x,
+            &gh,
+            &rows,
+            &[0, 1],
+            &cfg(1.0, 1.0, 0.0, 3),
+            &ones(x.n_rows as usize),
+        )
+        .unwrap()
+        .expect("a tree should grow");
         assert!((1..=3).contains(&tree.depth));
         // Distinct raw features across splits == depth (I1).
         let mut raws: Vec<u32> = tree.splits.iter().map(|s| s.axis).collect();
@@ -1120,9 +1498,16 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
-                grow_oblivious_tree(&x, &gh, &rows, &[0, 1, 2], &cfg(1.0, 0.1, 0.0, 3))
-                    .unwrap()
-                    .unwrap()
+                grow_oblivious_tree(
+                    &x,
+                    &gh,
+                    &rows,
+                    &[0, 1, 2],
+                    &cfg(1.0, 0.1, 0.0, 3),
+                    &ones(x.n_rows as usize),
+                )
+                .unwrap()
+                .unwrap()
             })
         };
         let a = run(1);
@@ -1150,7 +1535,7 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
-                grow_oblivious_tree(&x, &gh, &rows, &[0, 1, 2], &cfg)
+                grow_oblivious_tree(&x, &gh, &rows, &[0, 1, 2], &cfg, &ones(x.n_rows as usize))
                     .unwrap()
                     .unwrap()
             })
@@ -1166,7 +1551,15 @@ mod tests {
         let x = matrix(vec![vec![1u8, 2, 1, 2]], &[3]);
         let gh = gradhess(&[1.0, 1.0, 1.0, 1.0], &[1.0; 4]);
         let rows = [0u32, 1, 2, 3];
-        let tree = grow_oblivious_tree(&x, &gh, &rows, &[0], &cfg(1.0, 0.1, 1e-9, 1)).unwrap();
+        let tree = grow_oblivious_tree(
+            &x,
+            &gh,
+            &rows,
+            &[0],
+            &cfg(1.0, 0.1, 1e-9, 1),
+            &ones(x.n_rows as usize),
+        )
+        .unwrap();
         assert!(tree.is_none(), "constant gradient must not split");
     }
 
@@ -1232,9 +1625,16 @@ mod tests {
         let x = matrix(vec![c0, c1], &[3, 3]);
         let gh = gradhess(&[-2.0, -1.0, 1.0, 2.0], &[1.0; 4]);
         let rows = [0u32, 1, 2, 3];
-        let tree = grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &cfg(1.0, 0.1, 0.0, 1))
-            .unwrap()
-            .unwrap();
+        let tree = grow_oblivious_tree(
+            &x,
+            &gh,
+            &rows,
+            &[0, 1],
+            &cfg(1.0, 0.1, 0.0, 1),
+            &ones(x.n_rows as usize),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(tree.depth, 1);
     }
 
@@ -1251,14 +1651,16 @@ mod tests {
         let denied_groups = vec![FeatureSet::new(&[0])];
         let mut denied = cfg(1.0, 0.1, 0.0, 2);
         denied.groups = Some(&denied_groups);
-        assert!(grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &denied)
-            .unwrap()
-            .is_none());
+        assert!(
+            grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &denied, &ones(x.n_rows as usize))
+                .unwrap()
+                .is_none()
+        );
 
         let allowed_groups = vec![FeatureSet::new(&[1])];
         let mut allowed = cfg(1.0, 0.1, 0.0, 2);
         allowed.groups = Some(&allowed_groups);
-        let tree = grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &allowed)
+        let tree = grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &allowed, &ones(x.n_rows as usize))
             .unwrap()
             .unwrap();
         assert_eq!(tree.splits[0].axis, 1);
@@ -1281,9 +1683,17 @@ mod tests {
         set(&mut hist, 0, 2.0, 1.0);
         set(&mut hist, 1, -6.0, 3.0);
         set(&mut hist, 2, 4.0, 2.0);
-        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, RankingContext::default())
-            .unwrap()
-            .unwrap();
+        let best = best_level_split(
+            &hist,
+            &[0],
+            &[2],
+            1.0,
+            0.0,
+            RankingContext::default(),
+            &CredibilityFloor::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(!best.missing_left, "missing should be learned RIGHT here");
         assert!((best.gain - 9.0).abs() < 1e-9, "gain {} != 9", best.gain);
     }
@@ -1347,9 +1757,16 @@ mod tests {
         // (With λ > 0 the small-variance 3rd split is correctly regularized away — the
         // L2 penalty adds λ to TWO child denominators vs one parent — which is why the
         // default-λ tree may stop at depth 2; that is correct behavior, not a defect.)
-        let tree = grow_oblivious_tree(&x, &gh, &rows, &[0, 1, 2], &cfg(0.0, 0.1, 0.0, 3))
-            .unwrap()
-            .expect("a depth-3 tree should grow");
+        let tree = grow_oblivious_tree(
+            &x,
+            &gh,
+            &rows,
+            &[0, 1, 2],
+            &cfg(0.0, 0.1, 0.0, 3),
+            &ones(x.n_rows as usize),
+        )
+        .unwrap()
+        .expect("a depth-3 tree should grow");
         assert_eq!(tree.depth, 3, "all three features are informative");
         let mut raws: Vec<u32> = tree.splits.iter().map(|s| s.axis).collect();
         raws.sort_unstable();
@@ -1365,9 +1782,16 @@ mod tests {
         let x = matrix(vec![c0, c1], &[3, 3]);
         let gh = gradhess(&[-2.0, -1.0, 1.0, 2.0], &[1.0; 4]);
         let rows = [0u32, 1, 2, 3];
-        let tree = grow_oblivious_tree(&x, &gh, &rows, &[0, 1], &cfg(1.0, 0.1, 0.0, 3))
-            .unwrap()
-            .unwrap();
+        let tree = grow_oblivious_tree(
+            &x,
+            &gh,
+            &rows,
+            &[0, 1],
+            &cfg(1.0, 0.1, 0.0, 3),
+            &ones(x.n_rows as usize),
+        )
+        .unwrap()
+        .unwrap();
         let model = model_from(tree, &x);
         crate::explain::check_feature_budget(&model).expect("a grown tree must satisfy I1");
     }
@@ -1419,7 +1843,7 @@ mod tests {
             let gh = gradhess(&g, &h);
             let rows: Vec<u32> = (0..x.n_rows).collect();
             let axes: Vec<u32> = (0..n_feat as u32).collect();
-            let res = grow_oblivious_tree(&x, &gh, &rows, &axes, &cfg(1.0, 0.1, 0.0, 3));
+            let res = grow_oblivious_tree(&x, &gh, &rows, &axes, &cfg(1.0, 0.1, 0.0, 3), &ones(x.n_rows as usize));
             prop_assert!(res.is_ok());
             if let Some(tree) = res.unwrap() {
                 // I1: depth 1..=3, splits.len()==depth, distinct raw features == depth.

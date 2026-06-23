@@ -29,7 +29,7 @@ __all__ = [
 __version__ = "0.1.0"
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> type:
     if name in {"TriBoostClassifier", "TriBoostRegressor", "PrecisionWarning"}:
         from .sklearn import PrecisionWarning, TriBoostClassifier, TriBoostRegressor
 

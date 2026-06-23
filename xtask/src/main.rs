@@ -35,9 +35,9 @@ use serde::Deserialize;
 use serde_json::json;
 use tri_boost_core::{
     assert_exact_decomposition, bin, bin_columns, check_feature_budget, encode_model, BinConfig,
-    BinnedMatrix, Booster, BoosterConfig, Config, ExactnessMode, FitSpec, HistPrecision,
-    InteractionPolicy, Loss, MonotoneMap, NesterovSpec, OverflowPolicy, PbError, RefMeasure,
-    RefitSpec, Sampling, ServeBinnedMatrix, SquaredError, Stage, TableBudget,
+    BinnedMatrix, Booster, BoosterConfig, Config, CredibilityFloor, ExactnessMode, FitSpec,
+    HistPrecision, InteractionPolicy, Loss, MonotoneMap, NesterovSpec, OverflowPolicy, PbError,
+    RefMeasure, RefitSpec, Sampling, ServeBinnedMatrix, SquaredError, Stage, TableBudget,
 };
 
 /// A grep-gate: scans the shipped sources and returns any violations found.
@@ -733,6 +733,7 @@ fn run_adversarial_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
         exposure: None,
         monotone: MonotoneMap::new(),
         interaction: InteractionPolicy::default(),
+        credibility: CredibilityFloor::default(),
         seed,
     };
     let model = Booster::with_config(accuracy_config(BoosterConfig::default()))
@@ -917,6 +918,7 @@ fn fit_score_candidate(
         exposure: None,
         monotone: MonotoneMap::new(),
         interaction: InteractionPolicy::default(),
+        credibility: CredibilityFloor::default(),
         seed,
     };
     let model = booster.fit(x_train, &train.y, &spec)?;

@@ -19,9 +19,9 @@
 
 use tri_boost_core::{
     assert_exact_decomposition, bin_serve_columns, bin_train_columns, BinConfig, Booster,
-    CategoricalColumn, Config, FeatureId, FitSpec, InteractionPolicy, LeakageScheme, MonotoneMap,
-    NumericColumn, RefMeasure, ServeCategoricalColumn, Smooth, SquaredError, TsConfig,
-    TsEncodingId,
+    CategoricalColumn, Config, CredibilityFloor, FeatureId, FitSpec, InteractionPolicy,
+    LeakageScheme, MonotoneMap, NumericColumn, RefMeasure, ServeCategoricalColumn, Smooth,
+    SquaredError, TsConfig, TsEncodingId,
 };
 
 #[test]
@@ -68,6 +68,7 @@ fn categorical_model_explains_and_passes_all_five_gates() {
         exposure: None,
         monotone: MonotoneMap::new(),
         interaction: InteractionPolicy::default(),
+        credibility: CredibilityFloor::default(),
         seed: 0,
     };
     let model = Booster::with_config(Config {

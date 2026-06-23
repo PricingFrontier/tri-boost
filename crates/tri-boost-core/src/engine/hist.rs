@@ -87,6 +87,7 @@ pub(crate) fn build_histogram(
     leaf_of_row: &[u8],
     n_leaves: usize,
     axes: &[u32],
+    weight: &[f32],
 ) -> Result<Hist, PbError> {
     let mut max_bins = 0usize;
     for &a in axes {
@@ -101,7 +102,7 @@ pub(crate) fn build_histogram(
     // Each axis is built independently (disjoint output region) on its own task.
     let subs: Result<Vec<AxisHist>, PbError> = axes
         .par_iter()
-        .map(|&a| accumulate_axis(x, gh, rows, leaf_of_row, n_leaves, a, max_bins))
+        .map(|&a| accumulate_axis(x, gh, rows, leaf_of_row, n_leaves, a, max_bins, weight))
         .collect();
     let subs = subs?;
 
@@ -124,6 +125,8 @@ pub(crate) fn build_histogram(
                     *sub.g.get(src).ok_or_else(oob("sub g"))?;
                 *hist.h.get_mut(dst).ok_or_else(oob("assemble h"))? =
                     *sub.h.get(src).ok_or_else(oob("sub h"))?;
+                *hist.wsum.get_mut(dst).ok_or_else(oob("assemble wsum"))? =
+                    *sub.wsum.get(src).ok_or_else(oob("sub wsum"))?;
                 *hist.count.get_mut(dst).ok_or_else(oob("assemble count"))? =
                     *sub.count.get(src).ok_or_else(oob("sub count"))?;
             }
@@ -241,6 +244,7 @@ fn stochastic_round(value: f64, seed: u64, round: u32, block: u32) -> Result<i32
 ///
 /// # Errors
 /// Propagates quantization and shape/index errors.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_quantized_histogram(
     x: &BinnedMatrix,
     gh: &GradHess,
@@ -249,6 +253,7 @@ pub(crate) fn build_quantized_histogram(
     n_leaves: usize,
     axes: &[u32],
     ctx: QuantizeContext,
+    weight: &[f32],
 ) -> Result<Hist, PbError> {
     let qgh = quantize_grad_hess(gh, ctx.seed, ctx.round)?;
     let mut max_bins = 0usize;
@@ -262,7 +267,9 @@ pub(crate) fn build_quantized_histogram(
     let n_axes = axes.len();
     let subs: Result<Vec<AxisQHist>, PbError> = axes
         .par_iter()
-        .map(|&a| accumulate_axis_quantized(x, &qgh, rows, leaf_of_row, n_leaves, a, max_bins))
+        .map(|&a| {
+            accumulate_axis_quantized(x, &qgh, rows, leaf_of_row, n_leaves, a, max_bins, weight)
+        })
         .collect();
     let subs = subs?;
     let mut hist = Hist::try_zeros(n_leaves, n_axes, max_bins)?;
@@ -285,6 +292,11 @@ pub(crate) fn build_quantized_histogram(
                 *hist.h.get_mut(dst).ok_or_else(oob("assemble quant h"))? =
                     *sub.h.get(src).ok_or_else(oob("sub quant h"))? as f64 * inv_h;
                 *hist
+                    .wsum
+                    .get_mut(dst)
+                    .ok_or_else(oob("assemble quant wsum"))? =
+                    *sub.wsum.get(src).ok_or_else(oob("sub quant wsum"))?;
+                *hist
                     .count
                     .get_mut(dst)
                     .ok_or_else(oob("assemble quant count"))? =
@@ -299,12 +311,16 @@ pub(crate) fn build_quantized_histogram(
 struct AxisHist {
     g: Vec<f64>,
     h: Vec<f64>,
+    wsum: Vec<f64>,
     count: Vec<u32>,
 }
 
 struct AxisQHist {
     g: Vec<i64>,
     h: Vec<i64>,
+    /// Sample-weight sums stay full-precision `f64` — weights are not gradients, so they
+    /// are never quantized (the credibility floor reads exact Σw on both hist paths).
+    wsum: Vec<f64>,
     count: Vec<u32>,
 }
 
@@ -314,6 +330,7 @@ impl AxisQHist {
         Ok(Self {
             g: Hist::try_zeroed_vec(size, "axis quant histogram g")?,
             h: Hist::try_zeroed_vec(size, "axis quant histogram h")?,
+            wsum: Hist::try_zeroed_vec(size, "axis quant histogram wsum")?,
             count: Hist::try_zeroed_vec(size, "axis quant histogram count")?,
         })
     }
@@ -325,11 +342,13 @@ impl AxisHist {
         Ok(Self {
             g: Hist::try_zeroed_vec(size, "axis histogram g")?,
             h: Hist::try_zeroed_vec(size, "axis histogram h")?,
+            wsum: Hist::try_zeroed_vec(size, "axis histogram wsum")?,
             count: Hist::try_zeroed_vec(size, "axis histogram count")?,
         })
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accumulate_axis(
     x: &BinnedMatrix,
     gh: &GradHess,
@@ -338,6 +357,7 @@ fn accumulate_axis(
     n_leaves: usize,
     axis: u32,
     max_bins: usize,
+    weight: &[f32],
 ) -> Result<AxisHist, PbError> {
     let col = x
         .data
@@ -359,6 +379,8 @@ fn accumulate_axis(
             f64::from(*gh.g.get(ru).ok_or_else(oob("gh.g"))?);
         *out.h.get_mut(idx).ok_or_else(oob("h cell"))? +=
             f64::from(*gh.h.get(ru).ok_or_else(oob("gh.h"))?);
+        *out.wsum.get_mut(idx).ok_or_else(oob("wsum cell"))? +=
+            f64::from(*weight.get(ru).ok_or_else(oob("weight"))?);
         let c = out.count.get_mut(idx).ok_or_else(oob("count cell"))?;
         // count <= rows.len() <= n_rows <= u32::MAX, so this never actually overflows;
         // checked_add keeps it panic-free under overflow-checks regardless.
@@ -367,6 +389,7 @@ fn accumulate_axis(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accumulate_axis_quantized(
     x: &BinnedMatrix,
     qgh: &QuantGradHess,
@@ -375,6 +398,7 @@ fn accumulate_axis_quantized(
     n_leaves: usize,
     axis: u32,
     max_bins: usize,
+    weight: &[f32],
 ) -> Result<AxisQHist, PbError> {
     let col = x
         .data
@@ -404,6 +428,8 @@ fn accumulate_axis_quantized(
             i64::from(*qgh.g_q.get(ru).ok_or_else(oob("qgh.g"))?);
         *out.h.get_mut(idx).ok_or_else(oob("quant h cell"))? +=
             i64::from(*qgh.h_q.get(ru).ok_or_else(oob("qgh.h"))?);
+        *out.wsum.get_mut(idx).ok_or_else(oob("quant wsum cell"))? +=
+            f64::from(*weight.get(ru).ok_or_else(oob("quant weight"))?);
         let c = out.count.get_mut(idx).ok_or_else(oob("quant count cell"))?;
         *c = c
             .checked_add(1)
@@ -431,6 +457,9 @@ pub(crate) fn subtract(parent: &Hist, left: &Hist) -> Result<Hist, PbError> {
         *o = p - l;
     }
     for (o, (p, l)) in out.h.iter_mut().zip(parent.h.iter().zip(&left.h)) {
+        *o = p - l;
+    }
+    for (o, (p, l)) in out.wsum.iter_mut().zip(parent.wsum.iter().zip(&left.wsum)) {
         *o = p - l;
     }
     for (o, (p, l)) in out
@@ -491,6 +520,28 @@ mod tests {
         }
     }
 
+    /// Most existing tests don't exercise weighted Σw, so they build with unit weights
+    /// (then `wsum == count` as `f64`). The dedicated `wsum_*` tests below pass real
+    /// weights to `build_histogram`/`build_quantized_histogram` directly.
+    fn build_hist(
+        x: &BinnedMatrix,
+        gh: &GradHess,
+        rows: &[u32],
+        leaf_of_row: &[u8],
+        n_leaves: usize,
+        axes: &[u32],
+    ) -> Result<Hist, PbError> {
+        build_histogram(
+            x,
+            gh,
+            rows,
+            leaf_of_row,
+            n_leaves,
+            axes,
+            &vec![1.0_f32; gh.g.len()],
+        )
+    }
+
     fn cell(hist: &Hist, leaf: usize, axis: usize, bin: usize) -> (f64, f64, u32) {
         let o = hist.offset(leaf, axis, bin).unwrap();
         (hist.g[o], hist.h[o], hist.count[o])
@@ -504,7 +555,7 @@ mod tests {
         let gh = gradhess(&[1.0, 2.0, 3.0, 4.0], &[1.0, 1.0, 1.0, 1.0]);
         let rows: Vec<u32> = (0..4).collect();
         let leaf_of_row = vec![0u8; 4];
-        let hist = build_histogram(&x, &gh, &rows, &leaf_of_row, 1, &[0, 1]).unwrap();
+        let hist = build_hist(&x, &gh, &rows, &leaf_of_row, 1, &[0, 1]).unwrap();
 
         assert_eq!(hist.shape(), (1, 2, 4)); // uniform stride 4
                                              // axis0: bin1 = rows 0,2 (g 1+3=4, count 2); bin2 = rows 1,3 (g 2+4=6, count 2).
@@ -526,7 +577,7 @@ mod tests {
         let gh = gradhess(&[1.0, 2.0, 3.0, 4.0], &[1.0, 1.0, 1.0, 1.0]);
         let rows: Vec<u32> = (0..4).collect();
         let leaf_of_row = vec![0u8, 0, 1, 1]; // rows 0,1 -> leaf 0; rows 2,3 -> leaf 1
-        let hist = build_histogram(&x, &gh, &rows, &leaf_of_row, 2, &[0]).unwrap();
+        let hist = build_hist(&x, &gh, &rows, &leaf_of_row, 2, &[0]).unwrap();
         assert_eq!(cell(&hist, 0, 0, 1), (3.0, 2.0, 2)); // 1+2
         assert_eq!(cell(&hist, 1, 0, 1), (7.0, 2.0, 2)); // 3+4
     }
@@ -554,7 +605,7 @@ mod tests {
                 .num_threads(nt)
                 .build()
                 .unwrap();
-            pool.install(|| build_histogram(&x, &gh, &rows, &leaf_of_row, 4, &axes).unwrap())
+            pool.install(|| build_hist(&x, &gh, &rows, &leaf_of_row, 4, &axes).unwrap())
         };
         let h1 = run(1);
         let h2 = run(2);
@@ -592,10 +643,10 @@ mod tests {
         let one_leaf = vec![0u8; n];
         let axes = [0u32, 1];
 
-        let parent = build_histogram(&x, &gh, &all, &one_leaf, 1, &axes).unwrap();
+        let parent = build_hist(&x, &gh, &all, &one_leaf, 1, &axes).unwrap();
         let k = n / 3;
-        let left = build_histogram(&x, &gh, &all[..k], &one_leaf, 1, &axes).unwrap();
-        let right_direct = build_histogram(&x, &gh, &all[k..], &one_leaf, 1, &axes).unwrap();
+        let left = build_hist(&x, &gh, &all[..k], &one_leaf, 1, &axes).unwrap();
+        let right_direct = build_hist(&x, &gh, &all[k..], &one_leaf, 1, &axes).unwrap();
         let right_sub = subtract(&parent, &left).unwrap();
 
         assert_eq!(right_sub.shape(), right_direct.shape());
@@ -624,10 +675,10 @@ mod tests {
         let all: Vec<u32> = (0..n as u32).collect();
         let one_leaf = vec![0u8; n];
 
-        let parent = build_histogram(&x, &gh, &all, &one_leaf, 1, &[0]).unwrap();
+        let parent = build_hist(&x, &gh, &all, &one_leaf, 1, &[0]).unwrap();
         let k = 6;
-        let left = build_histogram(&x, &gh, &all[..k], &one_leaf, 1, &[0]).unwrap();
-        let right_direct = build_histogram(&x, &gh, &all[k..], &one_leaf, 1, &[0]).unwrap();
+        let left = build_hist(&x, &gh, &all[..k], &one_leaf, 1, &[0]).unwrap();
+        let right_direct = build_hist(&x, &gh, &all[k..], &one_leaf, 1, &[0]).unwrap();
         let right_sub = subtract(&parent, &left).unwrap();
 
         let o = right_direct.offset(0, 0, 1).unwrap();
@@ -658,7 +709,7 @@ mod tests {
         let gh = gradhess(&[10.0, 20.0, 100.0, 200.0], &[1.0, 1.0, 1.0, 1.0]);
         let rows: Vec<u32> = (0..4).collect();
         let leaf_of_row = vec![0u8, 0, 1, 1]; // leaf0: rows 0,1 (Σg 30); leaf1: rows 2,3 (Σg 300)
-        let hist = build_histogram(&x, &gh, &rows, &leaf_of_row, 2, &[0, 1]).unwrap();
+        let hist = build_hist(&x, &gh, &rows, &leaf_of_row, 2, &[0, 1]).unwrap();
 
         assert_eq!(cell(&hist, 0, 0, 1), (30.0, 2.0, 2)); // leaf0, axis0
         assert_eq!(cell(&hist, 1, 0, 1), (300.0, 2.0, 2)); // leaf1, axis0  (off-diagonal)
@@ -689,7 +740,7 @@ mod tests {
         let x = matrix(vec![Vec::new()], &[3]);
         let gh = gradhess(&[], &[]);
         assert!(matches!(
-            build_histogram(&x, &gh, &[], &[], usize::MAX, &[0]),
+            build_hist(&x, &gh, &[], &[], usize::MAX, &[0]),
             Err(PbError::Internal { .. })
         ));
     }
@@ -712,23 +763,23 @@ mod tests {
         let rows = [0u32, 1];
         // Axis with no grid/column.
         assert!(matches!(
-            build_histogram(&x, &gh, &rows, &[0, 0], 1, &[5]),
+            build_hist(&x, &gh, &rows, &[0, 0], 1, &[5]),
             Err(PbError::Internal { .. })
         ));
         // A leaf_of_row entry >= n_leaves.
         assert!(matches!(
-            build_histogram(&x, &gh, &rows, &[0, 3], 1, &[0]),
+            build_hist(&x, &gh, &rows, &[0, 3], 1, &[0]),
             Err(PbError::Internal { .. })
         ));
         // A bin id >= max_bins (malformed column value 5 against a 3-bin grid).
         let bad = matrix(vec![vec![5u8, 1]], &[3]);
         assert!(matches!(
-            build_histogram(&bad, &gh, &rows, &[0, 0], 1, &[0]),
+            build_hist(&bad, &gh, &rows, &[0, 0], 1, &[0]),
             Err(PbError::Internal { .. })
         ));
         // A row id outside the column.
         assert!(matches!(
-            build_histogram(&x, &gh, &[0, 9], &[0, 0], 1, &[0]),
+            build_hist(&x, &gh, &[0, 9], &[0, 0], 1, &[0]),
             Err(PbError::Internal { .. })
         ));
     }
@@ -749,7 +800,7 @@ mod tests {
         // Every cell's count <= n_rows, and the total count over a single axis equals
         // the number of accumulated rows (the u32 count can never exceed n_rows).
         let (x, gh, rows, leaf_of_row) = fixture();
-        let hist = build_histogram(&x, &gh, &rows, &leaf_of_row, 4, &[0]).unwrap();
+        let hist = build_hist(&x, &gh, &rows, &leaf_of_row, 4, &[0]).unwrap();
         let total: u64 = hist.count.iter().map(|&c| u64::from(c)).sum();
         assert_eq!(total, rows.len() as u64);
         assert!(hist
@@ -791,6 +842,7 @@ mod tests {
                     4,
                     &[0, 1],
                     QuantizeContext { seed: 99, round: 4 },
+                    &vec![1.0_f32; gh.g.len()],
                 )
                 .unwrap()
             })
@@ -798,5 +850,40 @@ mod tests {
         let h1 = build(1);
         assert_eq!(h1, build(2));
         assert_eq!(h1, build(8));
+    }
+
+    #[test]
+    fn wsum_tracks_weighted_mass_per_cell_and_subtracts_exactly() {
+        // Two cells (bin 1 / bin 2) on one axis; weights differ from counts so Σw must be
+        // distinct from `count` (the credibility `min_weight_sum_in_leaf` path).
+        let cols = vec![vec![1u8, 2, 1, 2]];
+        let x = matrix(cols, &[3]);
+        let gh = gradhess(&[1.0, 2.0, 3.0, 4.0], &[1.0, 1.0, 1.0, 1.0]);
+        let weight = [0.5_f32, 2.0, 1.5, 4.0];
+        let rows: Vec<u32> = (0..4).collect();
+        let one_leaf = vec![0u8; 4];
+        let hist = build_histogram(&x, &gh, &rows, &one_leaf, 1, &[0], &weight).unwrap();
+        let o1 = hist.offset(0, 0, 1).unwrap();
+        let o2 = hist.offset(0, 0, 2).unwrap();
+        // bin1 = rows 0,2 (w 0.5+1.5=2.0); bin2 = rows 1,3 (w 2.0+4.0=6.0).
+        assert!((hist.wsum[o1] - 2.0).abs() < 1e-12);
+        assert!((hist.wsum[o2] - 6.0).abs() < 1e-12);
+        // Σw obeys the subtraction trick exactly for this well-conditioned data.
+        let parent = build_histogram(&x, &gh, &rows, &one_leaf, 1, &[0], &weight).unwrap();
+        let left = build_histogram(&x, &gh, &rows[..2], &one_leaf, 1, &[0], &weight).unwrap();
+        let right = subtract(&parent, &left).unwrap();
+        let direct = build_histogram(&x, &gh, &rows[2..], &one_leaf, 1, &[0], &weight).unwrap();
+        for (a, b) in right.wsum.iter().zip(&direct.wsum) {
+            assert!((a - b).abs() < 1e-9, "wsum subtraction drift {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn unit_weights_make_wsum_equal_count() {
+        let (x, gh, rows, leaf_of_row) = fixture();
+        let hist = build_hist(&x, &gh, &rows, &leaf_of_row, 4, &[0, 1]).unwrap();
+        for (w, &c) in hist.wsum.iter().zip(&hist.count) {
+            assert!((w - f64::from(c)).abs() < 1e-12);
+        }
     }
 }

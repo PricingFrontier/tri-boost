@@ -61,6 +61,36 @@ jobs:
       - name: Clippy on the PyO3 binding
         run: cargo clippy -p tri-boost-py --all-targets --all-features -- -D warnings
 
+  # ---- Python API: pytest + mypy --strict + stubtest (spec §12.8) --------
+  # Builds the PyO3 extension with maturin into a venv, then runs the sklearn
+  # integration tests and the typed-package stub/lint gate. This is the only job
+  # with a Python runtime; the core gates above stay Python-free.
+  python:
+    name: python (pytest + mypy + stubtest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Create venv on PATH
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+      - name: Install build + test tooling
+        run: pip install "maturin>=1.5,<2.0" mypy pytest "numpy>=1.23" "scikit-learn>=1.2"
+      - name: Build the extension into the venv (editable)
+        run: maturin develop --release
+      - name: Pytest (sklearn integration + credibility/path_smooth wiring)
+        run: pytest python/tests -q
+      - name: mypy --strict over the typed package
+        run: mypy --strict python/tri_boost
+      - name: stubtest against the compiled module
+        run: python -m mypy.stubtest tri_boost._tri_boost
+
   # ---- Tests + doctests + the invariant & determinism harnesses ----------
   test:
     name: test + doctests + invariants + determinism

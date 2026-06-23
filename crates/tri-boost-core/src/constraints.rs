@@ -4,6 +4,7 @@
 //! interaction strength. The online screening accumulator and soft heredity/FAST/Sobol
 //! admission prior build on these pieces.
 
+use crate::error::PbError;
 use crate::explain::FeatureSet;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -63,6 +64,74 @@ fn default_table_budget_cells() -> u64 {
     2_000_000
 }
 
+/// Per-leaf credibility floors (spec §07.2 / §07.6). §07 OWNS these; they shape *which*
+/// shared levels may fire and stabilize thin/low-exposure leaves. All-zero (the default)
+/// is exactly inert — no candidate is rejected and no leaf value is shrunk, so a fit with
+/// the default floor is byte-identical to one with floors disabled.
+///
+/// The first three are HARD per-candidate rejects evaluated across **all cells of the
+/// shared level** (one under-supported child cell vetoes the candidate — the symmetric
+/// credibility guarantee actuaries expect): `min_data_in_leaf` on the exact binned row
+/// count, `min_sum_hessian_in_leaf` on the per-cell Σh, `min_weight_sum_in_leaf` on the
+/// per-cell Σw (e.g. exposure, stable under a log link). These are DISTINCT from §03's
+/// grid-build `min_data_per_bin` (rare-bin merge at binning time). `path_smooth` (0 = off)
+/// shrinks each fitted leaf toward its oblivious-tree parent node, applied **after** the
+/// monotone clamp and then re-clamped (§07.6); it is value-level only, so structure, the
+/// ≤3-feature property, and exact decomposability are untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CredibilityFloor {
+    /// Minimum exact binned row count per cell (`0` = off).
+    pub min_data_in_leaf: u32,
+    /// Minimum Σh (curvature mass) per cell (`0.0` = off).
+    pub min_sum_hessian_in_leaf: f32,
+    /// Minimum Σw (e.g. exposure mass) per cell (`0.0` = off).
+    pub min_weight_sum_in_leaf: f32,
+    /// Parent-shrinkage strength (`0.0` = off). Larger ⇒ more shrinkage toward the parent.
+    pub path_smooth: f32,
+}
+
+impl Default for CredibilityFloor {
+    fn default() -> Self {
+        Self {
+            min_data_in_leaf: 0,
+            min_sum_hessian_in_leaf: 0.0,
+            min_weight_sum_in_leaf: 0.0,
+            path_smooth: 0.0,
+        }
+    }
+}
+
+impl CredibilityFloor {
+    /// Validate the floor.
+    ///
+    /// # Errors
+    /// [`PbError::InvalidConfig`] if any float floor is non-finite or negative.
+    pub fn validate(&self) -> Result<(), PbError> {
+        for (name, value) in [
+            ("min_sum_hessian_in_leaf", self.min_sum_hessian_in_leaf),
+            ("min_weight_sum_in_leaf", self.min_weight_sum_in_leaf),
+            ("path_smooth", self.path_smooth),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(PbError::InvalidConfig {
+                    what: format!("CredibilityFloor.{name} must be finite and >= 0, got {value}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// `true` if none of the three hard floors can reject a candidate (the fast path:
+    /// no per-cell support accounting is needed). `path_smooth` is a value-level clamp,
+    /// not a candidate reject, so it does not affect this.
+    #[must_use]
+    pub fn rejects_nothing(&self) -> bool {
+        self.min_data_in_leaf == 0
+            && self.min_sum_hessian_in_leaf <= 0.0
+            && self.min_weight_sum_in_leaf <= 0.0
+    }
+}
+
 /// Uniform 8-leaf Walsh-Hadamard / Möbius coefficients for one depth-3 oblivious
 /// leaf vector (§07.4a).
 ///
@@ -118,6 +187,38 @@ mod tests {
     #![allow(clippy::indexing_slicing, clippy::float_cmp)]
 
     use super::*;
+
+    #[test]
+    fn credibility_floor_default_is_inert_and_validates() {
+        let d = CredibilityFloor::default();
+        assert!(d.rejects_nothing());
+        assert!(d.validate().is_ok());
+        // Any positive hard floor means the split-finder must track per-cell support.
+        assert!(!CredibilityFloor {
+            min_data_in_leaf: 1,
+            ..CredibilityFloor::default()
+        }
+        .rejects_nothing());
+        // path_smooth alone is a value-level clamp, not a candidate reject.
+        assert!(CredibilityFloor {
+            path_smooth: 2.0,
+            ..CredibilityFloor::default()
+        }
+        .rejects_nothing());
+        // Negative / non-finite floors are rejected.
+        assert!(CredibilityFloor {
+            min_sum_hessian_in_leaf: -1.0,
+            ..CredibilityFloor::default()
+        }
+        .validate()
+        .is_err());
+        assert!(CredibilityFloor {
+            path_smooth: f32::NAN,
+            ..CredibilityFloor::default()
+        }
+        .validate()
+        .is_err());
+    }
 
     #[test]
     fn wht8_round_trips_leaf_values() {

@@ -6,7 +6,7 @@ It serves all three aims at once: **accurate** (XGBoost/LightGBM-parity Newton g
 
 ### 6.1 Configuration
 
-The booster is builder-configured; `Config` is the owned config struct, validated once in `Booster::fit` (returning `PbError::InvalidConfig`). Defaults reflect the depth-3 cap's shift toward more, lower-LR trees. The leaf-credibility floors (`min_sum_hessian_in_leaf`, `min_data_in_leaf`, `path_smooth`) are **owned by §07** (`CredibilityFloor`); `Config` references them rather than redefining them (the §03 grid-build floor `min_data_per_bin` is a distinct, separately-owned knob).
+The booster is builder-configured; `Config` is the owned config struct, validated once in `Booster::fit` (returning `PbError::InvalidConfig`). Defaults reflect the depth-3 cap's shift toward more, lower-LR trees. The leaf-credibility floors (`min_sum_hessian_in_leaf`, `min_data_in_leaf`, `min_weight_sum_in_leaf`, `path_smooth`) are **owned by §07** (`CredibilityFloor`); the build references them rather than redefining them (the §03 grid-build floor `min_data_per_bin` is a distinct, separately-owned knob). **FLAG (build reconciliation):** v1 carries `CredibilityFloor` on `FitSpec` (alongside the other §07 constraints `monotone` + `interaction`), not in `Config` — see §07.2; the `floors` field shown in the struct below is therefore resolved from `FitSpec` into the split-finder's `GrowConfig`, not stored on `Config`.
 
 ```rust
 pub struct Config {

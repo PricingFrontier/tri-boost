@@ -13,9 +13,9 @@
 )]
 
 use tri_boost_core::{
-    assert_exact_decomposition, bin_columns, BinConfig, Booster, Config, ExactnessMode, FitSpec,
-    Gamma, InteractionPolicy, Link, Logistic, Loss, LossId, MonotoneMap, Poisson, RefMeasure,
-    ServeBinnedMatrix, SquaredError, Tweedie,
+    assert_exact_decomposition, bin_columns, BinConfig, Booster, Config, CredibilityFloor,
+    ExactnessMode, FitSpec, Gamma, InteractionPolicy, Link, Logistic, Loss, LossId, MonotoneMap,
+    Poisson, RefMeasure, ServeBinnedMatrix, SquaredError, Tweedie,
 };
 
 fn spec<'a>(loss: &'a dyn Loss, exposure: Option<&'a [f32]>) -> FitSpec<'a> {
@@ -25,6 +25,7 @@ fn spec<'a>(loss: &'a dyn Loss, exposure: Option<&'a [f32]>) -> FitSpec<'a> {
         exposure,
         monotone: MonotoneMap::new(),
         interaction: InteractionPolicy::default(),
+        credibility: CredibilityFloor::default(),
         seed: 0,
     }
 }
