@@ -17,6 +17,7 @@
 //! * `check-no-usize-serialized` — no `usize`/`isize` field on a serialized type (§13.4 wire-width).
 //! * `check-no-hashmap-serialized` — no `HashMap`/`HashSet` field on a serialized type (order).
 //! * `check-no-rival-deps` — no benchmark-rival dependency leaks into shipped manifests (§13.7/M6).
+//! * `check-docs` — release docs include the SQL scoring recipe and M6 verdict summary.
 //! * `check-all` — run every gate; non-zero exit if any fails.
 //! * `accuracy` — deterministic, exactness-gated benchmark smoke harness (§13.7).
 //! * `release-preflight` — internal v1.5 lever/exactness checkpoint (§14.3/M6-0).
@@ -76,6 +77,7 @@ fn main() -> ExitCode {
         "check-no-usize-serialized" => run_gate(check_no_usize_serialized),
         "check-no-hashmap-serialized" => run_gate(check_no_hashmap_serialized),
         "check-no-rival-deps" => run_manifest_gate(check_no_rival_deps),
+        "check-docs" => run_docs_gate(),
         "check-all" => {
             let gates: [(&str, GateFn); 4] = [
                 ("check-no-box-dyn", check_no_box_dyn),
@@ -122,6 +124,16 @@ fn main() -> ExitCode {
                     println!("    {v}");
                 }
             }
+            let doc_violations = check_docs(&workspace_root());
+            if doc_violations.is_empty() {
+                println!("[ok]   check-docs");
+            } else {
+                failed = true;
+                println!("[FAIL] check-docs: {} violation(s)", doc_violations.len());
+                for v in &doc_violations {
+                    println!("    {v}");
+                }
+            }
             if failed {
                 ExitCode::FAILURE
             } else {
@@ -147,6 +159,7 @@ fn print_usage() {
          \x20 check-no-usize-serialized     forbid usize/isize on serialized types\n\
          \x20 check-no-hashmap-serialized   forbid HashMap/HashSet on serialized types\n\
          \x20 check-no-rival-deps           forbid benchmark rival deps in shipped manifests\n\
+         \x20 check-docs                    require release docs recipes\n\
          \x20 accuracy [--seed N] [--output PATH] [--adversarial]\n\
          \x20                               exactness-gated deterministic benchmark smoke\n\
          \x20 release-preflight [--seed N] [--output PATH]\n\
@@ -1207,6 +1220,20 @@ fn run_manifest_gate(gate: GateFn) -> ExitCode {
     }
 }
 
+/// Run the release-docs presence gate and translate findings into an exit code.
+fn run_docs_gate() -> ExitCode {
+    let violations = check_docs(&workspace_root());
+    if violations.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        for v in &violations {
+            println!("{v}");
+        }
+        eprintln!("xtask: {} violation(s)", violations.len());
+        ExitCode::FAILURE
+    }
+}
+
 /// A loaded shipped source file: its display path plus its lines.
 struct SourceFile {
     path: PathBuf,
@@ -1506,6 +1533,102 @@ fn strip_toml_comment(line: &str) -> &str {
     line.split('#').next().unwrap_or("")
 }
 
+// ---------------------------------------------------------------------------
+// Gate: release docs must include the SQL scoring recipe and M6 verdict summary.
+// ---------------------------------------------------------------------------
+
+fn check_docs(root: &Path) -> Vec<Violation> {
+    let mut out = Vec::new();
+    check_doc_file(
+        root,
+        "docs/score-in-sql.md",
+        &[
+            (
+                "RatingExport",
+                "SQL recipe must name the RatingExport artifact",
+            ),
+            (
+                "mode == \"Exact\"",
+                "SQL recipe must document the exactness firewall",
+            ),
+            (
+                "Cell `0` is always missing",
+                "SQL recipe must document the missing-cell convention",
+            ),
+            (
+                "bin(v) = 1 + count(borders < v)",
+                "SQL recipe must document the canonical border comparison",
+            ),
+            (
+                "RatingBasis",
+                "SQL recipe must document rating-view rebasing",
+            ),
+            ("exp(raw_score)", "SQL recipe must cover log-link scoring"),
+            (
+                "1.0 / (1.0 + exp(-raw_score))",
+                "SQL recipe must cover logit-link scoring",
+            ),
+        ],
+        &mut out,
+    );
+    check_doc_file(
+        root,
+        "docs/release-gate.md",
+        &[
+            (
+                "Exactness hard gate",
+                "release summary must document the exactness hard gate",
+            ),
+            (
+                "Beat-EBM hard gate",
+                "release summary must document the EBM median hard gate",
+            ),
+            (
+                "reported, not release-blocking",
+                "release summary must document the GBDT reported check",
+            ),
+            (
+                "rival_adapters",
+                "release summary must document external rival proof",
+            ),
+            (
+                "treeshap_oracle",
+                "release summary must document external TreeSHAP proof",
+            ),
+            (
+                "release-verdict",
+                "release summary must document the executable verdict command",
+            ),
+        ],
+        &mut out,
+    );
+    out
+}
+
+fn check_doc_file(root: &Path, rel: &str, required: &[(&str, &str)], out: &mut Vec<Violation>) {
+    let path = root.join(rel);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) => {
+            out.push(Violation {
+                path: PathBuf::from(rel),
+                line: 1,
+                message: format!("required release doc is missing or unreadable: {err}"),
+            });
+            return;
+        }
+    };
+    for (needle, message) in required {
+        if !text.contains(needle) {
+            out.push(Violation {
+                path: PathBuf::from(rel),
+                line: 1,
+                message: (*message).to_owned(),
+            });
+        }
+    }
+}
+
 /// Scan each `Serialize`/`Deserialize`-deriving struct/enum body and flag any field
 /// line that mentions one of `forbidden` as a whole token.
 fn serialized_field_gate(
@@ -1763,6 +1886,33 @@ mod accuracy_tests {
         let violations = check_no_rival_deps(&files);
         assert_eq!(violations.len(), 1);
         assert!(violations[0].message.contains("xgboost"));
+    }
+
+    #[test]
+    fn docs_gate_requires_release_recipes() {
+        let root = env::temp_dir().join(format!("tri-boost-docs-gate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs")).unwrap();
+
+        let missing = check_docs(&root);
+        assert_eq!(missing.len(), 2);
+
+        fs::write(
+            root.join("docs/score-in-sql.md"),
+            "RatingExport\nmode == \"Exact\"\nCell `0` is always missing\n\
+             bin(v) = 1 + count(borders < v)\nRatingBasis\nexp(raw_score)\n\
+             1.0 / (1.0 + exp(-raw_score))\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/release-gate.md"),
+            "Exactness hard gate\nBeat-EBM hard gate\nreported, not release-blocking\n\
+             rival_adapters\ntreeshap_oracle\nrelease-verdict\n",
+        )
+        .unwrap();
+
+        assert!(check_docs(&root).is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

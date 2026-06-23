@@ -14,9 +14,13 @@ use crate::loss::{GradHess, Loss};
 use rand::SeedableRng;
 use rand_pcg::Pcg64;
 
-/// Per-level constraint context passed to the split-finder (spec §06/§07). Phase-0
-/// placeholder registered here so the `Backend` trait compiles; the monotone /
-/// interaction / credibility fields land with §06/§07.
+/// Per-level constraint context passed to the legacy backend split-finder seam
+/// (spec §06/§07).
+///
+/// The implemented engine carries real constraints through
+/// [`crate::FitSpec`]/[`crate::InteractionPolicy`] and the §06 grow context. This
+/// marker remains only so the fail-closed backend trait preserves the frozen Phase-0
+/// shape without pretending to own split policy.
 #[derive(Debug, Clone, Default)]
 pub struct LevelConstraints {}
 
@@ -29,8 +33,9 @@ pub struct LevelConstraints {}
 /// full-precision `GradHess` with a FIXED-ORDER float fold (feature-parallel,
 /// sequential within each axis — `engine::hist`), never a steal-order rayon
 /// `reduce`. A `CpuBackend` built with different `n_threads` MUST produce
-/// byte-identical `Hist`s and predictions. (The associative `i64`-quantized
-/// accumulation is the M5-QHIST, v1.5, alternative.)
+/// byte-identical `Hist`s and predictions. The associative `i64`-quantized
+/// accumulation lives in the implemented `HistPrecision::QuantizedI32` engine path,
+/// not in this legacy trait seam.
 // The seam is deliberately defined ahead of its first consumer: the boosting loop
 // (§06, phase P1) is what calls these kernels. `CpuBackend` already implements the
 // whole trait, so the contract is frozen now; `dead_code` is expected until P1.
@@ -38,8 +43,8 @@ pub struct LevelConstraints {}
 pub(crate) trait Backend: Send + Sync {
     /// Build the per-level g/h histogram: full-precision `f64` sums per
     /// `(leaf, axis, bin)` into `Hist` (the single §06-owned accumulator; the v1
-    /// green spine accumulates `GradHess` directly — the quantized `QuantGradHess`
-    /// input is the M5-QHIST/v1.5 variant).
+    /// green spine accumulates `GradHess` directly; the quantized path is selected
+    /// through `HistPrecision::QuantizedI32` in `engine::split`.
     ///
     /// # Errors
     /// [`PbError`] on shape mismatch or because this legacy seam lacks the §06

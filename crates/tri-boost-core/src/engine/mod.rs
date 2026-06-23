@@ -152,13 +152,12 @@ impl ObliviousTree {
 /// stride** (the max grid bins over the built axes; shorter axes leave their high
 /// bins zeroed). `count` stays `u32` (a bin holds at most `n_rows <= u32::MAX` rows).
 ///
-/// **v1 uses `f64` accumulators** and earns determinism from a FIXED-ORDER fold
+/// The default path uses `f64` accumulators and earns determinism from a FIXED-ORDER fold
 /// (feature-parallel, sequential within each axis — [`hist::build_histogram`]).
 /// FLAG (spec reconciliation): §2.3/§06.3 specify `i64` accumulators, but that is the
-/// *quantized* path; §14 ships full-precision `GradHess` only in v1 and defers
-/// quantized integer histograms to v1.5 (M5-QHIST), where integer associativity
-/// replaces the fixed-order fold. So the v1 accumulator is `f64`; the `i64` quantized
-/// form returns with M5-QHIST.
+/// *quantized* path. The M5-QHIST lever implements that integer-associative path
+/// behind [`HistPrecision::QuantizedI32`], while [`HistPrecision::FullF64`] keeps
+/// this `f64` accumulator as the default green-spine representation.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Hist {
     /// Per-cell gradient sums (`[leaf][axis][bin]`, row-major).
@@ -252,8 +251,8 @@ impl Hist {
     }
 }
 
-/// The scale factors mapping full-precision g/h onto quantized integers (spec §2.3).
-/// Registered for M5-QHIST (v1.5); unused on the v1 full-precision path.
+/// The scale factors mapping full-precision g/h onto quantized integers (spec §2.3),
+/// used by the [`HistPrecision::QuantizedI32`] path.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GradScale {
     /// Multiplier applied to gradients before integer rounding.
@@ -263,9 +262,9 @@ pub struct GradScale {
 }
 
 /// Quantized integer g/h for associative, order-independent histogram sums (spec
-/// §2.3). Registered as the M5-QHIST (v1.5) future type — the v1 green spine
-/// accumulates full-precision [`crate::loss::GradHess`] directly, so this is unused
-/// in v1.
+/// §2.3). This is the M5-QHIST representation: split structure may be searched on
+/// quantized histograms, while leaf values are refit from full-precision
+/// [`crate::loss::GradHess`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct QuantGradHess {
     /// Quantized per-row gradients.
@@ -704,10 +703,10 @@ impl Default for Sampling {
 
 /// The optimizer configuration (spec §06.1). v1 green-spine subset: the full §06.1
 /// knob set (`colsample_*`, credibility floors, LR schedule, early stopping) lands
-/// with its features — v1.5 adds row sampling via [`Sampling::Mvs`], quantized
-/// histograms via [`HistPrecision::QuantizedI32`], and §09 registers inert
-/// predictiveness knobs through [`crate::boosters::BoosterConfig`]. FLAG: `Config`
-/// remains a subset of the full §06.1 type for now.
+/// with its features. The v1.5 levers are exposed here as row sampling via
+/// [`Sampling::Mvs`] and quantized histograms via [`HistPrecision::QuantizedI32`];
+/// §09 predictiveness knobs live in [`crate::boosters::BoosterConfig`]. FLAG:
+/// `Config` remains a subset of the full §06.1 type for now.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Number of boosting rounds (upper bound; growth also stops if a round can't split).

@@ -3,6 +3,9 @@
 **/target
 **/*.rs.bk
 *.profraw
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/target
 
 # Python
 __pycache__/

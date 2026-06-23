@@ -90,8 +90,8 @@ pub enum PbError {
     Serialization(String),
 
     /// An internal invariant of the implementation was violated — a bug. Used by
-    /// stubs that are not yet implemented and by `?`-propagated "this cannot happen"
-    /// guards (so the no-panic gate is honored instead of `unreachable!`).
+    /// fail-closed legacy seams and by `?`-propagated "this cannot happen" guards
+    /// (so the no-panic gate is honored instead of `unreachable!`).
     #[error("internal bug: {what}")]
     Internal {
         /// Description of the internal failure.
