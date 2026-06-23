@@ -18,6 +18,7 @@
 //! * `check-no-hashmap-serialized` — no `HashMap`/`HashSet` field on a serialized type (order).
 //! * `check-all` — run every gate; non-zero exit if any fails.
 //! * `accuracy` — deterministic, exactness-gated benchmark smoke harness (§13.7).
+//! * `release-preflight` — internal v1.5 lever/exactness checkpoint (§14.3/M6-0).
 //!
 //! Each gate prints `file:line` for every violation and returns a non-zero
 //! `ExitCode`, so CI fails closed.
@@ -51,6 +52,13 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("xtask accuracy: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        "release-preflight" => match run_release_preflight_cli(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("xtask release-preflight: {err}");
                 ExitCode::FAILURE
             }
         },
@@ -111,6 +119,8 @@ fn print_usage() {
          \x20 check-no-hashmap-serialized   forbid HashMap/HashSet on serialized types\n\
          \x20 accuracy [--seed N] [--output PATH] [--adversarial]\n\
          \x20                               exactness-gated deterministic benchmark smoke\n\
+         \x20 release-preflight [--seed N] [--output PATH]\n\
+         \x20                               internal v1.5 lever/exactness checkpoint\n\
          \x20 --help                        show this message"
     );
 }
@@ -160,6 +170,27 @@ fn run_accuracy_cli(args: &[String]) -> XtaskResult<()> {
     Ok(())
 }
 
+fn run_release_preflight_cli(args: &[String]) -> XtaskResult<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_release_preflight_usage();
+        return Ok(());
+    }
+    let opts = parse_accuracy_options(args)?;
+    if opts.adversarial {
+        return Err("--adversarial belongs to `xtask accuracy`, not `release-preflight`".into());
+    }
+    let artifact = run_release_preflight(opts.seed)?;
+    let text = serde_json::to_string_pretty(&artifact)?;
+    match opts.output {
+        Some(path) => {
+            fs::write(&path, format!("{text}\n"))?;
+            println!("wrote {}", path.display());
+        }
+        None => println!("{text}"),
+    }
+    Ok(())
+}
+
 fn parse_accuracy_options(args: &[String]) -> XtaskResult<AccuracyOptions> {
     let mut opts = AccuracyOptions::default();
     let mut i = 0usize;
@@ -193,6 +224,16 @@ fn print_accuracy_usage() {
          decomposition gates, then emits deviance/lift/ordered-Gini JSON. With\
          --adversarial, forces the §08 SparseFallback table-budget path and emits\
          a budget-firewall artifact."
+    );
+}
+
+fn print_release_preflight_usage() {
+    println!(
+        "USAGE: cargo run -p xtask -- release-preflight [--seed N] [--output PATH]\n\n\
+         Runs the internal v1.5 lever checkpoint: exactness-gated accuracy smoke,\
+         MVS+QHIST smoke, ensemble fork candidates, and SparseFallback adversarial\
+         budget stress. External rival/TreeSHAP corpus checks are reported as not-run\
+         by this local preflight rather than silently assumed."
     );
 }
 
@@ -379,6 +420,66 @@ fn run_adversarial_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
         },
         "perf": {
             "purification_ms": finite_or_zero(purification_ms)
+        }
+    }))
+}
+
+fn run_release_preflight(seed: u64) -> XtaskResult<serde_json::Value> {
+    let accuracy = run_accuracy_fixture(seed)?;
+    let adversarial = run_adversarial_fixture(seed)?;
+
+    let candidates = accuracy["fork_resolution"]["candidates"]
+        .as_array()
+        .ok_or("accuracy artifact missing fork candidates")?;
+    let fork_candidates_exact = candidates
+        .iter()
+        .all(|candidate| candidate["exact"].as_bool().unwrap_or(false));
+    let qhist_on = accuracy["model"]["hist_precision"] == "QuantizedI32";
+    let mvs_on = accuracy["model"]["sampling"] == "Mvs";
+    let sparse_on = adversarial["tables"]["sparse"].as_u64().unwrap_or(0) > 0;
+    let sparse_triple_on = adversarial["tables"]["sparse_triples"]
+        .as_u64()
+        .unwrap_or(0)
+        > 0;
+    let exactness_green = accuracy["exactness"]["mode"] == "Exact"
+        && accuracy["exactness"]["decomposition"] == true
+        && accuracy["exactness"]["feature_budget"] == true
+        && adversarial["exactness"]["mode"] == "Exact"
+        && adversarial["exactness"]["decomposition"] == true
+        && adversarial["exactness"]["feature_budget"] == true;
+
+    if !(fork_candidates_exact
+        && qhist_on
+        && mvs_on
+        && sparse_on
+        && sparse_triple_on
+        && exactness_green)
+    {
+        return Err("internal release preflight did not clear every local lever gate".into());
+    }
+
+    Ok(json!({
+        "schema_version": 1,
+        "seed": seed,
+        "status": "internal_green_external_not_run",
+        "internal": {
+            "exactness": true,
+            "mvs": true,
+            "quantized_histograms": true,
+            "sparse_fallback": true,
+            "sparse_triples": true,
+            "ensemble_candidates_exact": true
+        },
+        "artifacts": {
+            "accuracy": accuracy,
+            "adversarial": adversarial
+        },
+        "external": {
+            "rival_adapters": "not_run_by_local_preflight",
+            "treeshap_oracle": "not_run_by_local_preflight",
+            "full_ci_matrix": "not_run_by_local_preflight",
+            "wheel_matrix": "not_run_by_local_preflight",
+            "crates_io_publish_dry_run": "not_run_by_local_preflight"
         }
     }))
 }
@@ -1162,5 +1263,25 @@ mod accuracy_tests {
         assert_eq!(a["budget"]["overflow_policy"], "SparseFallback");
         assert!(a["tables"]["sparse"].as_u64().unwrap() > 0);
         assert!(a["perf"]["purification_ms"].as_f64().unwrap().is_finite());
+    }
+
+    #[test]
+    fn release_preflight_is_honest_about_external_checks() {
+        let artifact = run_release_preflight(7).unwrap();
+        assert_eq!(artifact["status"], "internal_green_external_not_run");
+        assert_eq!(artifact["internal"]["exactness"], true);
+        assert_eq!(artifact["internal"]["mvs"], true);
+        assert_eq!(artifact["internal"]["quantized_histograms"], true);
+        assert_eq!(artifact["internal"]["sparse_fallback"], true);
+        assert_eq!(artifact["internal"]["sparse_triples"], true);
+        assert_eq!(artifact["internal"]["ensemble_candidates_exact"], true);
+        assert_eq!(
+            artifact["external"]["rival_adapters"],
+            "not_run_by_local_preflight"
+        );
+        assert_eq!(
+            artifact["external"]["treeshap_oracle"],
+            "not_run_by_local_preflight"
+        );
     }
 }
