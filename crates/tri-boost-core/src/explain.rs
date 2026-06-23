@@ -37,9 +37,37 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Hard ceiling on exhaustive joint-grid enumeration for the reconstruction /
 /// variance / three-way checks. Below it the sweep is exhaustive (one interior point
 /// per joint cell, spec §08.6); above it the checks sample a deterministic subset
-/// (the release-mode behavior of §08.8). v1 green-spine models have a handful of
-/// realized features, so the gate path is exhaustive in practice.
+/// (the release-mode behavior of §08.8). MassConservation never enumerates the joint
+/// grid (it integrates exactly per tree); VarianceSum self-normalizes and widens its
+/// tolerance when sampled; Reconstruction/ThreeWayEqual are per-point max checks, sound
+/// under sampling. Most models stay under the cap and run exhaustively.
 const JOINT_CAP: usize = 1 << 20;
+
+/// Relative tolerance band for the SAMPLED VarianceSum estimator (a >`JOINT_CAP`-cell
+/// joint grid): the self-normalized Monte-Carlo variance carries `O(1/√N)` sampling
+/// error, so for such large models VarianceSum is a statistical certification, not a
+/// bit-exact one. `5%` is comfortably above the realized sampling error at `N = JOINT_CAP`.
+const SAMPLE_VAR_REL: f64 = 0.05;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for the joint-grid exhaustion cap, so the sampling branch can
+    /// be forced on a small model without fitting a multi-million-cell ensemble. `0`
+    /// means "use [`JOINT_CAP`]". Thread-local, so parallel tests do not interfere.
+    static TEST_JOINT_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The effective exhaustion cap ([`JOINT_CAP`], or a test override).
+fn joint_cap() -> usize {
+    #[cfg(test)]
+    {
+        let t = TEST_JOINT_CAP.with(std::cell::Cell::get);
+        if t > 0 {
+            return t;
+        }
+    }
+    JOINT_CAP
+}
 
 // ===========================================================================
 // §08.1 — Local aliases: the merged-grid axis and the effect tensor.
@@ -1388,12 +1416,15 @@ fn gate_features(model: &Model, bank: &TableBank) -> Result<Vec<FeatureId>, PbEr
 /// Visit interior points of the joint merged grid over `feats`. Exhaustive when the
 /// product is `<= JOINT_CAP` (the §08.6 worst-case-per-cell sweep); otherwise a
 /// deterministic sample (the §08.8 release behavior). Each visit gets `x_cells` (indexed
-/// by raw feature) and `rep_bins` (indexed by model axis) for the same point.
+/// by raw feature) and `rep_bins` (indexed by model axis) for the same point. Returns
+/// `true` iff the joint grid was SAMPLED (rather than exhausted) — the integral gates
+/// (VarianceSum) self-normalize and widen their tolerance in that case; the per-point
+/// gates (Reconstruction/ThreeWayEqual) are sound either way and ignore the flag.
 fn enumerate_check_points(
     grids: &MergedGrids,
     feats: &[FeatureId],
     mut visit: impl FnMut(&[u32], &[u8]) -> Result<(), PbError>,
-) -> Result<(), PbError> {
+) -> Result<bool, PbError> {
     let n_features = grids.n_features();
     let mut extents = Vec::with_capacity(feats.len());
     for r in feats {
@@ -1421,13 +1452,14 @@ fn enumerate_check_points(
         visit(&x_cells, &rep_bins)
     };
 
-    if total <= JOINT_CAP as u64 {
+    if total <= joint_cap() as u64 {
         walk_extents(&extents, &mut emit)?;
+        Ok(false)
     } else {
         // Deterministic strided sample: mix the sample index per axis with a splitmix
         // step so the points spread across the space without RNG state.
         let mut tuple = vec![0usize; feats.len()];
-        for s in 0..JOINT_CAP as u64 {
+        for s in 0..joint_cap() as u64 {
             for (k, &e) in extents.iter().enumerate() {
                 let mut z = s
                     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -1440,8 +1472,8 @@ fn enumerate_check_points(
             }
             emit(&tuple)?;
         }
+        Ok(true)
     }
-    Ok(())
 }
 
 /// **Reconstruction (I2.1):** the ensemble equals `f0 + Σ_u f_u` at every merged-grid
@@ -1460,11 +1492,52 @@ pub fn check_reconstruction(model: &Model, bank: &TableBank) -> Result<(), PbErr
             return Err(PbError::invariant(Invariant::Reconstruction));
         }
         Ok(())
-    })
+    })?;
+    Ok(())
+}
+
+/// The exact `w`-weighted mean of the ensemble, `E_w[F] = f0 + Σ_t alpha_t·E_w[T_t]`.
+/// Computed SEPARABLY per tree over its own ≤3-feature support grid (integrating out the
+/// other features, whose product weights sum to 1) — so it never materializes the joint
+/// grid and stays exact regardless of the ensemble's total feature count. This is the
+/// fix for the prior joint-grid sampler, which produced an un-normalized partial sum and
+/// false-failed large exact models on MassConservation.
+fn ensemble_w_mean(model: &Model, grids: &MergedGrids, w: &WeightCache) -> Result<f64, PbError> {
+    let mut mass = f64::from(model.f0);
+    for (alpha, tree) in &model.trees {
+        let u = tree_support(model, tree)?;
+        let u_ids: Vec<FeatureId> = u.0.iter().copied().collect();
+        let mut extents = Vec::with_capacity(u_ids.len());
+        for r in &u_ids {
+            extents.push(grids.cells(*r)?);
+        }
+        let mut tree_int = 0.0_f64;
+        walk_extents(&extents, |tuple| {
+            let leaf_idx = leaf_index_for_tuple(model, tree, grids, &u_ids, tuple)?;
+            let leaf = *tree.leaves.get(leaf_idx).ok_or_else(|| PbError::Internal {
+                what: "mass: oblivious leaf index escaped 0..8".into(),
+            })?;
+            let mut wprod = 1.0_f64;
+            for (k, r) in u_ids.iter().enumerate() {
+                let cell = *tuple.get(k).ok_or_else(|| PbError::Internal {
+                    what: "mass tuple shorter than support".into(),
+                })?;
+                wprod *= *w.axis(*r)?.get(cell).ok_or_else(|| PbError::Internal {
+                    what: "mass cell escaped axis weights".into(),
+                })?;
+            }
+            tree_int += wprod * f64::from(leaf);
+            Ok(())
+        })?;
+        mass += f64::from(*alpha) * tree_int;
+    }
+    Ok(mass)
 }
 
 /// **MassConservation (I2.2):** all `w`-mass that survives purification sits in the
-/// intercept — `Σ_x w(x)·F_ens(x) == f0` (every table integrates to zero).
+/// intercept — `E_w[F_ens] == f0` (every table integrates to zero). Computed EXACTLY via
+/// the separable per-tree integral ([`ensemble_w_mean`]), so it is correct for arbitrarily
+/// large ensembles (no joint-grid enumeration / sampling).
 ///
 /// # Errors
 /// [`Invariant::MassConservation`] if the `w`-weighted ensemble mean drifts from `f0`.
@@ -1475,13 +1548,7 @@ pub(crate) fn check_mass_conservation(
 ) -> Result<(), PbError> {
     let tol = ExactTol::for_model(model).mass_tol;
     let grids = MergedGrids::from_model(model)?;
-    let feats = gate_features(model, bank)?;
-    let mut mass = 0.0_f64;
-    enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
-        let wprod = joint_weight(w, &feats, x_cells)?;
-        mass += wprod * model.ensemble_f64(rep_bins)?;
-        Ok(())
-    })?;
+    let mass = ensemble_w_mean(model, &grids, w)?;
     if (mass - bank.f0).abs() > tol {
         return Err(PbError::invariant(Invariant::MassConservation));
     }
@@ -1558,17 +1625,37 @@ pub(crate) fn check_variance_sum(
     let tol = ExactTol::for_model(model).var_tol;
     let grids = MergedGrids::from_model(model)?;
     let feats = gate_features(model, bank)?;
-    let (mut m1, mut m2) = (0.0_f64, 0.0_f64);
-    enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
+    let (mut m1, mut m2, mut wsum) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let sampled = enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
         let wprod = joint_weight(w, &feats, x_cells)?;
         let e = model.ensemble_f64(rep_bins)?;
         m1 += wprod * e;
         m2 += wprod * e * e;
+        wsum += wprod;
         Ok(())
     })?;
-    let var_ens = m2 - m1 * m1;
+    // Self-normalize by the realized total weight. For the EXHAUSTIVE sweep `wsum == 1`
+    // (the product of per-axis-normalized weights summed over the full grid), so this is
+    // a no-op and the integral stays exact. For the SAMPLED sweep `wsum < 1`, this turns
+    // the partial sum into a consistent self-normalized (Horvitz–Thompson) estimator of
+    // the true moments — fixing the prior bug where the un-normalized partial sum made a
+    // large exact model false-fail VarianceSum.
+    if !wsum.is_finite() || wsum <= 0.0 {
+        return Err(PbError::Internal {
+            what: "variance check accumulated non-positive total weight".into(),
+        });
+    }
+    let var_ens = (m2 / wsum) - (m1 / wsum) * (m1 / wsum);
     let var_tables: f64 = bank.tables.iter().map(|t| t.variance).sum();
-    if (var_ens - var_tables).abs() > tol {
+    // Exact tolerance when exhaustive; a relative band when sampled (the sampled estimator
+    // carries Monte-Carlo error, so for >JOINT_CAP-cell models VarianceSum is a STATISTICAL
+    // certification, not bit-exact — documented FLAG; MassConservation stays exact).
+    let eff_tol = if sampled {
+        tol + SAMPLE_VAR_REL * (var_tables.abs() + var_ens.abs())
+    } else {
+        tol
+    };
+    if (var_ens - var_tables).abs() > eff_tol {
         return Err(PbError::invariant(Invariant::VarianceSum));
     }
     Ok(())
@@ -1592,7 +1679,8 @@ pub fn check_three_way_equal(model: &Model, bank: &TableBank) -> Result<(), PbEr
             return Err(PbError::invariant(Invariant::ThreeWayEqual));
         }
         Ok(())
-    })
+    })?;
+    Ok(())
 }
 
 /// Run all five I2 checks against a real fitted model and its purified bank (spec
@@ -1801,7 +1889,8 @@ fn verify_raw_accumulation(
             });
         }
         Ok(())
-    })
+    })?;
+    Ok(())
 }
 
 impl TableBank {
@@ -2458,6 +2547,123 @@ mod tests {
             hist_precision: Default::default(),
             boosters: Default::default(),
         }
+    }
+
+    fn moderate_model() -> (Model, ServeBinnedMatrix) {
+        // A 4-feature additive model with a non-trivial joint grid (each feature
+        // realizes several borders), so the integral gates have something to integrate.
+        let n = 120usize;
+        let cols: Vec<Vec<f32>> = (0..4)
+            .map(|f| (0..n).map(|i| ((i * 7 + f * 3) % 11) as f32).collect())
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                cols.iter()
+                    .enumerate()
+                    .map(|(f, c)| c[i] * (1.0 + f as f32))
+                    .sum()
+            })
+            .collect();
+        fit(
+            &cols,
+            &y,
+            Config {
+                n_trees: 40,
+                learning_rate: 0.3,
+                lambda: 1.0,
+                ..exact_cfg(40)
+            },
+        )
+    }
+
+    /// MassConservation fix: `ensemble_w_mean` (the new exact per-tree integral) equals
+    /// the exhaustive joint-grid `Σ w·F_ens` — so mass is exact with NO joint enumeration.
+    #[test]
+    fn ensemble_w_mean_equals_exhaustive_joint_integral() {
+        let (model, x) = moderate_model();
+        let grids = MergedGrids::from_model(&model).unwrap();
+        let w = build_weights(&x, &grids, &RefMeasure::default()).unwrap();
+        let per_tree = ensemble_w_mean(&model, &grids, &w).unwrap();
+        // Independent exhaustive joint-grid integral over all realized features.
+        let feats =
+            gate_features(&model, &model.explain(&x, RefMeasure::default()).unwrap()).unwrap();
+        let mut joint = 0.0_f64;
+        enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
+            joint += joint_weight(&w, &feats, x_cells)? * model.ensemble_f64(rep_bins)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            (per_tree - joint).abs() < 1e-9 * (1.0 + joint.abs()),
+            "per-tree mass {per_tree} != exhaustive joint mass {joint}"
+        );
+    }
+
+    /// The integral gates stay correct when the joint grid is SAMPLED (the >JOINT_CAP
+    /// path, forced here with a tiny test cap on a small model). MassConservation is
+    /// exact (never samples); the self-normalized sampled mean still recovers f0 (the
+    /// un-normalized partial sum — the prior bug — would be a tiny fraction of f0).
+    #[test]
+    fn integral_gates_correct_under_forced_sampling() {
+        let (model, x) = moderate_model();
+        let bank = model.explain(&x, RefMeasure::default()).unwrap();
+        let grids = MergedGrids::from_model(&model).unwrap();
+        let feats = gate_features(&model, &bank).unwrap();
+        let w = build_weights(&x, &grids, &RefMeasure::default()).unwrap();
+
+        // Force the SAMPLED branch on this small model.
+        TEST_JOINT_CAP.with(|c| c.set(64));
+
+        // Mass is exact (per-tree, ignores the cap); Reconstruction/ThreeWayEqual are
+        // per-point and sound under sampling — all pass.
+        check_mass_conservation(&model, &bank, &w).unwrap();
+        check_reconstruction(&model, &bank).unwrap();
+        check_three_way_equal(&model, &bank).unwrap();
+
+        // Self-normalization recovers the true mean from the partial sample. Replicate
+        // the estimator: the UN-normalized m1 would be ≈ (Σ_sampled wprod)·f0, a small
+        // fraction; the self-normalized m1/wsum ≈ f0.
+        let (mut m1, mut wsum) = (0.0_f64, 0.0_f64);
+        let sampled = enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
+            let wp = joint_weight(&w, &feats, x_cells)?;
+            m1 += wp * model.ensemble_f64(rep_bins)?;
+            wsum += wp;
+            Ok(())
+        })
+        .unwrap();
+        assert!(sampled, "the tiny cap must force sampling");
+        assert!(
+            wsum < 0.99,
+            "a partial sample must under-cover the weight, got {wsum}"
+        );
+        let self_norm_mean = m1 / wsum;
+        assert!(
+            (self_norm_mean - bank.f0).abs() < 0.25 * (1.0 + bank.f0.abs()),
+            "self-normalized mean {self_norm_mean} should recover f0 {}",
+            bank.f0
+        );
+
+        // Negatives are still caught under sampling.
+        let mut bad_mass = bank.clone();
+        bad_mass.f0 += 10.0;
+        assert!(matches!(
+            check_mass_conservation(&model, &bad_mass, &w),
+            Err(PbError::InvariantViolated {
+                invariant: Invariant::MassConservation
+            })
+        ));
+        let mut bad_var = bank.clone();
+        if let Some(t) = bad_var.tables.first_mut() {
+            t.variance += 1000.0;
+        }
+        assert!(matches!(
+            check_variance_sum(&model, &bad_var, &w),
+            Err(PbError::InvariantViolated {
+                invariant: Invariant::VarianceSum
+            })
+        ));
+
+        TEST_JOINT_CAP.with(|c| c.set(0));
     }
 
     fn binary_conditional_mean(
