@@ -2266,6 +2266,50 @@ mod tests {
         }
     }
 
+    fn binary_conditional_mean(
+        leaves: &[f64; 8],
+        p_low: [f64; 3],
+        mask: usize,
+        leaf: usize,
+    ) -> f64 {
+        let mut out = 0.0_f64;
+        for (z, &leaf_value) in leaves.iter().enumerate() {
+            if (z & mask) != (leaf & mask) {
+                continue;
+            }
+            let mut weight = 1.0_f64;
+            for (bit, &p) in p_low.iter().enumerate() {
+                if (mask & (1usize << bit)) == 0 {
+                    weight *= if (z & (1usize << bit)) != 0 {
+                        p
+                    } else {
+                        1.0 - p
+                    };
+                }
+            }
+            out += leaf_value * weight;
+        }
+        out
+    }
+
+    fn binary_fanova_effects(leaves: &[f64; 8], p_low: [f64; 3]) -> [[f64; 8]; 8] {
+        let mut effects = [[0.0_f64; 8]; 8];
+        for mask in 0usize..8 {
+            for leaf in 0usize..8 {
+                let mut value = binary_conditional_mean(leaves, p_low, mask, leaf);
+                let mut sub = mask;
+                while sub > 0 {
+                    sub = (sub - 1) & mask;
+                    if sub != mask {
+                        value -= effects[sub][leaf];
+                    }
+                }
+                effects[mask][leaf] = value;
+            }
+        }
+        effects
+    }
+
     #[test]
     fn fixture_explain_passes_all_gates() {
         let m = fixture_model();
@@ -2585,6 +2629,124 @@ mod tests {
         // missing routing is not silently collapsed into the first/last finite interval.
         assert!((bank.score(&[2]).unwrap() - 3.0).abs() < 1e-6);
         assert!((bank.score(&[1]).unwrap() - 7.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wht8_coefficients_match_purified_single_tree_tables() {
+        use crate::cat::CatEncoderStore;
+        use crate::constraints::wht8_uniform;
+        use crate::data::{AxisKind, AxisProvenance};
+        use crate::engine::{ExactnessMode, ModelSchema, ObliviousTree, Split};
+        use crate::loss::{Link, LossId, ObjectiveTag};
+
+        let leaves = [0.0, 1.0, 3.0, 4.0, 8.0, -2.0, 5.0, 11.0];
+        let tree = ObliviousTree {
+            splits: vec![
+                Split {
+                    axis: 0,
+                    bin_le: 1,
+                    missing_left: false,
+                },
+                Split {
+                    axis: 1,
+                    bin_le: 1,
+                    missing_left: false,
+                },
+                Split {
+                    axis: 2,
+                    bin_le: 1,
+                    missing_left: false,
+                },
+            ],
+            leaves,
+            depth: 3,
+        };
+        let provenance: Vec<AxisProvenance> = (0..3u32)
+            .map(|raw| AxisProvenance {
+                raw: FeatureId(raw),
+                kind: AxisKind::Numeric,
+            })
+            .collect();
+        let model = Model {
+            f0: 0.0,
+            trees: vec![(1.0, tree)],
+            grids: vec![fixture_grid(), fixture_grid(), fixture_grid()],
+            provenance: provenance.clone(),
+            link: Link::Identity,
+            mode: ExactnessMode::Exact,
+            schema: ModelSchema {
+                feature_names: vec!["x0".into(), "x1".into(), "x2".into()],
+                feature_kinds: vec![AxisKind::Numeric; 3],
+                cat_encoders: CatEncoderStore::new(),
+                class_labels: None,
+                objective: ObjectiveTag {
+                    link: Link::Identity,
+                    loss: LossId::SquaredError,
+                    tweedie_rho: None,
+                },
+            },
+            schema_version: crate::serialize::SCHEMA_VERSION,
+        };
+        let serve = ServeBinnedMatrix(crate::data::BinnedMatrix {
+            data: vec![
+                vec![2, 1, 2, 1, 2, 1, 2, 1],
+                vec![2, 2, 1, 1, 2, 2, 1, 1],
+                vec![2, 2, 2, 2, 1, 1, 1, 1],
+            ],
+            n_rows: 8,
+            grids: model.grids.clone(),
+            provenance,
+        });
+        let bank = model.explain(&serve, RefMeasure::Uniform).unwrap();
+        let leaves_f64 = leaves.map(f64::from);
+        let coeffs = wht8_uniform(leaves_f64).coeffs;
+        let half_effects = binary_fanova_effects(&leaves_f64, [0.5; 3]);
+        for (mask, values) in half_effects.iter().enumerate() {
+            for (leaf, &effect) in values.iter().enumerate() {
+                let sign = if ((mask & leaf).count_ones() & 1) == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                assert!((effect - sign * coeffs[mask]).abs() < 1.0e-10);
+            }
+        }
+
+        // Under the §08 Uniform measure the missing cell is a third cell. With
+        // `missing_left=false`, missing routes with the high side, so the induced
+        // binary cut weights are P(low)=1/3 and P(high)=2/3 on every axis.
+        let effects = binary_fanova_effects(&leaves_f64, [1.0 / 3.0; 3]);
+        assert!((bank.f0 - effects[0][0]).abs() < 1.0e-10);
+
+        for (mask, effect_values) in effects.iter().enumerate().skip(1) {
+            let ids: Vec<u32> = (0..3)
+                .filter(|bit| (mask & (1usize << bit)) != 0)
+                .map(|bit| bit as u32)
+                .collect();
+            let u = FeatureSet::new(&ids);
+            let table = bank
+                .tables
+                .iter()
+                .find(|table| table.u == u)
+                .expect("purified table for WHT mask");
+            for (leaf, &expected) in effect_values.iter().enumerate() {
+                let coord: Vec<usize> = ids
+                    .iter()
+                    .map(|id| {
+                        if (leaf & (1usize << usize::try_from(*id).unwrap())) != 0 {
+                            1
+                        } else {
+                            2
+                        }
+                    })
+                    .collect();
+                let got = table.values.at(&coord).unwrap();
+                assert!(
+                    (got - expected).abs() < 1.0e-9,
+                    "mask {mask:03b} leaf {leaf:03b}: got {got}, expected {expected}"
+                );
+            }
+        }
     }
 
     #[test]
