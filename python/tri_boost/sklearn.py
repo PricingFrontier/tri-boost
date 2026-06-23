@@ -85,6 +85,25 @@ class _BaseTriBoost(BaseEstimator):
                 delattr(self, name)
         return result
 
+    def _resolve_n_jobs(self) -> int | None:
+        """Resolve n_jobs per the sklearn convention into a positive thread count.
+
+        ``None`` keeps the native default (all cores); ``-1`` means all cores, and a
+        negative ``n`` means ``cpu_count + 1 + n`` (so ``-1`` is all, ``-2`` all-but-one).
+        Negative values must be translated here because the native layer takes an
+        unsigned count and would otherwise raise ``OverflowError``.
+        """
+        n = self.n_jobs
+        if n is None:
+            return None
+        n = int(n)
+        if n < 0:
+            import os
+
+            cores = os.cpu_count() or 1
+            n = max(1, cores + 1 + n)
+        return n
+
     def _new_booster(self) -> _Booster:
         return _Booster(
             n_trees=int(self.n_trees),
@@ -96,7 +115,7 @@ class _BaseTriBoost(BaseEstimator):
             objective=self.objective,
             tweedie_rho=float(self.tweedie_rho),
             seed=int(self.seed),
-            n_jobs=self.n_jobs,
+            n_jobs=self._resolve_n_jobs(),
         )
 
     def _fit_model(

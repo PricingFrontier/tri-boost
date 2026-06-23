@@ -317,6 +317,11 @@ impl PyModel {
                 model.predict_binned(&binned, None)
             })
             .map_err(py_err)?;
+        if pred.is_empty() {
+            // sklearn contract: predict_proba returns (n_samples, n_classes); for an
+            // empty design that is (0, 2), not the (0, 0) that from_vec2 of [] yields.
+            return Ok(numpy::PyArray2::<f32>::zeros(py, [0usize, 2], false));
+        }
         let mut rows = Vec::with_capacity(pred.len());
         for p1 in pred {
             rows.push(vec![1.0 - p1, p1]);
@@ -512,7 +517,11 @@ fn write_or_return_array1<'py>(
         return Ok(values.into_pyarray(py));
     };
     {
-        let mut borrowed: PyReadwriteArray1<'_, f32> = out.readwrite();
+        // `try_readwrite` (not `readwrite`) so a read-only / borrowed numpy array returns
+        // a typed Python error rather than panicking across the FFI boundary.
+        let mut borrowed: PyReadwriteArray1<'_, f32> = out
+            .try_readwrite()
+            .map_err(|_| PyTypeError::new_err("out must be a writable contiguous float32 array"))?;
         let out_slice = borrowed
             .as_slice_mut()
             .map_err(|_| PyTypeError::new_err("out must be a contiguous writable float32 array"))?;
