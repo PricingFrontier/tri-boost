@@ -23,7 +23,7 @@
 //!
 //! v1 scope: numeric axes only (one axis per raw feature; categoricals arrive with
 //! §04), the `ProductMarginals`/`Uniform` reference measures (single-pass purify, exact
-//! variance-sum), and the `Error` table-budget policy. `Joint` and `SparseFallback` are
+//! variance-sum), and exact `Error`/`SparseFallback` table-budget policies. `Joint` is
 //! rejected up front rather than silently mishandled.
 
 use crate::data::{BorderGrid, FeatureId, ServeBinnedMatrix};
@@ -31,6 +31,7 @@ use crate::engine::{low_bit, Model};
 use crate::error::{Invariant, PbError};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Hard ceiling on exhaustive joint-grid enumeration for the reconstruction /
@@ -71,7 +72,25 @@ pub struct Tensor {
     // wasm32 smoke build, breaking cross-platform byte-equality (spec §02.8).
     // Cell-count dimensions are tiny, so `u32` is ample.
     shape: Vec<u32>,
-    data: Vec<f64>,
+    data: TensorData,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum TensorData {
+    Dense(Vec<f64>),
+    Sparse(Vec<SparseEntry>),
+}
+
+impl Default for TensorData {
+    fn default() -> Self {
+        TensorData::Dense(Vec::new())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct SparseEntry {
+    index: u64,
+    value: f64,
 }
 
 fn checked_shape(shape: &[usize]) -> Result<(Vec<u32>, usize), PbError> {
@@ -91,6 +110,23 @@ fn checked_shape(shape: &[usize]) -> Result<(Vec<u32>, usize), PbError> {
         })?;
     }
     Ok((shape_u32, cells))
+}
+
+fn checked_shape_cells_u64(shape: &[u32]) -> Result<u64, PbError> {
+    let mut cells = 1u64;
+    for &dim in shape {
+        if dim == 0 {
+            return Err(PbError::InvalidInput {
+                what: "tensor has a zero extent".into(),
+            });
+        }
+        cells = cells
+            .checked_mul(u64::from(dim))
+            .ok_or_else(|| PbError::Internal {
+                what: "tensor shape overflows u64".into(),
+            })?;
+    }
+    Ok(cells)
 }
 
 fn filled_data(cells: usize, value: f64) -> Result<Vec<f64>, PbError> {
@@ -113,7 +149,20 @@ impl Tensor {
     pub fn try_zeros(shape: Vec<usize>) -> Result<Self, PbError> {
         let (shape, cells) = checked_shape(&shape)?;
         Ok(Self {
-            data: filled_data(cells, 0.0)?,
+            data: TensorData::Dense(filled_data(cells, 0.0)?),
+            shape,
+        })
+    }
+
+    /// Try to build a sparse zero tensor of the given per-axis extents.
+    ///
+    /// # Errors
+    /// [`PbError::InvalidInput`] if an extent is zero or exceeds `u32`;
+    /// [`PbError::Internal`] if shape arithmetic overflows.
+    pub fn try_sparse_zeros(shape: Vec<usize>) -> Result<Self, PbError> {
+        let (shape, _) = checked_shape(&shape)?;
+        Ok(Self {
+            data: TensorData::Sparse(Vec::new()),
             shape,
         })
     }
@@ -126,7 +175,7 @@ impl Tensor {
     pub fn try_filled(shape: Vec<usize>, value: f64) -> Result<Self, PbError> {
         let (shape, cells) = checked_shape(&shape)?;
         Ok(Self {
-            data: filled_data(cells, value)?,
+            data: TensorData::Dense(filled_data(cells, value)?),
             shape,
         })
     }
@@ -144,7 +193,10 @@ impl Tensor {
                 what: format!("tensor data len {} != product(shape) {n}", data.len()),
             });
         }
-        Ok(Self { shape, data })
+        Ok(Self {
+            shape,
+            data: TensorData::Dense(data),
+        })
     }
 
     /// The tensor's per-axis extents (as `usize` for indexing).
@@ -162,49 +214,120 @@ impl Tensor {
     /// Total number of cells.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.data.len()
+        checked_shape_cells_u64(&self.shape)
+            .ok()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0)
     }
 
     /// `true` if the tensor has no cells.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len() == 0
     }
 
-    /// The dense row-major backing values.
+    /// The row-major values. Dense tensors borrow their backing slice; sparse tensors
+    /// materialize an owned dense view for display/export compatibility.
     #[must_use]
-    pub fn values(&self) -> &[f64] {
-        &self.data
+    pub fn values(&self) -> Cow<'_, [f64]> {
+        match &self.data {
+            TensorData::Dense(data) => Cow::Borrowed(data),
+            TensorData::Sparse(_) => Cow::Owned(self.dense_values().unwrap_or_default()),
+        }
+    }
+
+    /// `true` if this tensor uses sparse backing storage.
+    #[must_use]
+    pub fn is_sparse(&self) -> bool {
+        matches!(self.data, TensorData::Sparse(_))
+    }
+
+    fn sparse_nnz(&self) -> Option<usize> {
+        match &self.data {
+            TensorData::Dense(_) => None,
+            TensorData::Sparse(entries) => Some(entries.len()),
+        }
     }
 
     /// Add a constant to every cell. Used by rating-view re-basing, which moves an
     /// equal and opposite constant into the exported intercept and therefore preserves
     /// every reconstructed score exactly.
     pub fn add_scalar(&mut self, delta: f64) {
-        for v in &mut self.data {
-            *v += delta;
+        match &mut self.data {
+            TensorData::Dense(data) => {
+                for v in data {
+                    *v += delta;
+                }
+            }
+            TensorData::Sparse(_) => {
+                if let Ok(mut dense) = self.dense_values() {
+                    for v in &mut dense {
+                        *v += delta;
+                    }
+                    self.data = TensorData::Dense(dense);
+                }
+            }
         }
     }
 
-    fn offset(&self, coord: &[usize]) -> Option<usize> {
+    fn offset(&self, coord: &[usize]) -> Option<u64> {
         if coord.len() != self.shape.len() {
             return None;
         }
-        let mut off = 0usize;
+        let mut off = 0u64;
         for (c, dim) in coord.iter().zip(self.shape.iter()) {
-            let dim = *dim as usize;
-            if *c >= dim {
+            let dim_u64 = u64::from(*dim);
+            let c_u64 = u64::try_from(*c).ok()?;
+            if c_u64 >= dim_u64 {
                 return None;
             }
-            off = off.checked_mul(dim)?.checked_add(*c)?;
+            off = off.checked_mul(dim_u64)?.checked_add(c_u64)?;
         }
         Some(off)
+    }
+
+    fn dense_values(&self) -> Result<Vec<f64>, PbError> {
+        let cells_u64 = checked_shape_cells_u64(&self.shape)?;
+        let cells = usize::try_from(cells_u64).map_err(|_| PbError::Internal {
+            what: "tensor dense view exceeds usize".into(),
+        })?;
+        let mut dense = filled_data(cells, 0.0)?;
+        match &self.data {
+            TensorData::Dense(data) => {
+                if data.len() != cells {
+                    return Err(PbError::ShapeMismatch {
+                        what: "tensor dense backing length does not match shape".into(),
+                    });
+                }
+                dense = data.clone();
+            }
+            TensorData::Sparse(entries) => {
+                for entry in entries {
+                    let idx = usize::try_from(entry.index).map_err(|_| PbError::Internal {
+                        what: "sparse tensor index exceeds usize".into(),
+                    })?;
+                    let slot = dense.get_mut(idx).ok_or_else(|| PbError::ShapeMismatch {
+                        what: "sparse tensor index outside shape".into(),
+                    })?;
+                    *slot = entry.value;
+                }
+            }
+        }
+        Ok(dense)
     }
 
     /// Read the value at `coord`, or `None` if out of range / wrong rank.
     #[must_use]
     pub fn at(&self, coord: &[usize]) -> Option<f64> {
-        self.offset(coord).and_then(|o| self.data.get(o).copied())
+        let off = self.offset(coord)?;
+        match &self.data {
+            TensorData::Dense(data) => usize::try_from(off).ok().and_then(|o| data.get(o).copied()),
+            TensorData::Sparse(entries) => entries
+                .binary_search_by_key(&off, |entry| entry.index)
+                .ok()
+                .and_then(|pos| entries.get(pos).map(|entry| entry.value))
+                .or(Some(0.0)),
+        }
     }
 
     /// Write `value` at `coord`.
@@ -215,10 +338,34 @@ impl Tensor {
         let off = self.offset(coord).ok_or_else(|| PbError::ShapeMismatch {
             what: "tensor set coord out of range".into(),
         })?;
-        let slot = self.data.get_mut(off).ok_or_else(|| PbError::Internal {
-            what: "tensor offset escaped buffer".into(),
-        })?;
-        *slot = value;
+        match &mut self.data {
+            TensorData::Dense(data) => {
+                let off = usize::try_from(off).map_err(|_| PbError::Internal {
+                    what: "tensor offset exceeds usize".into(),
+                })?;
+                let slot = data.get_mut(off).ok_or_else(|| PbError::Internal {
+                    what: "tensor offset escaped buffer".into(),
+                })?;
+                *slot = value;
+            }
+            TensorData::Sparse(entries) => match entries.binary_search_by_key(&off, |e| e.index) {
+                Ok(pos) => {
+                    if value == 0.0 {
+                        entries.remove(pos);
+                    } else if let Some(entry) = entries.get_mut(pos) {
+                        entry.value = value;
+                    }
+                }
+                Err(pos) => {
+                    if value != 0.0 {
+                        entries.try_reserve(1).map_err(|_| PbError::Internal {
+                            what: "sparse tensor allocation failed".into(),
+                        })?;
+                        entries.insert(pos, SparseEntry { index: off, value });
+                    }
+                }
+            },
+        }
         Ok(())
     }
 
@@ -227,14 +374,10 @@ impl Tensor {
     /// # Errors
     /// [`PbError::ShapeMismatch`] if `coord` is out of range or the wrong rank.
     pub fn add(&mut self, coord: &[usize], delta: f64) -> Result<(), PbError> {
-        let off = self.offset(coord).ok_or_else(|| PbError::ShapeMismatch {
+        let value = self.at(coord).ok_or_else(|| PbError::ShapeMismatch {
             what: "tensor add coord out of range".into(),
         })?;
-        let slot = self.data.get_mut(off).ok_or_else(|| PbError::Internal {
-            what: "tensor offset escaped buffer".into(),
-        })?;
-        *slot += delta;
-        Ok(())
+        self.set(coord, value + delta)
     }
 }
 
@@ -284,7 +427,7 @@ pub struct EffectTable {
     /// Per-cell training-row count (display-only; same extents as `values`).
     pub support: Tensor,
     /// Optional per-cell standard-error band, display-only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub se_band: Option<SeBand>,
     /// `w`-weighted variance of this effect, `σ²(f_u)`.
     pub variance: f64,
@@ -385,7 +528,8 @@ impl ExactTol {
 
 /// Per-table and whole-bank cell budgets (spec §08.10, the memory firewall). Counted on
 /// the realized merged (union) grid (R-TABLEBUDGET), checked at lazy allocation so an
-/// over-budget triple fails *before* it materializes 100s of MB.
+/// over-budget table either fails before dense allocation or uses the explicit sparse
+/// policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TableBudget {
     /// Per-[`EffectTable`] `Π cells_i` ceiling.
@@ -412,10 +556,10 @@ pub enum OverflowPolicy {
     /// Hard error — refuse to build a bank that would exceed the budget
     /// ([`PbError::TableBudget`]). No silent truncation.
     Error,
-    /// EXACT sparse-tensor storage for hot triples — a v1.5 optimization, rejected up
-    /// front in v1 (so a caller never silently receives `Error` behavior under it).
+    /// EXACT sparse-tensor storage for over-budget tables. This preserves the logical
+    /// tensor shape and all I2 checks while avoiding dense allocation for cold cells.
     SparseFallback {
-        /// Occupancy below which a triple would be stored sparsely.
+        /// Maximum realized nonzero occupancy allowed for sparse storage.
         density_threshold: f64,
     },
 }
@@ -787,10 +931,12 @@ fn accumulate(
     grids: &MergedGrids,
     budget: &TableBudget,
 ) -> Result<RawBank, PbError> {
-    if let OverflowPolicy::SparseFallback { .. } = budget.on_overflow {
-        return Err(PbError::InvalidConfig {
-            what: "SparseFallback is a v1.5 optimization; v1 uses OverflowPolicy::Error".into(),
-        });
+    if let OverflowPolicy::SparseFallback { density_threshold } = budget.on_overflow {
+        if !density_threshold.is_finite() || !(0.0..=1.0).contains(&density_threshold) {
+            return Err(PbError::InvalidConfig {
+                what: "SparseFallback density_threshold must be finite and in [0, 1]".into(),
+            });
+        }
     }
     let mut tables: BTreeMap<FeatureSet, RawTable> = BTreeMap::new();
     let mut bank_cells: u64 = 0;
@@ -804,25 +950,35 @@ fn accumulate(
                 extents.push(grids.cells(*r)?);
             }
             let table_cells = product_u64(&extents)?;
-            if table_cells > budget.max_table_cells {
-                return Err(PbError::TableBudget {
-                    what: format!("table {u:?}"),
-                    cells: table_cells,
-                    budget: budget.max_table_cells,
-                });
-            }
-            bank_cells = bank_cells
-                .checked_add(table_cells)
-                .ok_or_else(|| PbError::Internal {
-                    what: "bank cell count overflowed u64".into(),
-                })?;
-            if bank_cells > budget.max_bank_cells {
-                return Err(PbError::TableBudget {
-                    what: "bank".into(),
-                    cells: bank_cells,
-                    budget: budget.max_bank_cells,
-                });
-            }
+            let values = if table_cells > budget.max_table_cells {
+                match budget.on_overflow {
+                    OverflowPolicy::Error => {
+                        return Err(PbError::TableBudget {
+                            what: format!("table {u:?}"),
+                            cells: table_cells,
+                            budget: budget.max_table_cells,
+                        });
+                    }
+                    OverflowPolicy::SparseFallback { .. } => {
+                        Tensor::try_sparse_zeros(extents.clone())?
+                    }
+                }
+            } else {
+                bank_cells =
+                    bank_cells
+                        .checked_add(table_cells)
+                        .ok_or_else(|| PbError::Internal {
+                            what: "bank cell count overflowed u64".into(),
+                        })?;
+                if bank_cells > budget.max_bank_cells {
+                    return Err(PbError::TableBudget {
+                        what: "bank".into(),
+                        cells: bank_cells,
+                        budget: budget.max_bank_cells,
+                    });
+                }
+                Tensor::try_zeros(extents.clone())?
+            };
             let mut axes = Vec::with_capacity(u_ids.len());
             for r in &u_ids {
                 axes.push(grids.axis_id(*r)?);
@@ -832,7 +988,7 @@ fn accumulate(
                 RawTable {
                     u: u.clone(),
                     axes,
-                    values: Tensor::try_zeros(extents)?,
+                    values,
                 },
             );
         }
@@ -848,6 +1004,24 @@ fn accumulate(
             })?;
             table.values.add(tuple, alpha * f64::from(leaf))
         })?;
+    }
+
+    if let OverflowPolicy::SparseFallback { density_threshold } = budget.on_overflow {
+        for (u, table) in &tables {
+            if let Some(nnz) = table.values.sparse_nnz() {
+                let table_cells = product_u64(&table.values.shape())?;
+                let density = nnz as f64 / table_cells as f64;
+                if density > density_threshold {
+                    return Err(PbError::TableBudget {
+                        what: format!(
+                            "sparse table {u:?} density {density:.6} exceeds threshold {density_threshold:.6}"
+                        ),
+                        cells: table_cells,
+                        budget: budget.max_table_cells,
+                    });
+                }
+            }
+        }
     }
 
     Ok(RawBank {
@@ -2493,6 +2667,29 @@ mod tests {
     }
 
     #[test]
+    fn sparse_tensor_preserves_logical_dense_values() {
+        let mut tensor = Tensor::try_sparse_zeros(vec![2, 3]).unwrap();
+        assert!(tensor.is_sparse());
+        assert_eq!(tensor.len(), 6);
+        assert_eq!(tensor.values().as_ref(), &[0.0; 6]);
+
+        tensor.add(&[1, 2], 1.5).unwrap();
+        tensor.add(&[0, 1], -2.0).unwrap();
+        tensor.add(&[1, 2], -1.5).unwrap();
+
+        assert_eq!(tensor.at(&[1, 2]), Some(0.0));
+        assert_eq!(tensor.at(&[0, 1]), Some(-2.0));
+        assert_eq!(tensor.values().as_ref(), &[0.0, -2.0, 0.0, 0.0, 0.0, 0.0]);
+
+        tensor.add_scalar(0.25);
+        assert!(!tensor.is_sparse());
+        assert_eq!(
+            tensor.values().as_ref(),
+            &[0.25, -1.75, 0.25, 0.25, 0.25, 0.25]
+        );
+    }
+
+    #[test]
     fn g3_real_fit_two_feature_additive() {
         // Gate G3: a real fitted model, explained, passes all five checks.
         let n = 64usize;
@@ -2788,18 +2985,70 @@ mod tests {
     }
 
     #[test]
-    fn sparse_fallback_is_rejected_in_v1() {
+    fn sparse_fallback_is_exact_and_serializable() {
+        let model = fixture_model();
+        let x = fixture_serve();
+        let grids = MergedGrids::from_model(&model).unwrap();
+        let budget = TableBudget {
+            max_table_cells: 1,
+            max_bank_cells: 1,
+            on_overflow: OverflowPolicy::SparseFallback {
+                density_threshold: 1.0,
+            },
+        };
+        let raw = accumulate(&model, &grids, &budget).unwrap();
+        assert!(raw.tables.values().any(|table| table.values.is_sparse()));
+        verify_raw_accumulation(&model, &raw, &grids).unwrap();
+
+        let weights = build_weights(&x, &grids, &RefMeasure::Uniform).unwrap();
+        let mut bank = purify(raw, &weights, &grids, PurifyMode::SinglePass).unwrap();
+        fill_support(&mut bank, &grids, &x).unwrap();
+        assert!(bank.tables.iter().any(|table| table.values.is_sparse()));
+
+        check_reconstruction(&model, &bank).unwrap();
+        check_mass_conservation(&model, &bank, &weights).unwrap();
+        check_purity(&model, &bank, &weights).unwrap();
+        check_variance_sum(&model, &bank, &weights).unwrap();
+        check_three_way_equal(&model, &bank).unwrap();
+
+        let encoded = bincode::serde::encode_to_vec(&bank, bincode::config::standard()).unwrap();
+        let (decoded, consumed): (TableBank, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, bank);
+        check_reconstruction(&model, &decoded).unwrap();
+    }
+
+    #[test]
+    fn sparse_fallback_rejects_invalid_density_threshold() {
+        let model = fixture_model();
+        let grids = MergedGrids::from_model(&model).unwrap();
+        for density_threshold in [f64::NAN, -0.1, 1.1] {
+            let budget = TableBudget {
+                on_overflow: OverflowPolicy::SparseFallback { density_threshold },
+                ..TableBudget::default()
+            };
+            assert!(matches!(
+                accumulate(&model, &grids, &budget),
+                Err(PbError::InvalidConfig { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn sparse_fallback_rejects_tables_above_density_threshold() {
         let model = fixture_model();
         let grids = MergedGrids::from_model(&model).unwrap();
         let budget = TableBudget {
+            max_table_cells: 1,
+            max_bank_cells: 1,
             on_overflow: OverflowPolicy::SparseFallback {
-                density_threshold: 0.05,
+                density_threshold: 0.0,
             },
-            ..TableBudget::default()
         };
         assert!(matches!(
             accumulate(&model, &grids, &budget),
-            Err(PbError::InvalidConfig { .. })
+            Err(PbError::TableBudget { .. })
         ));
     }
 

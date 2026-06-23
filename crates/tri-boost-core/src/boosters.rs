@@ -439,14 +439,14 @@ fn validate_bank(
                 what: "effect tensor shape does not match its bank merged grid".into(),
             });
         }
-        for &value in table.values.values() {
+        for &value in table.values.values().iter() {
             if !value.is_finite() {
                 return Err(PbError::InvalidInput {
                     what: "effect table value must be finite".into(),
                 });
             }
         }
-        for &support in table.support.values() {
+        for &support in table.support.values().iter() {
             if !support.is_finite() || support < 0.0 {
                 return Err(PbError::InvalidInput {
                     what: "effect table support must be finite and >= 0".into(),
