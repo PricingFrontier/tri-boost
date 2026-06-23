@@ -30,8 +30,9 @@ use std::process::ExitCode;
 use serde_json::json;
 use tri_boost_core::{
     assert_exact_decomposition, bin, bin_columns, check_feature_budget, encode_model, BinConfig,
-    BinnedMatrix, Booster, Config, ExactnessMode, FitSpec, HistPrecision, InteractionPolicy, Loss,
-    MonotoneMap, PbError, RefMeasure, Sampling, ServeBinnedMatrix, SquaredError, Stage,
+    BinnedMatrix, Booster, BoosterConfig, Config, ExactnessMode, FitSpec, HistPrecision,
+    InteractionPolicy, Loss, MonotoneMap, NesterovSpec, PbError, RefMeasure, RefitSpec, Sampling,
+    ServeBinnedMatrix, SquaredError, Stage,
 };
 
 /// A grep-gate: scans the shipped sources and returns any violations found.
@@ -183,53 +184,80 @@ fn print_accuracy_usage() {
 }
 
 fn run_accuracy_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
-    let raw = synthetic_fixture(seed, 320)?;
+    let raw = synthetic_fixture(seed, 192)?;
     let split = deterministic_split(seed, raw.y.len())?;
     let train = select_fixture_rows(&raw, &split.train);
     let test = select_fixture_rows(&raw, &split.test);
     let x_train = build_train_matrix(&train)?;
 
     let loss = SquaredError;
-    let booster = Booster::with_config(Config {
-        n_trees: 120,
-        learning_rate: 0.25,
-        lambda: 1.0,
-        min_split_gain: 0.0,
-        max_delta_step: None,
-        sampling: Sampling::Mvs {
-            rate: 0.75,
-            min_rows: 96,
-        },
-        hist_precision: HistPrecision::QuantizedI32,
-        boosters: Default::default(),
-    });
-    let spec = FitSpec {
-        loss: &loss,
-        weight: None,
-        exposure: None,
-        monotone: MonotoneMap::new(),
-        interaction: InteractionPolicy::default(),
+    let baseline = fit_score_candidate(
+        "baseline",
+        accuracy_config(BoosterConfig::default()),
+        &x_train,
+        &train,
+        &test,
         seed,
-    };
-    let model = booster.fit(&x_train, &train.y, &spec)?;
-
-    let serve_train = ServeBinnedMatrix(x_train.clone());
-    let bank = model.explain(&serve_train, RefMeasure::default())?;
-    if model.mode != ExactnessMode::Exact {
-        return Err("accuracy harness refuses to score a non-Exact model".into());
-    }
-    check_feature_budget(&model)?;
-    assert_exact_decomposition(&model, &bank, &serve_train)?;
-
-    let x_test = bin_like_model(&test, &model.grids, &model.provenance)?;
-    let mut raw_pred = vec![0.0_f32; x_test.n_rows as usize];
-    model.score_trees(&x_test, None, &mut raw_pred)?;
-    let pred = model.predict_binned(&x_test, None)?;
-    let weight = vec![1.0_f32; test.y.len()];
-    let deviance = loss.deviance(&test.y, &raw_pred, &weight)?;
-    let lift = lift_curve(&test.y, &pred, &weight, 10);
-    let ordered_gini = ordered_gini(&test.y, &pred, &weight);
-    let encoded_len = encode_model(&model)?.len();
+        &loss,
+    )?;
+    let refit = fit_score_candidate(
+        "refit_ridge",
+        accuracy_config(BoosterConfig {
+            refit_leaves: RefitSpec::Ridge {
+                l2: 1.0e-6,
+                max_iter: 2,
+                every_k_trees: None,
+            },
+            ..BoosterConfig::default()
+        }),
+        &x_train,
+        &train,
+        &test,
+        seed,
+        &loss,
+    )?;
+    let agbm = fit_score_candidate(
+        "agbm",
+        accuracy_config(BoosterConfig {
+            nesterov: NesterovSpec::Agbm {
+                momentum_correction: false,
+            },
+            ..BoosterConfig::default()
+        }),
+        &x_train,
+        &train,
+        &test,
+        seed,
+        &loss,
+    )?;
+    let agbm_correction = fit_score_candidate(
+        "agbm_momentum_correction",
+        accuracy_config(BoosterConfig {
+            nesterov: NesterovSpec::Agbm {
+                momentum_correction: true,
+            },
+            ..BoosterConfig::default()
+        }),
+        &x_train,
+        &train,
+        &test,
+        seed,
+        &loss,
+    )?;
+    let candidates = vec![
+        baseline.to_fork_json(),
+        refit.to_fork_json(),
+        agbm.to_fork_json(),
+        agbm_correction.to_fork_json(),
+    ];
+    let best = [&baseline, &refit, &agbm, &agbm_correction]
+        .into_iter()
+        .min_by(|a, b| {
+            a.deviance
+                .total_cmp(&b.deviance)
+                .then_with(|| a.name.cmp(b.name))
+        })
+        .ok_or("accuracy fork candidate set is empty")?;
 
     Ok(json!({
         "schema_version": 1,
@@ -246,18 +274,116 @@ fn run_accuracy_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
             "decomposition": true
         },
         "model": {
-            "n_trees": model.trees.len(),
-            "n_features": model.grids.len(),
+            "n_trees": baseline.n_trees,
+            "n_features": baseline.n_features,
             "hist_precision": "QuantizedI32",
             "sampling": "Mvs",
-            "bincode_bytes": encoded_len
+            "bincode_bytes": baseline.encoded_len
         },
         "metrics": {
-            "deviance": deviance,
-            "ordered_gini": ordered_gini,
-            "lift": lift
+            "deviance": baseline.deviance,
+            "ordered_gini": baseline.ordered_gini,
+            "lift": baseline.lift
+        },
+        "fork_resolution": {
+            "candidates": candidates,
+            "best_smoke_candidate": best.name,
+            "decision": {
+                "refit_default": "off",
+                "agbm_default": "off",
+                "reason": "Smoke results are recorded for regression visibility; default-on requires repayment on the external accuracy corpus."
+            }
         }
     }))
+}
+
+#[derive(Debug, Clone)]
+struct CandidateMetrics {
+    name: &'static str,
+    n_trees: usize,
+    n_features: usize,
+    encoded_len: usize,
+    deviance: f32,
+    ordered_gini: f64,
+    lift: Vec<serde_json::Value>,
+}
+
+impl CandidateMetrics {
+    fn to_fork_json(&self) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "deviance": self.deviance,
+            "ordered_gini": self.ordered_gini,
+            "n_trees": self.n_trees,
+            "bincode_bytes": self.encoded_len,
+            "exact": true
+        })
+    }
+}
+
+fn accuracy_config(boosters: BoosterConfig) -> Config {
+    Config {
+        n_trees: 40,
+        learning_rate: 0.25,
+        lambda: 1.0,
+        min_split_gain: 0.0,
+        max_delta_step: None,
+        sampling: Sampling::Mvs {
+            rate: 0.75,
+            min_rows: 48,
+        },
+        hist_precision: HistPrecision::QuantizedI32,
+        boosters,
+    }
+}
+
+fn fit_score_candidate(
+    name: &'static str,
+    config: Config,
+    x_train: &BinnedMatrix,
+    train: &RawFixture,
+    test: &RawFixture,
+    seed: u64,
+    loss: &SquaredError,
+) -> XtaskResult<CandidateMetrics> {
+    let booster = Booster::with_config(config);
+    let spec = FitSpec {
+        loss,
+        weight: None,
+        exposure: None,
+        monotone: MonotoneMap::new(),
+        interaction: InteractionPolicy::default(),
+        seed,
+    };
+    let model = booster.fit(x_train, &train.y, &spec)?;
+
+    let serve_train = ServeBinnedMatrix(x_train.clone());
+    let bank = model.explain(&serve_train, RefMeasure::default())?;
+    if model.mode != ExactnessMode::Exact {
+        return Err("accuracy harness refuses to score a non-Exact model".into());
+    }
+    check_feature_budget(&model)?;
+    assert_exact_decomposition(&model, &bank, &serve_train)?;
+
+    let x_test = bin_like_model(test, &model.grids, &model.provenance)?;
+    let mut raw_pred = vec![0.0_f32; x_test.n_rows as usize];
+    model.score_trees(&x_test, None, &mut raw_pred)?;
+    let pred = model.predict_binned(&x_test, None)?;
+    let weight = vec![1.0_f32; test.y.len()];
+    let deviance = loss.deviance(&test.y, &raw_pred, &weight)?;
+    let lift = lift_curve(&test.y, &pred, &weight, 10);
+    let ordered_gini = ordered_gini(&test.y, &pred, &weight);
+    let encoded_len = encode_model(&model)?.len();
+
+    Ok(CandidateMetrics {
+        name,
+        n_trees: model.trees.len(),
+        n_features: model.grids.len(),
+        encoded_len,
+        deviance,
+        ordered_gini,
+        lift,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -923,5 +1049,15 @@ mod accuracy_tests {
         assert_eq!(a["exactness"]["feature_budget"], true);
         assert!(a["metrics"]["deviance"].as_f64().unwrap().is_finite());
         assert!(a["metrics"]["ordered_gini"].as_f64().unwrap().is_finite());
+        assert_eq!(a["fork_resolution"]["decision"]["refit_default"], "off");
+        assert_eq!(a["fork_resolution"]["decision"]["agbm_default"], "off");
+        assert_eq!(
+            a["fork_resolution"]["candidates"].as_array().unwrap().len(),
+            4
+        );
+        for candidate in a["fork_resolution"]["candidates"].as_array().unwrap() {
+            assert_eq!(candidate["exact"], true);
+            assert!(candidate["deviance"].as_f64().unwrap().is_finite());
+        }
     }
 }
