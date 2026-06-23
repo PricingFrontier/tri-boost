@@ -690,6 +690,7 @@ fn run_accuracy_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
             "n_features": baseline.n_features,
             "hist_precision": "QuantizedI32",
             "sampling": "Mvs",
+            "table_budget_beta": f64::from(InteractionPolicy::default().table_budget_beta),
             "bincode_bytes": baseline.encoded_len
         },
         "metrics": {
@@ -794,6 +795,9 @@ fn run_release_preflight(seed: u64) -> XtaskResult<serde_json::Value> {
         .all(|candidate| candidate["exact"].as_bool().unwrap_or(false));
     let qhist_on = accuracy["model"]["hist_precision"] == "QuantizedI32";
     let mvs_on = accuracy["model"]["sampling"] == "Mvs";
+    let table_budget_beta_on = accuracy["model"]["table_budget_beta"]
+        .as_f64()
+        .is_some_and(|beta| beta > 0.0);
     let sparse_on = adversarial["tables"]["sparse"].as_u64().unwrap_or(0) > 0;
     let sparse_triple_on = adversarial["tables"]["sparse_triples"]
         .as_u64()
@@ -809,6 +813,7 @@ fn run_release_preflight(seed: u64) -> XtaskResult<serde_json::Value> {
     if !(fork_candidates_exact
         && qhist_on
         && mvs_on
+        && table_budget_beta_on
         && sparse_on
         && sparse_triple_on
         && exactness_green)
@@ -824,6 +829,7 @@ fn run_release_preflight(seed: u64) -> XtaskResult<serde_json::Value> {
             "exactness": true,
             "mvs": true,
             "quantized_histograms": true,
+            "table_budget_beta": true,
             "sparse_fallback": true,
             "sparse_triples": true,
             "ensemble_candidates_exact": true
@@ -1734,6 +1740,7 @@ mod accuracy_tests {
         assert_eq!(artifact["internal"]["exactness"], true);
         assert_eq!(artifact["internal"]["mvs"], true);
         assert_eq!(artifact["internal"]["quantized_histograms"], true);
+        assert_eq!(artifact["internal"]["table_budget_beta"], true);
         assert_eq!(artifact["internal"]["sparse_fallback"], true);
         assert_eq!(artifact["internal"]["sparse_triples"], true);
         assert_eq!(artifact["internal"]["ensemble_candidates_exact"], true);

@@ -26,7 +26,9 @@ use crate::boosters::{DartSpec, EnsembleSpec, HpGrid, NesterovSpec, RefitSpec};
 use crate::cat::CatEncoderStore;
 use crate::constraints::MonoSign;
 use crate::data::{compute_offset, BinnedMatrix};
-use crate::engine::split::{grow_oblivious_tree, refit_tree_leaves, GrowConfig};
+use crate::engine::split::{
+    grow_oblivious_tree, refit_tree_leaves, GrowConfig, TableBudgetPenalty,
+};
 use crate::engine::{
     low_bit, Config, ExactnessMode, FitSpec, Model, ModelSchema, ObliviousTree, Sampling,
 };
@@ -72,6 +74,19 @@ fn validate_fit_spec(spec: &FitSpec<'_>) -> Result<(), PbError> {
                 });
             }
         }
+    }
+    if !spec.interaction.table_budget_beta.is_finite() || spec.interaction.table_budget_beta < 0.0 {
+        return Err(PbError::InvalidConfig {
+            what: format!(
+                "interaction.table_budget_beta must be finite and >= 0, got {}",
+                spec.interaction.table_budget_beta
+            ),
+        });
+    }
+    if spec.interaction.table_budget_cells == 0 {
+        return Err(PbError::InvalidConfig {
+            what: "interaction.table_budget_cells must be > 0".into(),
+        });
     }
     Ok(())
 }
@@ -311,6 +326,10 @@ fn fit_single(
         random_strength: f64::from(config.boosters.random_strength),
         groups: spec.interaction.groups.as_deref(),
         monotone: monotone_ref,
+        table_budget_penalty: TableBudgetPenalty::new(
+            f64::from(spec.interaction.table_budget_beta),
+            spec.interaction.table_budget_cells,
+        ),
     };
 
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
@@ -2863,6 +2882,20 @@ mod tests {
         let mut s = spec(&sqe);
         s.interaction.groups = Some(vec![FeatureSet::new(&[0])]);
         assert!(booster.fit(&x, &y, &s).is_ok());
+
+        let mut s = spec(&sqe);
+        s.interaction.table_budget_beta = f32::NAN;
+        assert!(matches!(
+            booster.fit(&x, &y, &s),
+            Err(PbError::InvalidConfig { .. })
+        ));
+
+        let mut s = spec(&sqe);
+        s.interaction.table_budget_cells = 0;
+        assert!(matches!(
+            booster.fit(&x, &y, &s),
+            Err(PbError::InvalidConfig { .. })
+        ));
 
         let mut s = spec(&sqe);
         s.monotone.insert("f0".into(), MonoSign::Increasing);

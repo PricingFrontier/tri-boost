@@ -57,6 +57,9 @@ pub(crate) struct GrowConfig<'a> {
     pub groups: Option<&'a [FeatureSet]>,
     /// Optional per-axis monotone signs resolved at fit entry (§07).
     pub monotone: Option<&'a [Option<MonoSign>]>,
+    /// Optional soft table-size admission prior (§07.3/§07.4). It changes only the
+    /// ranking score; raw Newton gain still gates and is stored.
+    pub table_budget_penalty: Option<TableBudgetPenalty>,
 }
 
 /// A candidate level split with its summed Newton gain.
@@ -70,6 +73,53 @@ pub(crate) struct Candidate {
     pub missing_left: bool,
     /// The summed Newton gain `½ Σ_leaf [G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ)]`.
     pub gain: f64,
+}
+
+/// Soft table-size admission prior (§07.3/§07.4).
+///
+/// This is a ranking-only multiplier:
+/// `score = gain.max(0) * (budget / max(budget, projected_cells))^beta`.
+/// `beta = 0` is represented as `None` by [`TableBudgetPenalty::new`], which makes
+/// the split finder exactly recover the unpenalized ordering and tie behavior.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TableBudgetPenalty {
+    beta: f64,
+    budget_cells: u64,
+}
+
+impl TableBudgetPenalty {
+    pub(crate) fn new(beta: f64, budget_cells: u64) -> Option<Self> {
+        (beta > 0.0).then_some(Self { beta, budget_cells })
+    }
+
+    fn multiplier(
+        self,
+        x: &BinnedMatrix,
+        used_axes: &[u32],
+        candidate_axis: u32,
+    ) -> Result<f64, PbError> {
+        let mut cells = 1u64;
+        for axis in used_axes
+            .iter()
+            .copied()
+            .chain(std::iter::once(candidate_axis))
+        {
+            let grid = x
+                .grids
+                .get(axis as usize)
+                .ok_or_else(internal("budget-prior axis grid"))?;
+            cells = cells
+                .checked_mul(u64::from(grid.n_bins))
+                .ok_or_else(|| PbError::Internal {
+                    what: "budget-prior projected cell count overflowed u64".into(),
+                })?;
+        }
+        if cells <= self.budget_cells {
+            Ok(1.0)
+        } else {
+            Ok((self.budget_cells as f64 / cells as f64).powf(self.beta))
+        }
+    }
 }
 
 /// Deterministic per-candidate split-score noise.
@@ -124,6 +174,16 @@ pub(crate) struct MonotoneScan<'a> {
     candidate_axis_signs: &'a [Option<MonoSign>],
     lr: f64,
     max_delta_step: Option<f64>,
+}
+
+/// Ranking-only split aids. These can choose among admissible raw-gain candidates,
+/// but they never alter the stored [`Candidate::gain`] and never bypass
+/// `min_split_gain`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RankingContext<'a> {
+    monotone: Option<MonotoneScan<'a>>,
+    noise: Option<SplitNoise>,
+    table_penalties: Option<&'a [f64]>,
 }
 
 /// The Newton term `G²/(H+λ)`, guarded so a non-positive denominator contributes 0
@@ -204,8 +264,7 @@ pub(crate) fn best_level_split(
     n_data_bins: &[usize],
     lambda: f64,
     min_split_gain: f64,
-    monotone: Option<MonotoneScan<'_>>,
-    noise: Option<SplitNoise>,
+    ranking: RankingContext<'_>,
 ) -> Result<Option<Candidate>, PbError> {
     let nl = hist.n_leaves;
     let mut best: Option<(Candidate, f64)> = None;
@@ -296,7 +355,7 @@ pub(crate) fn best_level_split(
                 if !gain.is_finite() || gain <= min_split_gain {
                     continue;
                 }
-                if let Some(scan) = monotone {
+                if let Some(scan) = ranking.monotone {
                     let mut signs = Vec::with_capacity(scan.level + 1);
                     signs.extend_from_slice(scan.chosen);
                     signs.push(
@@ -336,8 +395,14 @@ pub(crate) fn best_level_split(
                 }
                 // Strict `>` ⇒ the first candidate (lowest axis/bin_le, ml=false) wins
                 // ties ⇒ deterministic argmax.
-                let score = gain
-                    + match noise {
+                let penalty = match ranking.table_penalties {
+                    Some(penalties) => *penalties
+                        .get(p)
+                        .ok_or_else(internal("ranking penalty index"))?,
+                    None => 1.0,
+                };
+                let score = gain.max(0.0) * penalty
+                    + match ranking.noise {
                         Some(split_noise) => split_noise.adjustment(axis, v, ml)?,
                         None => 0.0,
                     };
@@ -484,6 +549,7 @@ pub(crate) fn grow_oblivious_tree(
     let mut splits: Vec<Split> = Vec::new();
     let mut split_signs: Vec<Option<MonoSign>> = Vec::new();
     let mut used_raws: smallvec::SmallVec<[u32; 3]> = smallvec::SmallVec::new();
+    let mut used_axes: smallvec::SmallVec<[u32; 3]> = smallvec::SmallVec::new();
     let order_cap = usize::from(cfg.max_order).min(3);
 
     for level in 0..3usize {
@@ -507,6 +573,15 @@ pub(crate) fn grow_oblivious_tree(
                     .map_or(0, |grid| usize::from(grid.n_bins).saturating_sub(1))
             })
             .collect();
+        let ranking_penalties = match cfg.table_budget_penalty {
+            Some(penalty) => Some(
+                admissible
+                    .iter()
+                    .map(|&axis| penalty.multiplier(x, &used_axes, axis))
+                    .collect::<Result<Vec<_>, PbError>>()?,
+            ),
+            None => None,
+        };
 
         let n_leaves = 1usize << level;
         let hist = match cfg.hist_precision {
@@ -546,8 +621,11 @@ pub(crate) fn grow_oblivious_tree(
             &n_data_bins,
             cfg.lambda,
             cfg.min_split_gain,
-            monotone_scan,
-            SplitNoise::new(cfg.quant_seed, cfg.round, level, cfg.random_strength),
+            RankingContext {
+                monotone: monotone_scan,
+                noise: SplitNoise::new(cfg.quant_seed, cfg.round, level, cfg.random_strength),
+                table_penalties: ranking_penalties.as_deref(),
+            },
         )? {
             Some(c) => c,
             None => break, // graceful early-termination (depth < 3)
@@ -569,6 +647,7 @@ pub(crate) fn grow_oblivious_tree(
             .raw
             .0;
         used_raws.push(raw);
+        used_axes.push(cand.axis);
 
         // Sample→leaf update: set this level's bit using the SAME canonical low_bit.
         let col = x
@@ -685,7 +764,7 @@ mod tests {
         set(&mut hist, 1, 4.0, 2.0, 1);
         set(&mut hist, 2, -6.0, 3.0, 1);
 
-        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None, None)
+        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, RankingContext::default())
             .unwrap()
             .unwrap();
         // Only candidate is v=1. total_g=0,total_h=6 ⇒ parent=0²/7=0.
@@ -718,9 +797,19 @@ mod tests {
         set(&mut hist, 2, -6.0, 3.0);
 
         let noise = SplitNoise::new(123, 7, 0, 100.0);
-        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None, noise)
-            .unwrap()
-            .unwrap();
+        let best = best_level_split(
+            &hist,
+            &[0],
+            &[2],
+            1.0,
+            0.0,
+            RankingContext {
+                noise,
+                ..RankingContext::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
         let expected_raw = if best.missing_left {
             9.0
         } else {
@@ -734,15 +823,70 @@ mod tests {
     }
 
     #[test]
+    fn table_budget_penalty_is_soft_and_preserves_raw_gain() {
+        // Two one-threshold axes. Axis 0 has larger raw Newton gain (~10) but is
+        // assigned an expensive-support multiplier; axis 1 has smaller raw gain (~9)
+        // and wins only after the ranking prior. The stored gain remains axis 1's
+        // raw Newton gain.
+        let mut hist = Hist::try_zeros(1, 2, 3).unwrap();
+        let set_axis = |hist: &mut Hist, axis: usize, a: f64| {
+            let l = hist.offset(0, axis, 1).unwrap();
+            let r = hist.offset(0, axis, 2).unwrap();
+            hist.g[l] = a;
+            hist.h[l] = 1.0;
+            hist.count[l] = 1;
+            hist.g[r] = -a;
+            hist.h[r] = 1.0;
+            hist.count[r] = 1;
+        };
+        set_axis(&mut hist, 0, (20.0_f64).sqrt());
+        set_axis(&mut hist, 1, (18.0_f64).sqrt());
+
+        let raw_best =
+            best_level_split(&hist, &[0, 1], &[2, 2], 1.0, 0.0, RankingContext::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(raw_best.axis, 0);
+        assert!((raw_best.gain - 10.0).abs() < 1.0e-9);
+
+        let penalized = best_level_split(
+            &hist,
+            &[0, 1],
+            &[2, 2],
+            1.0,
+            0.0,
+            RankingContext {
+                table_penalties: Some(&[0.5, 1.0]),
+                ..RankingContext::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(penalized.axis, 1);
+        assert!((penalized.gain - 9.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn table_budget_beta_zero_is_exactly_inert() {
+        assert_eq!(TableBudgetPenalty::new(0.0, 1), None);
+        let x = matrix(vec![vec![1u8, 2]], &[3]);
+        let penalty = TableBudgetPenalty::new(0.5, 3).unwrap();
+        let no_over_budget = penalty.multiplier(&x, &[], 0).unwrap();
+        assert_eq!(no_over_budget, 1.0);
+    }
+
+    #[test]
     fn below_min_split_gain_yields_no_candidate() {
         let mut hist = Hist::try_zeros(1, 1, 3).unwrap();
         let o = hist.offset(0, 0, 1).unwrap();
         hist.g[o] = 1.0;
         hist.h[o] = 1.0;
         // Single populated bin ⇒ any split is degenerate (gain 0); a positive floor rejects it.
-        assert!(best_level_split(&hist, &[0], &[2], 1.0, 1.0, None, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            best_level_split(&hist, &[0], &[2], 1.0, 1.0, RankingContext::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -809,6 +953,7 @@ mod tests {
             random_strength: 0.0,
             groups: None,
             monotone: None,
+            table_budget_penalty: None,
         }
     }
 
@@ -1010,7 +1155,7 @@ mod tests {
         set(&mut hist, 0, 2.0, 1.0);
         set(&mut hist, 1, -6.0, 3.0);
         set(&mut hist, 2, 4.0, 2.0);
-        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None, None)
+        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, RankingContext::default())
             .unwrap()
             .unwrap();
         assert!(!best.missing_left, "missing should be learned RIGHT here");

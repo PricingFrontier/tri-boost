@@ -33,6 +33,15 @@ pub struct InteractionPolicy {
     pub max_order: u8,
     /// Allowed co-occurrence groups; `None` = unconstrained.
     pub groups: Option<Vec<FeatureSet>>,
+    /// Soft table-size prior exponent (§07.3/§07.4). A value of `0.0` is exactly
+    /// inert; positive values down-rank supports whose projected table cells exceed
+    /// [`InteractionPolicy::table_budget_cells`], but never hard-reject them.
+    #[serde(default = "default_table_budget_beta")]
+    pub table_budget_beta: f32,
+    /// Cell budget used by the soft table-size prior. This is an admission score
+    /// prior, separate from the hard [`crate::TableBudget`] allocation firewall.
+    #[serde(default = "default_table_budget_cells")]
+    pub table_budget_cells: u64,
 }
 
 impl Default for InteractionPolicy {
@@ -40,8 +49,18 @@ impl Default for InteractionPolicy {
         Self {
             max_order: 3,
             groups: None,
+            table_budget_beta: default_table_budget_beta(),
+            table_budget_cells: default_table_budget_cells(),
         }
     }
+}
+
+fn default_table_budget_beta() -> f32 {
+    0.5
+}
+
+fn default_table_budget_cells() -> u64 {
+    2_000_000
 }
 
 /// Uniform 8-leaf Walsh-Hadamard / Möbius coefficients for one depth-3 oblivious
