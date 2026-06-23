@@ -559,6 +559,20 @@ fn map_union_cell_to_source(
     }
 }
 
+/// Per source cell, how many union cells map to it (the refinement fanout) — used to
+/// split a member's per-cell support count across the union sub-cells it covers, so the
+/// averaged-bank support conserves the source count instead of multiplying it.
+fn source_fanout(union_grid: &BorderGrid, source_grid: &BorderGrid) -> Result<Vec<usize>, PbError> {
+    let mut fanout = vec![0usize; usize::from(source_grid.n_bins)];
+    for cell in 0..usize::from(union_grid.n_bins) {
+        let s = map_union_cell_to_source(union_grid, source_grid, cell)?;
+        *fanout.get_mut(s).ok_or_else(|| PbError::Internal {
+            what: "fanout source cell escaped".into(),
+        })? += 1;
+    }
+    Ok(fanout)
+}
+
 fn source_coord(
     union_grids: &[BorderGrid],
     source_grids: &[BorderGrid],
@@ -793,6 +807,26 @@ pub fn average_banks(members: &[(f32, TableBank)], w: &RefMeasure) -> Result<Tab
                 what: "average_banks support missing from accumulator".into(),
             })?;
             let extents = target.values.shape();
+            // Per-axis refinement fanout: how many union cells map to each source cell.
+            // The source support is a ROW COUNT, so it must be SPLIT across the union
+            // sub-cells it covers (Σ conserved), not replicated into each — replication
+            // would multiply the realized support by the fanout and distort the
+            // ProductMarginals reference measure derived from it (build_weights_from_effect_support).
+            let mut fanouts: Vec<Vec<usize>> = Vec::with_capacity(table.u.order());
+            for raw in &table.u.0 {
+                let union_grid =
+                    union_grids
+                        .get(raw.0 as usize)
+                        .ok_or_else(|| PbError::Internal {
+                            what: "union grid missing raw feature for fanout".into(),
+                        })?;
+                let source_grid = bank.merged_grids.get(raw.0 as usize).ok_or_else(|| {
+                    PbError::ShapeMismatch {
+                        what: format!("source bank missing raw feature {} for fanout", raw.0),
+                    }
+                })?;
+                fanouts.push(source_fanout(union_grid, source_grid)?);
+            }
             walk_extents(&extents, |target_coord| {
                 let src = source_coord(&union_grids, &bank.merged_grids, &table.u, target_coord)?;
                 let value = table.values.at(&src).ok_or_else(|| PbError::Internal {
@@ -801,8 +835,23 @@ pub fn average_banks(members: &[(f32, TableBank)], w: &RefMeasure) -> Result<Tab
                 let support = table.support.at(&src).ok_or_else(|| PbError::Internal {
                     what: "member support coordinate out of range".into(),
                 })?;
+                // K = number of union sub-cells covering this source cell.
+                let mut k = 1usize;
+                for (pos, &s) in src.iter().enumerate() {
+                    let f = fanouts
+                        .get(pos)
+                        .and_then(|fv| fv.get(s))
+                        .copied()
+                        .ok_or_else(|| PbError::Internal {
+                            what: "fanout lookup escaped".into(),
+                        })?;
+                    k = k.saturating_mul(f);
+                }
+                let k = k.max(1) as f64;
+                // The cell VALUE is constant on the refinement (correct to replicate);
+                // the SUPPORT count is split evenly across the K covering union sub-cells.
                 target.values.add(target_coord, alpha64 * value)?;
-                target.support.add(target_coord, alpha64 * support)?;
+                target.support.add(target_coord, alpha64 * support / k)?;
                 Ok(())
             })?;
         }
@@ -920,6 +969,84 @@ mod tests {
                 assert!((got - want).abs() < 1.0e-6, "{cells:?}: {got} vs {want}");
             }
         }
+    }
+
+    fn fit_main_effect_bank(vals: &[f32]) -> TableBank {
+        use crate::constraints::{InteractionPolicy, MonotoneMap};
+        use crate::data::{bin_columns, BinConfig, ServeBinnedMatrix};
+        use crate::engine::{Booster, Config, FitSpec};
+        use crate::explain::RefMeasure;
+        use crate::loss::SquaredError;
+        let cols: Vec<&[f32]> = vec![vals];
+        let x = bin_columns(&cols, None, &BinConfig::default(), 0).unwrap();
+        let sqe = SquaredError;
+        let spec = FitSpec {
+            loss: &sqe,
+            weight: None,
+            exposure: None,
+            monotone: MonotoneMap::new(),
+            interaction: InteractionPolicy::default(),
+            seed: 0,
+        };
+        let model = Booster::with_config(Config {
+            n_trees: 15,
+            learning_rate: 0.5,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: Default::default(),
+        })
+        .fit(&x, vals, &spec)
+        .unwrap();
+        model
+            .explain(&ServeBinnedMatrix(x), RefMeasure::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn average_banks_conserves_support_across_differing_grids() {
+        // Two single-feature models whose realized borders DIFFER, so the averaged union
+        // grid refines each member. A member's per-cell support is a ROW COUNT and must be
+        // SPLIT across the union sub-cells it covers (Σ conserved), not replicated.
+        let a: Vec<f32> = (1..=10).map(|i| i as f32).collect();
+        let b: Vec<f32> = (1..=10).map(|i| (i * 2) as f32).collect();
+        let ba = fit_main_effect_bank(&a);
+        let bb = fit_main_effect_bank(&b);
+        assert_ne!(
+            ba.merged_grids, bb.merged_grids,
+            "members must differ in grid for this test to exercise the refinement split"
+        );
+        let avg = average_banks(
+            &[(0.5, ba.clone()), (0.5, bb.clone())],
+            &RefMeasure::default(),
+        )
+        .unwrap();
+
+        // Total support over the main-effect table is conserved: each member's table sums
+        // to its row count (10), so the 0.5/0.5 average sums to 10 — NOT 10·fanout.
+        let member_total = |bank: &TableBank| -> f64 {
+            bank.tables
+                .iter()
+                .find(|t| t.u.order() == 1)
+                .map(|t| t.support.values().iter().sum::<f64>())
+                .unwrap_or(0.0)
+        };
+        let want = 0.5 * member_total(&ba) + 0.5 * member_total(&bb);
+        let got: f64 = avg
+            .tables
+            .iter()
+            .find(|t| t.u.order() == 1)
+            .unwrap()
+            .support
+            .values()
+            .iter()
+            .sum();
+        assert!(
+            (got - want).abs() < 1e-6,
+            "averaged support {got} should conserve the member total {want} (replication would inflate it)"
+        );
     }
 
     #[test]
