@@ -213,6 +213,8 @@ pub enum Stage {
     Bagging = 4,
     /// Categorical target-statistic permutations/folds (§04.3).
     Categorical = 5,
+    /// Split-score random-strength tie/regularization noise (§09.6).
+    SplitNoise = 6,
 }
 
 /// Construct the per-work-unit [`Pcg64`] from the frozen [`pb_seed`] mixer

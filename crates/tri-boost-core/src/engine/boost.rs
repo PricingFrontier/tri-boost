@@ -272,6 +272,7 @@ pub(crate) fn fit(
         hist_precision: config.hist_precision,
         quant_seed: spec.seed,
         round: 0,
+        random_strength: f64::from(config.boosters.random_strength),
         groups: spec.interaction.groups.as_deref(),
         monotone: monotone_ref,
     };
@@ -643,6 +644,55 @@ mod tests {
                 });
                 let sqe = SquaredError;
                 let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert!(!b1.is_empty());
+        assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn random_strength_fit_is_byte_identical_across_thread_counts() {
+        let n = 240usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 6 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 4 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                (if x0[i] <= 3.0 { -2.0 } else { 3.0 })
+                    + if x1[i] <= 2.0 { 1.5 } else { -1.0 }
+                    + (i % 7) as f32 * 0.05
+            })
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let cfg = Config {
+            n_trees: 35,
+            learning_rate: 0.25,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: BoosterConfig {
+                random_strength: 0.35,
+                ..BoosterConfig::default()
+            },
+        };
+        let sqe = SquaredError;
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(cfg.clone())
+                    .fit(&x, &y, &spec(&sqe))
+                    .unwrap();
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
                 crate::serialize::encode_model(&model).unwrap()
             })
         };

@@ -14,6 +14,7 @@
 //! count) with a deterministic first-wins argmax; the parallelism lives in the
 //! histogram build (`engine::hist`). Determinism is therefore structural.
 
+use crate::backend::{pb_seed, Stage};
 use crate::constraints::MonoSign;
 use crate::data::BinnedMatrix;
 use crate::engine::hist::{build_histogram, build_quantized_histogram, QuantizeContext};
@@ -49,6 +50,8 @@ pub(crate) struct GrowConfig<'a> {
     pub quant_seed: u64,
     /// Boosting round, used as the quantization re-seed coordinate.
     pub round: u32,
+    /// Decaying deterministic split-score noise (§09.6). `0.0` is exactly inert.
+    pub random_strength: f64,
     /// Optional whole-tree feature-group whitelist (§07): every realized tree support
     /// must be a subset of at least one group.
     pub groups: Option<&'a [FeatureSet]>,
@@ -67,6 +70,51 @@ pub(crate) struct Candidate {
     pub missing_left: bool,
     /// The summed Newton gain `½ Σ_leaf [G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ)]`.
     pub gain: f64,
+}
+
+/// Deterministic per-candidate split-score noise.
+///
+/// This is deliberately a ranking-only term: the raw Newton gain still gates
+/// `min_split_gain` and is what gets stored on [`Candidate`]. The seed stream is
+/// position-stable in `(seed, round, level, axis, bin, missing_left)`, so thread
+/// count and scan partitioning cannot affect the selected candidate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SplitNoise {
+    seed: u64,
+    round: u32,
+    level: usize,
+    strength: f64,
+}
+
+impl SplitNoise {
+    fn new(seed: u64, round: u32, level: usize, strength: f64) -> Option<Self> {
+        (strength > 0.0).then_some(Self {
+            seed,
+            round,
+            level,
+            strength,
+        })
+    }
+
+    fn adjustment(self, axis: u32, bin_le: usize, missing_left: bool) -> Result<f64, PbError> {
+        let level = u64::try_from(self.level).map_err(|_| PbError::Internal {
+            what: "split-noise level exceeded u64".into(),
+        })?;
+        let bin = u64::try_from(bin_le).map_err(|_| PbError::Internal {
+            what: "split-noise bin exceeded u64".into(),
+        })?;
+        let salt = u64::from(axis).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ bin.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+            ^ level.wrapping_mul(0x94D0_49BB_1331_11EB)
+            ^ u64::from(missing_left);
+        let bits = pb_seed(self.seed ^ salt, self.round, Stage::SplitNoise as u32, axis);
+        let mantissa = bits >> 11;
+        const TWO_53: f64 = 9_007_199_254_740_992.0;
+        let unit = mantissa as f64 / TWO_53;
+        let centered = 2.0 * unit - 1.0;
+        let decay = (f64::from(self.round) + 1.0).sqrt();
+        Ok(centered * self.strength / decay)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,9 +190,11 @@ fn candidate_monotone_ok(
 /// Scan one level's histogram for the best shared `(axis, bin_le, missing_left)`
 /// split (spec §06.2). `axes[p]` is the global axis of histogram column `p`, and
 /// `n_data_bins[p]` is that axis's data-bin count (candidate `bin_le ∈ 1..=ndb-1`).
-/// Returns the gain-maximizing candidate that clears `min_split_gain`, or `None`
-/// (graceful early-termination). Ties break deterministically: lowest axis, then
-/// lowest `bin_le`, then `missing_left = false` (sequential first-wins, strict `>`).
+/// Returns the best ranking-score candidate whose raw Newton gain clears
+/// `min_split_gain`, or `None` (graceful early-termination). With no split noise,
+/// the ranking score is the raw gain. Ties break deterministically: lowest axis,
+/// then lowest `bin_le`, then `missing_left = false` (sequential first-wins,
+/// strict `>`).
 ///
 /// # Errors
 /// [`PbError::Internal`] on an out-of-range histogram offset (a build/shape bug).
@@ -155,9 +205,10 @@ pub(crate) fn best_level_split(
     lambda: f64,
     min_split_gain: f64,
     monotone: Option<MonotoneScan<'_>>,
+    noise: Option<SplitNoise>,
 ) -> Result<Option<Candidate>, PbError> {
     let nl = hist.n_leaves;
-    let mut best: Option<Candidate> = None;
+    let mut best: Option<(Candidate, f64)> = None;
 
     for p in 0..hist.n_axes {
         let axis = *axes.get(p).ok_or_else(internal("axis index"))?;
@@ -242,6 +293,9 @@ pub(crate) fn best_level_split(
                     acc += newton_term(lg, lh, lambda) + newton_term(tg - lg, th - lh, lambda);
                 }
                 let gain = 0.5 * (acc - parent);
+                if !gain.is_finite() || gain <= min_split_gain {
+                    continue;
+                }
                 if let Some(scan) = monotone {
                     let mut signs = Vec::with_capacity(scan.level + 1);
                     signs.extend_from_slice(scan.chosen);
@@ -282,24 +336,32 @@ pub(crate) fn best_level_split(
                 }
                 // Strict `>` ⇒ the first candidate (lowest axis/bin_le, ml=false) wins
                 // ties ⇒ deterministic argmax.
+                let score = gain
+                    + match noise {
+                        Some(split_noise) => split_noise.adjustment(axis, v, ml)?,
+                        None => 0.0,
+                    };
                 let improves = match best {
-                    Some(b) => gain > b.gain,
+                    Some((_, best_score)) => score > best_score,
                     None => true,
                 };
-                if gain > min_split_gain && improves {
-                    best = Some(Candidate {
-                        axis,
-                        bin_le: u8::try_from(v).map_err(|_| PbError::Internal {
-                            what: "bin_le exceeded u8".into(),
-                        })?,
-                        missing_left: ml,
-                        gain,
-                    });
+                if improves {
+                    best = Some((
+                        Candidate {
+                            axis,
+                            bin_le: u8::try_from(v).map_err(|_| PbError::Internal {
+                                what: "bin_le exceeded u8".into(),
+                            })?,
+                            missing_left: ml,
+                            gain,
+                        },
+                        score,
+                    ));
                 }
             }
         }
     }
-    Ok(best)
+    Ok(best.map(|(candidate, _score)| candidate))
 }
 
 /// Exact Newton leaf values from FULL-PRECISION sums (spec §06.4): `w* = −G/(H+λ)`,
@@ -485,6 +547,7 @@ pub(crate) fn grow_oblivious_tree(
             cfg.lambda,
             cfg.min_split_gain,
             monotone_scan,
+            SplitNoise::new(cfg.quant_seed, cfg.round, level, cfg.random_strength),
         )? {
             Some(c) => c,
             None => break, // graceful early-termination (depth < 3)
@@ -622,7 +685,7 @@ mod tests {
         set(&mut hist, 1, 4.0, 2.0, 1);
         set(&mut hist, 2, -6.0, 3.0, 1);
 
-        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None)
+        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None, None)
             .unwrap()
             .unwrap();
         // Only candidate is v=1. total_g=0,total_h=6 ⇒ parent=0²/7=0.
@@ -639,13 +702,45 @@ mod tests {
     }
 
     #[test]
+    fn random_strength_does_not_rewrite_raw_gain() {
+        // Same closed-form fixture as above, but with ranking noise enabled. Either
+        // missing direction may win; the stored gain must remain that candidate's raw
+        // Newton gain rather than the noisy score.
+        let mut hist = Hist::try_zeros(1, 1, 3).unwrap();
+        let set = |hist: &mut Hist, bin: usize, g: f64, h: f64| {
+            let o = hist.offset(0, 0, bin).unwrap();
+            hist.g[o] = g;
+            hist.h[o] = h;
+            hist.count[o] = 1;
+        };
+        set(&mut hist, 0, 2.0, 1.0);
+        set(&mut hist, 1, 4.0, 2.0);
+        set(&mut hist, 2, -6.0, 3.0);
+
+        let noise = SplitNoise::new(123, 7, 0, 100.0);
+        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None, noise)
+            .unwrap()
+            .unwrap();
+        let expected_raw = if best.missing_left {
+            9.0
+        } else {
+            0.5 * (16.0 / 3.0 + 16.0 / 5.0)
+        };
+        assert!(
+            (best.gain - expected_raw).abs() < 1e-9,
+            "gain {} != raw {expected_raw}",
+            best.gain
+        );
+    }
+
+    #[test]
     fn below_min_split_gain_yields_no_candidate() {
         let mut hist = Hist::try_zeros(1, 1, 3).unwrap();
         let o = hist.offset(0, 0, 1).unwrap();
         hist.g[o] = 1.0;
         hist.h[o] = 1.0;
         // Single populated bin ⇒ any split is degenerate (gain 0); a positive floor rejects it.
-        assert!(best_level_split(&hist, &[0], &[2], 1.0, 1.0, None)
+        assert!(best_level_split(&hist, &[0], &[2], 1.0, 1.0, None, None)
             .unwrap()
             .is_none());
     }
@@ -711,6 +806,7 @@ mod tests {
             hist_precision: HistPrecision::FullF64,
             quant_seed: 0,
             round: 0,
+            random_strength: 0.0,
             groups: None,
             monotone: None,
         }
@@ -754,6 +850,36 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 grow_oblivious_tree(&x, &gh, &rows, &[0, 1, 2], &cfg(1.0, 0.1, 0.0, 3))
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        let a = run(1);
+        assert_eq!(a, run(2));
+        assert_eq!(a, run(8));
+    }
+
+    #[test]
+    fn grow_with_random_strength_is_deterministic_across_thread_counts() {
+        let n = 360usize;
+        let c0: Vec<u8> = (0..n).map(|i| u8::try_from(i % 6 + 1).unwrap()).collect();
+        let c1: Vec<u8> = (0..n).map(|i| u8::try_from(i % 5 + 1).unwrap()).collect();
+        let c2: Vec<u8> = (0..n).map(|i| u8::try_from(i % 4 + 1).unwrap()).collect();
+        let x = matrix(vec![c0, c1, c2], &[7, 6, 5]);
+        let g: Vec<f32> = (0..n).map(|i| (i as f32 % 13.0) - 6.0).collect();
+        let gh = gradhess(&g, &vec![1.0; n]);
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let mut cfg = cfg(1.0, 0.1, 0.0, 3);
+        cfg.quant_seed = 99;
+        cfg.round = 5;
+        cfg.random_strength = 0.75;
+        let run = |nt: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                grow_oblivious_tree(&x, &gh, &rows, &[0, 1, 2], &cfg)
                     .unwrap()
                     .unwrap()
             })
@@ -884,7 +1010,7 @@ mod tests {
         set(&mut hist, 0, 2.0, 1.0);
         set(&mut hist, 1, -6.0, 3.0);
         set(&mut hist, 2, 4.0, 2.0);
-        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None)
+        let best = best_level_split(&hist, &[0], &[2], 1.0, 0.0, None, None)
             .unwrap()
             .unwrap();
         assert!(!best.missing_left, "missing should be learned RIGHT here");
