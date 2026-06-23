@@ -657,6 +657,16 @@ struct RawBank {
     tables: BTreeMap<FeatureSet, RawTable>,
 }
 
+/// One pre-purification effect supplied by another exactness-preserving layer.
+pub(crate) struct RawEffect {
+    /// The effect support.
+    pub u: FeatureSet,
+    /// Raw, uncentered score-space values on the supplied merged grids.
+    pub values: Tensor,
+    /// Display/support counts on the same tensor shape as `values`.
+    pub support: Tensor,
+}
+
 /// The distinct raw-feature support of a tree (sorted, size = depth by I1).
 fn tree_support(model: &Model, tree: &crate::engine::ObliviousTree) -> Result<FeatureSet, PbError> {
     let mut ids: SmallVec<[FeatureId; 3]> = SmallVec::new();
@@ -1710,7 +1720,7 @@ impl MergedGrids {
     /// is `0..borders.len()`). Used by [`TableBank::recompute_under`], where no model is
     /// in hand. Only the borders/cells are consulted downstream (purify + support-derived
     /// weights), so the indices need only be internally consistent.
-    fn from_border_grids(grids: &[BorderGrid]) -> Self {
+    pub(crate) fn from_border_grids(grids: &[BorderGrid]) -> Self {
         let per_raw = grids
             .iter()
             .enumerate()
@@ -1723,6 +1733,269 @@ impl MergedGrids {
             .collect();
         MergedGrids { per_raw }
     }
+}
+
+fn validate_bank_grid(grid: &BorderGrid, raw: usize) -> Result<(), PbError> {
+    if grid.missing_bin != 0 {
+        return Err(PbError::InvalidInput {
+            what: format!("bank merged grid {raw} missing_bin must be 0"),
+        });
+    }
+    let expected = grid
+        .borders
+        .len()
+        .checked_add(2)
+        .ok_or_else(|| PbError::Internal {
+            what: "bank merged grid border count overflow".into(),
+        })?;
+    if usize::from(grid.n_bins) != expected {
+        return Err(PbError::InvalidInput {
+            what: format!(
+                "bank merged grid {raw} n_bins {} inconsistent with {} borders",
+                grid.n_bins,
+                grid.borders.len()
+            ),
+        });
+    }
+    for (i, &border) in grid.borders.iter().enumerate() {
+        if !border.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: format!("bank merged grid {raw} border {i} must be finite"),
+            });
+        }
+    }
+    for pair in grid.borders.windows(2) {
+        if let [a, b] = pair {
+            if a >= b {
+                return Err(PbError::InvalidInput {
+                    what: format!("bank merged grid {raw} borders must be strictly ascending"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn effect_extents(grids: &MergedGrids, u: &FeatureSet) -> Result<Vec<usize>, PbError> {
+    let mut extents = Vec::with_capacity(u.order());
+    for raw in &u.0 {
+        extents.push(grids.cells(*raw)?);
+    }
+    Ok(extents)
+}
+
+fn validate_raw_effect(grids: &MergedGrids, effect: &RawEffect) -> Result<(), PbError> {
+    if !(1..=3).contains(&effect.u.order()) {
+        return Err(PbError::InvalidInput {
+            what: format!("raw effect order {} outside 1..=3", effect.u.order()),
+        });
+    }
+    let extents = effect_extents(grids, &effect.u)?;
+    if effect.values.shape() != extents {
+        return Err(PbError::ShapeMismatch {
+            what: "raw effect values shape does not match merged grid".into(),
+        });
+    }
+    if effect.support.shape() != extents {
+        return Err(PbError::ShapeMismatch {
+            what: "raw effect support shape does not match merged grid".into(),
+        });
+    }
+    Ok(())
+}
+
+fn marginal_counts_from_effect(
+    effect: &RawEffect,
+    raw: FeatureId,
+    cells: usize,
+) -> Result<Option<Vec<f64>>, PbError> {
+    let Some(pos) = effect.u.0.iter().position(|r| *r == raw) else {
+        return Ok(None);
+    };
+    let mut counts = vec![0.0_f64; cells];
+    let extents = effect.support.shape();
+    walk_extents(&extents, |coord| {
+        let cell = *coord.get(pos).ok_or_else(|| PbError::Internal {
+            what: "support marginal position escaped coordinate".into(),
+        })?;
+        let value = effect.support.at(coord).ok_or_else(|| PbError::Internal {
+            what: "support marginal coordinate out of range".into(),
+        })?;
+        let slot = counts.get_mut(cell).ok_or_else(|| PbError::Internal {
+            what: "support marginal cell escaped counts".into(),
+        })?;
+        *slot += value;
+        Ok(())
+    })?;
+    let total: f64 = counts.iter().sum();
+    if total > 0.0 {
+        Ok(Some(counts))
+    } else {
+        Ok(None)
+    }
+}
+
+fn axis_counts_from_effects(
+    effects: &[RawEffect],
+    raw: FeatureId,
+    cells: usize,
+) -> Result<Vec<f64>, PbError> {
+    let mut candidates: Vec<&RawEffect> = effects.iter().filter(|e| e.u.contains(raw)).collect();
+    candidates.sort_by_key(|e| e.u.order());
+    for effect in candidates {
+        if let Some(counts) = marginal_counts_from_effect(effect, raw, cells)? {
+            return Ok(counts);
+        }
+    }
+    Ok(vec![0.0_f64; cells])
+}
+
+fn build_weights_from_effect_support(
+    grids: &[BorderGrid],
+    effects: &[RawEffect],
+    w: &RefMeasure,
+) -> Result<WeightCache, PbError> {
+    let laplace =
+        match w {
+            RefMeasure::Uniform => None,
+            RefMeasure::ProductMarginals { laplace } => {
+                if !laplace.is_finite() || *laplace <= 0.0 {
+                    return Err(PbError::InvalidConfig {
+                        what: "ProductMarginals laplace must be finite and > 0".into(),
+                    });
+                }
+                Some(f64::from(*laplace))
+            }
+            RefMeasure::Joint => return Err(PbError::InvalidConfig {
+                what:
+                    "Joint reference measure is a v1.5 fork; v1 supports ProductMarginals/Uniform"
+                        .into(),
+            }),
+        };
+
+    let mut per_axis = Vec::with_capacity(grids.len());
+    for (raw, grid) in grids.iter().enumerate() {
+        validate_bank_grid(grid, raw)?;
+        let cells = usize::from(grid.n_bins);
+        let raw_w = match laplace {
+            None => vec![1.0_f64 / cells as f64; cells],
+            Some(lap) => {
+                let raw_id = FeatureId(u32::try_from(raw).map_err(|_| PbError::InvalidInput {
+                    what: "raw feature index exceeds u32".into(),
+                })?);
+                let counts = axis_counts_from_effects(effects, raw_id, cells)?;
+                let n_total: f64 = counts.iter().sum();
+                let unif = 1.0_f64 / cells as f64;
+                let inv_n = if n_total > 0.0 { 1.0 / n_total } else { 0.0 };
+                counts.iter().map(|c| unif + lap * (c * inv_n)).collect()
+            }
+        };
+        let total: f64 = raw_w.iter().sum();
+        if total.is_nan() || total <= 0.0 {
+            return Err(PbError::Internal {
+                what: "reference-measure axis weights summed to zero".into(),
+            });
+        }
+        per_axis.push(raw_w.iter().map(|x| x / total).collect());
+    }
+    Ok(WeightCache {
+        per_axis,
+        kind: w.clone(),
+    })
+}
+
+fn support_for_subset(
+    support_by_u: &BTreeMap<FeatureSet, Tensor>,
+    target: &FeatureSet,
+    grids: &MergedGrids,
+) -> Result<Option<Tensor>, PbError> {
+    let mut candidates: Vec<(&FeatureSet, &Tensor)> = support_by_u
+        .iter()
+        .filter(|(u, _)| target.0.iter().all(|raw| u.contains(*raw)))
+        .collect();
+    candidates.sort_by_key(|(u, _)| u.order());
+
+    if let Some((source_u, support)) = candidates.into_iter().next() {
+        if source_u == target {
+            return Ok(Some(support.clone()));
+        }
+        let mut positions = Vec::with_capacity(target.order());
+        for raw in &target.0 {
+            let pos = source_u
+                .0
+                .iter()
+                .position(|source_raw| source_raw == raw)
+                .ok_or_else(|| PbError::Internal {
+                    what: "support subset search lost a raw feature".into(),
+                })?;
+            positions.push(pos);
+        }
+        let extents = effect_extents(grids, target)?;
+        let mut out = Tensor::try_zeros(extents)?;
+        let source_extents = support.shape();
+        walk_extents(&source_extents, |coord| {
+            let mut target_coord = Vec::with_capacity(target.order());
+            for pos in &positions {
+                target_coord.push(*coord.get(*pos).ok_or_else(|| PbError::Internal {
+                    what: "support subset coordinate escaped source".into(),
+                })?);
+            }
+            let v = support.at(coord).ok_or_else(|| PbError::Internal {
+                what: "support subset source coordinate out of range".into(),
+            })?;
+            out.add(&target_coord, v)
+        })?;
+        return Ok(Some(out));
+    }
+    Ok(None)
+}
+
+/// Purify raw score-space effects on an explicit merged grid, carrying support
+/// metadata through for callers that build exact banks without a [`Model`].
+pub(crate) fn purify_raw_effects(
+    f0: f64,
+    merged_grids: Vec<BorderGrid>,
+    w: RefMeasure,
+    effects: Vec<RawEffect>,
+) -> Result<TableBank, PbError> {
+    for (raw, grid) in merged_grids.iter().enumerate() {
+        validate_bank_grid(grid, raw)?;
+    }
+    let grids = MergedGrids::from_border_grids(&merged_grids);
+    let weights = build_weights_from_effect_support(&merged_grids, &effects, &w)?;
+    let mut tables = BTreeMap::new();
+    let mut support_by_u = BTreeMap::new();
+    for effect in effects {
+        validate_raw_effect(&grids, &effect)?;
+        let mut axes = Vec::with_capacity(effect.u.order());
+        for raw in &effect.u.0 {
+            axes.push(grids.axis_id(*raw)?);
+        }
+        if tables
+            .insert(
+                effect.u.clone(),
+                RawTable {
+                    u: effect.u.clone(),
+                    axes,
+                    values: effect.values,
+                },
+            )
+            .is_some()
+        {
+            return Err(PbError::InvalidInput {
+                what: "duplicate raw effect support".into(),
+            });
+        }
+        support_by_u.insert(effect.u, effect.support);
+    }
+    let raw = RawBank { f0, tables };
+    let mut bank = purify(raw, &weights, &grids, PurifyMode::SinglePass)?;
+    for table in &mut bank.tables {
+        if let Some(support) = support_for_subset(&support_by_u, &table.u, &grids)? {
+            table.support = support;
+        }
+    }
+    Ok(bank)
 }
 
 /// Build the per-axis cell weights from a bank's cached `support` tensors — the
