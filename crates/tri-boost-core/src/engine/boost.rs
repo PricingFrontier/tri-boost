@@ -22,7 +22,7 @@
 //! between the two scorers (same `low_bit` routing); only the accumulation width differs.
 
 use crate::backend::{pb_rng, pb_seed, Stage};
-use crate::boosters::RefitSpec;
+use crate::boosters::{NesterovSpec, RefitSpec};
 use crate::cat::CatEncoderStore;
 use crate::constraints::MonoSign;
 use crate::data::{compute_offset, BinnedMatrix};
@@ -287,11 +287,25 @@ pub(crate) fn fit(
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
     let mut gh = GradHess::default();
     let mut last_refit_tree_count = 0usize;
+    let mut prev_alphas: Vec<f32> = Vec::new();
     for t in 0..config.n_trees {
         // Per-round deterministic re-seed — the seam for MVS/subsampling (M5-QHIST,
         // v1.5).
         let _round_rng = pb_rng(spec.seed, t, Stage::Sample, 0);
-        spec.loss.grad_hess(y, &raw, weight, &mut gh)?;
+        let current_alphas = collect_tree_alphas(&trees)?;
+        let agbm = match config.boosters.nesterov {
+            NesterovSpec::Off => None,
+            NesterovSpec::Agbm {
+                momentum_correction,
+            } => Some((agbm_beta(t), momentum_correction)),
+        };
+        let mut fit_raw = raw.clone();
+        if let Some((beta, _)) = agbm {
+            let lookahead_alphas = combine_alphas(&current_alphas, &prev_alphas, beta)?;
+            set_tree_alphas(&mut trees, &lookahead_alphas)?;
+            fit_raw = raw_from_tree_alphas(f0_f32, offset.as_deref(), x, &trees)?;
+        }
+        spec.loss.grad_hess(y, &fit_raw, weight, &mut gh)?;
         let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
         let mut round_grow_cfg = grow_cfg.clone();
         round_grow_cfg.round = t;
@@ -300,6 +314,8 @@ pub(crate) fn fit(
                 if sampled_rows.len() != rows.len() {
                     refit_tree_leaves(x, &gh, &rows, &mut tree, &round_grow_cfg)?;
                 }
+                prev_alphas = current_alphas;
+                raw = fit_raw;
                 update_raw(&mut raw, x, &tree)?;
                 trees.push((1.0, tree));
                 if should_refit_after_round(&config.boosters.refit_leaves, trees.len())? {
@@ -319,10 +335,52 @@ pub(crate) fn fit(
                     )?;
                     last_refit_tree_count = trees.len();
                 }
+                if matches!(
+                    config.boosters.nesterov,
+                    NesterovSpec::Agbm {
+                        momentum_correction: true
+                    }
+                ) {
+                    spec.loss.grad_hess(y, &raw, weight, &mut gh)?;
+                    let correction_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
+                    let mut correction_cfg = grow_cfg.clone();
+                    correction_cfg.round = t;
+                    if let Some(mut correction) =
+                        grow_oblivious_tree(x, &gh, &correction_rows, &axes, &correction_cfg)?
+                    {
+                        if correction_rows.len() != rows.len() {
+                            refit_tree_leaves(x, &gh, &rows, &mut correction, &correction_cfg)?;
+                        }
+                        update_raw(&mut raw, x, &correction)?;
+                        trees.push((1.0, correction));
+                        if should_refit_after_round(&config.boosters.refit_leaves, trees.len())? {
+                            let problem = RefitProblem {
+                                spec,
+                                x,
+                                y,
+                                weight,
+                                offset: offset.as_deref(),
+                                f0: f0_f32,
+                            };
+                            fully_corrective_refit(
+                                &config.boosters.refit_leaves,
+                                &problem,
+                                &mut trees,
+                                &mut raw,
+                            )?;
+                            last_refit_tree_count = trees.len();
+                        }
+                    }
+                }
             }
             // No admissible split clears the floor (e.g. converged / constant target):
             // stop early with what we have — a valid (possibly empty) Exact model.
-            None => break,
+            None => {
+                if agbm.is_some() {
+                    set_tree_alphas(&mut trees, &current_alphas)?;
+                }
+                break;
+            }
         }
     }
     if should_refit_at_end(
@@ -395,6 +453,94 @@ fn should_refit_after_round(refit: &RefitSpec, n_trees: usize) -> Result<bool, P
 
 fn should_refit_at_end(refit: &RefitSpec, n_trees: usize, last_refit_tree_count: usize) -> bool {
     matches!(refit, RefitSpec::Ridge { .. }) && n_trees > 0 && last_refit_tree_count != n_trees
+}
+
+fn agbm_beta(round: u32) -> f32 {
+    let theta = 2.0_f32 / (round as f32 + 2.0);
+    1.0 - theta
+}
+
+fn collect_tree_alphas(trees: &[(f32, ObliviousTree)]) -> Result<Vec<f32>, PbError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(trees.len())
+        .map_err(|_| PbError::Internal {
+            what: "AGBM alpha allocation failed".into(),
+        })?;
+    for (alpha, _) in trees {
+        if !alpha.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: "AGBM tree alpha must be finite".into(),
+            });
+        }
+        out.push(*alpha);
+    }
+    Ok(out)
+}
+
+fn combine_alphas(current: &[f32], previous: &[f32], beta: f32) -> Result<Vec<f32>, PbError> {
+    if previous.len() > current.len() {
+        return Err(PbError::Internal {
+            what: "AGBM previous alpha vector longer than current".into(),
+        });
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(current.len())
+        .map_err(|_| PbError::Internal {
+            what: "AGBM combined alpha allocation failed".into(),
+        })?;
+    for (idx, &alpha) in current.iter().enumerate() {
+        let prev = previous.get(idx).copied().unwrap_or(0.0);
+        let value = (1.0 + beta) * alpha - beta * prev;
+        if !value.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: "AGBM combined alpha is not finite".into(),
+            });
+        }
+        out.push(value);
+    }
+    Ok(out)
+}
+
+fn set_tree_alphas(trees: &mut [(f32, ObliviousTree)], alphas: &[f32]) -> Result<(), PbError> {
+    if trees.len() != alphas.len() {
+        return Err(PbError::ShapeMismatch {
+            what: "AGBM alpha vector length does not match tree count".into(),
+        });
+    }
+    for ((alpha_slot, _), &alpha) in trees.iter_mut().zip(alphas) {
+        if !alpha.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: "AGBM alpha must be finite".into(),
+            });
+        }
+        *alpha_slot = alpha;
+    }
+    Ok(())
+}
+
+fn raw_from_tree_alphas(
+    f0: f32,
+    offset: Option<&[f32]>,
+    x: &BinnedMatrix,
+    trees: &[(f32, ObliviousTree)],
+) -> Result<Vec<f32>, PbError> {
+    let n_rows = x.n_rows as usize;
+    let mut out: Vec<f32> = crate::engine::Hist::try_zeroed_vec(n_rows, "AGBM raw")?;
+    for row in 0..n_rows {
+        let mut score = base_raw(offset, f0, row)?;
+        for (alpha, tree) in trees {
+            score += f64::from(*alpha) * f64::from(tree_value_for_row(tree, x, row)?);
+        }
+        if !score.is_finite() || score < f64::from(f32::MIN) || score > f64::from(f32::MAX) {
+            return Err(PbError::InvalidInput {
+                what: "AGBM raw score is not finite/representable as f32".into(),
+            });
+        }
+        *out.get_mut(row).ok_or_else(|| PbError::Internal {
+            what: "AGBM raw write escaped".into(),
+        })? = score as f32;
+    }
+    Ok(out)
 }
 
 struct RefitProblem<'a, 's> {
@@ -1084,7 +1230,7 @@ mod tests {
         clippy::float_cmp
     )]
     use super::*;
-    use crate::boosters::{BoosterConfig, RefitSpec};
+    use crate::boosters::{BoosterConfig, NesterovSpec, RefitSpec};
     use crate::cat::{CatEncoderStore, LeakageScheme, Smooth, TsConfig, TsEncodingId};
     use crate::constraints::MonoSign;
     use crate::data::{
@@ -1386,6 +1532,99 @@ mod tests {
                 "refit moved an exact score: {a} vs {b}"
             );
         }
+    }
+
+    #[test]
+    fn agbm_fit_is_alpha_folded_exact_and_thread_deterministic() {
+        let n = 220usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 7 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 4 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                (if x0[i] <= 3.0 { -1.5 } else { 2.0 })
+                    + if x1[i] <= 2.0 { 1.0 } else { -0.75 }
+                    + (i % 11) as f32 * 0.03
+            })
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let cfg = Config {
+            n_trees: 30,
+            learning_rate: 0.18,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: BoosterConfig {
+                nesterov: NesterovSpec::Agbm {
+                    momentum_correction: false,
+                },
+                ..BoosterConfig::default()
+            },
+        };
+        let sqe = SquaredError;
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(cfg.clone())
+                    .fit(&x, &y, &spec(&sqe))
+                    .unwrap();
+                assert!(
+                    model
+                        .trees
+                        .iter()
+                        .any(|(alpha, _)| (*alpha - 1.0).abs() > 1.0e-6),
+                    "AGBM should fold non-unit alphas into the plain model"
+                );
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn agbm_momentum_correction_stays_exact() {
+        let n = 120usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 6 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 4 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| (if x0[i] <= 3.0 { 0.0 } else { 2.0 }) + (i % 5) as f32 * 0.1)
+            .collect();
+        let x = binned(&[x0, x1]);
+        let sqe = SquaredError;
+        let model = Booster::with_config(Config {
+            n_trees: 8,
+            learning_rate: 0.2,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: BoosterConfig {
+                nesterov: NesterovSpec::Agbm {
+                    momentum_correction: true,
+                },
+                ..BoosterConfig::default()
+            },
+        })
+        .fit(&x, &y, &spec(&sqe))
+        .unwrap();
+        assert!(
+            model.trees.len() > 8,
+            "momentum correction should append correction trees when splits remain"
+        );
+        let serve = crate::data::ServeBinnedMatrix(x);
+        let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+        assert_exact_decomposition(&model, &bank, &serve).unwrap();
     }
 
     #[test]
