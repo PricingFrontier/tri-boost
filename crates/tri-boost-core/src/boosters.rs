@@ -57,6 +57,12 @@ impl BoosterConfig {
         if let Some(dart) = &self.dart {
             dart.validate()?;
         }
+        if self.dart.is_some() && !matches!(self.nesterov, NesterovSpec::Off) {
+            return Err(PbError::InvalidConfig {
+                what: "DART and Nesterov/AGBM cannot be combined in the v1.5 booster pipeline"
+                    .into(),
+            });
+        }
         if !self.random_strength.is_finite() || self.random_strength < 0.0 {
             return Err(PbError::InvalidConfig {
                 what: format!(
@@ -852,6 +858,15 @@ mod tests {
         assert!(matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })));
         cfg.random_strength = 0.0;
         cfg.ensemble = EnsembleSpec::OuterBag { n_bags: 0 };
+        assert!(matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })));
+        cfg.ensemble = EnsembleSpec::Off;
+        cfg.dart = Some(DartSpec {
+            drop_rate: 0.1,
+            normalize: true,
+        });
+        cfg.nesterov = NesterovSpec::Agbm {
+            momentum_correction: false,
+        };
         assert!(matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })));
     }
 

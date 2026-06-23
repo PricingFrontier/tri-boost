@@ -22,7 +22,7 @@
 //! between the two scorers (same `low_bit` routing); only the accumulation width differs.
 
 use crate::backend::{pb_rng, pb_seed, Stage};
-use crate::boosters::{NesterovSpec, RefitSpec};
+use crate::boosters::{DartSpec, NesterovSpec, RefitSpec};
 use crate::cat::CatEncoderStore;
 use crate::constraints::MonoSign;
 use crate::data::{compute_offset, BinnedMatrix};
@@ -305,6 +305,19 @@ pub(crate) fn fit(
             set_tree_alphas(&mut trees, &lookahead_alphas)?;
             fit_raw = raw_from_tree_alphas(f0_f32, offset.as_deref(), x, &trees)?;
         }
+        let dart_cfg = config
+            .boosters
+            .dart
+            .as_ref()
+            .filter(|dart| dart.drop_rate > 0.0);
+        let dart_drops = if agbm.is_none() {
+            dart_drop_mask(dart_cfg, spec.seed, t, trees.len())?
+        } else {
+            Vec::new()
+        };
+        if dart_drops.iter().any(|dropped| *dropped) {
+            fit_raw = raw_minus_dropped(&raw, x, &trees, &dart_drops)?;
+        }
         spec.loss.grad_hess(y, &fit_raw, weight, &mut gh)?;
         let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &rows)?;
         let mut round_grow_cfg = grow_cfg.clone();
@@ -314,10 +327,16 @@ pub(crate) fn fit(
                 if sampled_rows.len() != rows.len() {
                     refit_tree_leaves(x, &gh, &rows, &mut tree, &round_grow_cfg)?;
                 }
-                prev_alphas = current_alphas;
-                raw = fit_raw;
-                update_raw(&mut raw, x, &tree)?;
-                trees.push((1.0, tree));
+                if let Some(dart) = dart_cfg {
+                    let new_alpha = apply_dart_normalization(&mut trees, &dart_drops, dart)?;
+                    trees.push((new_alpha, tree));
+                    raw = raw_from_tree_alphas(f0_f32, offset.as_deref(), x, &trees)?;
+                } else {
+                    prev_alphas = current_alphas;
+                    raw = fit_raw;
+                    update_raw(&mut raw, x, &tree)?;
+                    trees.push((1.0, tree));
+                }
                 if should_refit_after_round(&config.boosters.refit_leaves, trees.len())? {
                     let problem = RefitProblem {
                         spec,
@@ -541,6 +560,104 @@ fn raw_from_tree_alphas(
         })? = score as f32;
     }
     Ok(out)
+}
+
+fn dart_drop_mask(
+    dart: Option<&DartSpec>,
+    seed: u64,
+    round: u32,
+    n_trees: usize,
+) -> Result<Vec<bool>, PbError> {
+    let Some(dart) = dart else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    out.try_reserve_exact(n_trees)
+        .map_err(|_| PbError::Internal {
+            what: "DART mask allocation failed".into(),
+        })?;
+    for tree_idx in 0..n_trees {
+        let block = u32::try_from(tree_idx).map_err(|_| PbError::InvalidInput {
+            what: "DART supports at most u32::MAX trees".into(),
+        })?;
+        let bits = pb_seed(seed, round, Stage::Dart as u32, block);
+        let unit = ((bits >> 11) as f64 + 1.0) / ((1_u64 << 53) as f64 + 1.0);
+        out.push(unit < f64::from(dart.drop_rate));
+    }
+    Ok(out)
+}
+
+fn raw_minus_dropped(
+    raw: &[f32],
+    x: &BinnedMatrix,
+    trees: &[(f32, ObliviousTree)],
+    drops: &[bool],
+) -> Result<Vec<f32>, PbError> {
+    if trees.len() != drops.len() {
+        return Err(PbError::ShapeMismatch {
+            what: "DART drop mask length does not match tree count".into(),
+        });
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(raw.len())
+        .map_err(|_| PbError::Internal {
+            what: "DART raw allocation failed".into(),
+        })?;
+    out.extend_from_slice(raw);
+    for row in 0..out.len() {
+        let mut score = f64::from(*out.get(row).ok_or_else(|| PbError::Internal {
+            what: "DART raw row escaped".into(),
+        })?);
+        for ((alpha, tree), dropped) in trees.iter().zip(drops) {
+            if *dropped {
+                score -= f64::from(*alpha) * f64::from(tree_value_for_row(tree, x, row)?);
+            }
+        }
+        if !score.is_finite() || score < f64::from(f32::MIN) || score > f64::from(f32::MAX) {
+            return Err(PbError::InvalidInput {
+                what: "DART dropout raw is not finite/representable as f32".into(),
+            });
+        }
+        *out.get_mut(row).ok_or_else(|| PbError::Internal {
+            what: "DART raw write escaped".into(),
+        })? = score as f32;
+    }
+    Ok(out)
+}
+
+fn apply_dart_normalization(
+    trees: &mut [(f32, ObliviousTree)],
+    drops: &[bool],
+    dart: &DartSpec,
+) -> Result<f32, PbError> {
+    if trees.len() != drops.len() {
+        return Err(PbError::ShapeMismatch {
+            what: "DART normalization mask length does not match tree count".into(),
+        });
+    }
+    if !dart.normalize {
+        return Ok(1.0);
+    }
+    let dropped = drops.iter().filter(|drop| **drop).count();
+    if dropped == 0 {
+        return Ok(1.0);
+    }
+    let denom = dropped.checked_add(1).ok_or_else(|| PbError::Internal {
+        what: "DART dropped count overflow".into(),
+    })?;
+    let dropped_scale = dropped as f32 / denom as f32;
+    let new_alpha = 1.0_f32 / denom as f32;
+    for ((alpha, _), drop) in trees.iter_mut().zip(drops) {
+        if *drop {
+            *alpha *= dropped_scale;
+            if !alpha.is_finite() {
+                return Err(PbError::InvalidInput {
+                    what: "DART normalized alpha is not finite".into(),
+                });
+            }
+        }
+    }
+    Ok(new_alpha)
 }
 
 struct RefitProblem<'a, 's> {
@@ -1230,7 +1347,7 @@ mod tests {
         clippy::float_cmp
     )]
     use super::*;
-    use crate::boosters::{BoosterConfig, NesterovSpec, RefitSpec};
+    use crate::boosters::{BoosterConfig, DartSpec, NesterovSpec, RefitSpec};
     use crate::cat::{CatEncoderStore, LeakageScheme, Smooth, TsConfig, TsEncodingId};
     use crate::constraints::MonoSign;
     use crate::data::{
@@ -1625,6 +1742,101 @@ mod tests {
         let serve = crate::data::ServeBinnedMatrix(x);
         let bank = model.explain(&serve, RefMeasure::default()).unwrap();
         assert_exact_decomposition(&model, &bank, &serve).unwrap();
+    }
+
+    #[test]
+    fn dart_drop_rate_zero_is_byte_identical_to_default() {
+        let (x0, x1, y) = additive_2feat(96);
+        let x = binned(&[x0, x1]);
+        let base_cfg = Config {
+            n_trees: 25,
+            learning_rate: 0.2,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: Default::default(),
+        };
+        let dart_cfg = Config {
+            boosters: BoosterConfig {
+                dart: Some(DartSpec {
+                    drop_rate: 0.0,
+                    normalize: true,
+                }),
+                ..BoosterConfig::default()
+            },
+            ..base_cfg.clone()
+        };
+        let sqe = SquaredError;
+        let base = Booster::with_config(base_cfg)
+            .fit(&x, &y, &spec(&sqe))
+            .unwrap();
+        let dart = Booster::with_config(dart_cfg)
+            .fit(&x, &y, &spec(&sqe))
+            .unwrap();
+        assert_eq!(
+            crate::serialize::encode_model(&base).unwrap(),
+            crate::serialize::encode_model(&dart).unwrap()
+        );
+    }
+
+    #[test]
+    fn dart_normalized_fit_is_exact_and_thread_deterministic() {
+        let n = 220usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 7 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 4 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                (if x0[i] <= 3.0 { -1.0 } else { 2.25 })
+                    + if x1[i] <= 2.0 { 1.0 } else { -0.5 }
+                    + (i % 13) as f32 * 0.02
+            })
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let cfg = Config {
+            n_trees: 35,
+            learning_rate: 0.2,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: BoosterConfig {
+                dart: Some(DartSpec {
+                    drop_rate: 0.45,
+                    normalize: true,
+                }),
+                ..BoosterConfig::default()
+            },
+        };
+        let sqe = SquaredError;
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(cfg.clone())
+                    .fit(&x, &y, &spec(&sqe))
+                    .unwrap();
+                assert!(
+                    model
+                        .trees
+                        .iter()
+                        .any(|(alpha, _)| (*alpha - 1.0).abs() > 1.0e-6),
+                    "DART normalization should fold non-unit alphas into the model"
+                );
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
     }
 
     #[test]

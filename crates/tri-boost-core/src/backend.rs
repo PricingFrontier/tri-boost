@@ -215,6 +215,8 @@ pub enum Stage {
     Categorical = 5,
     /// Split-score random-strength tie/regularization noise (§09.6).
     SplitNoise = 6,
+    /// DART tree-dropout masks (§09.6).
+    Dart = 7,
 }
 
 /// Construct the per-work-unit [`Pcg64`] from the frozen [`pb_seed`] mixer
