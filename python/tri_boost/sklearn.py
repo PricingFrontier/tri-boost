@@ -208,6 +208,22 @@ class TriBoostRegressor(RegressorMixin, _BaseTriBoost):
         check_is_fitted(self, "_model")
         return self._model.to_json()
 
+    def tables(
+        self,
+        X: Any,
+        ref_measure: str | None = None,
+        laplace: float = 1.0,
+        basis_json: str | None = None,
+    ) -> str:
+        check_is_fitted(self, "_model")
+        x32 = self._as_float32_2d_once(X)
+        return self._model.tables(
+            x32,
+            ref_measure=ref_measure,
+            laplace=float(laplace),
+            basis_json=basis_json,
+        )
+
 
 class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
     """Binary exact depth-3 oblivious boosting classifier."""
@@ -295,6 +311,22 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
     def to_json(self) -> str:
         check_is_fitted(self, "_model")
         return self._model.to_json()
+
+    def tables(
+        self,
+        X: Any,
+        ref_measure: str | None = None,
+        laplace: float = 1.0,
+        basis_json: str | None = None,
+    ) -> str:
+        check_is_fitted(self, "_model")
+        x32 = self._as_float32_2d_once(X)
+        return self._model.tables(
+            x32,
+            ref_measure=ref_measure,
+            laplace=float(laplace),
+            basis_json=basis_json,
+        )
 
     def _attach_classifier_model(self, model: _Model) -> None:
         labels = model.class_labels

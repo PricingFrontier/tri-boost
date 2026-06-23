@@ -21,6 +21,7 @@ use tri_boost_core::engine::{Booster, Config, FitSpec, Model, Sampling};
 use tri_boost_core::error::{Invariant, PbError};
 use tri_boost_core::explain::{RefMeasure, TableBank};
 use tri_boost_core::loss::{Gamma, Logistic, Loss, Poisson, SquaredError, Tweedie};
+use tri_boost_core::serialize::RatingBasis;
 
 create_exception!(
     _tri_boost,
@@ -345,6 +346,31 @@ impl PyModel {
         Ok(PyTableBank { bank })
     }
 
+    #[pyo3(signature = (x, ref_measure=None, laplace=1.0, basis_json=None))]
+    fn tables(
+        &self,
+        py: Python<'_>,
+        x: PyReadonlyArray2<'_, f32>,
+        ref_measure: Option<String>,
+        laplace: f32,
+        basis_json: Option<&str>,
+    ) -> PyResult<String> {
+        let columns = raw_columns_from_array(x)?;
+        let model = Arc::clone(&self.model);
+        let w = parse_ref_measure(ref_measure, laplace).map_err(py_err)?;
+        let basis = parse_rating_basis(basis_json)?;
+        py.detach(move || {
+            let binned = binned_for_model(&model, columns)?;
+            let bank = model.explain(&tri_boost_core::data::ServeBinnedMatrix(binned), w)?;
+            let export =
+                bank.to_rating_export(model.link, &model.mode, &model.schema, basis.as_ref())?;
+            serde_json::to_string_pretty(&export).map_err(|err| {
+                PbError::Serialization(format!("could not serialize RatingExport JSON: {err}"))
+            })
+        })
+        .map_err(py_err)
+    }
+
     fn to_json(&self) -> PyResult<String> {
         self.model.to_json().map_err(py_err)
     }
@@ -550,6 +576,18 @@ fn parse_ref_measure(name: Option<String>, laplace: f32) -> Result<RefMeasure, P
             what: format!("unknown reference measure `{other}`"),
         }),
     }
+}
+
+fn parse_rating_basis(value: Option<&str>) -> PyResult<Option<RatingBasis>> {
+    value
+        .map(|s| {
+            serde_json::from_str::<RatingBasis>(s).map_err(|err| {
+                py_err(PbError::Serialization(format!(
+                    "could not parse RatingBasis JSON: {err}"
+                )))
+            })
+        })
+        .transpose()
 }
 
 fn py_err(err: PbError) -> PyErr {

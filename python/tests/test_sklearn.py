@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import warnings
 
 import numpy as np
@@ -57,6 +58,11 @@ def test_regressor_fit_predict_serialize_and_warns_once() -> None:
     np.testing.assert_array_equal(pred1, loaded.predict(x.astype(np.float32)))
     loaded_json = TriBoostRegressor.from_json(est.to_json())
     np.testing.assert_array_equal(pred1, loaded_json.predict(x.astype(np.float32)))
+
+    export = json.loads(est.tables(x.astype(np.float32), ref_measure="uniform"))
+    assert export["mode"] == "Exact"
+    assert export["link"] == "Identity"
+    assert export["tables"]
 
 
 def test_regressor_clone_set_params_and_not_fitted_contract() -> None:

@@ -835,6 +835,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "rayon",
+ "serde_json",
  "tri-boost-core",
 ]
 

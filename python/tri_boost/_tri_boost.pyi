@@ -67,6 +67,14 @@ class _Model:
         laplace: float = 1.0,
     ) -> _TableBank: ...
 
+    def tables(
+        self,
+        x: np.ndarray,
+        ref_measure: str | None = None,
+        laplace: float = 1.0,
+        basis_json: str | None = None,
+    ) -> str: ...
+
     def to_json(self) -> str: ...
 
     def to_bytes(self) -> bytes: ...
