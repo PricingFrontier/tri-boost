@@ -7,6 +7,11 @@ name: Release Gate
 
 on:
   workflow_dispatch:
+    inputs:
+      benchmark_artifact:
+        description: "Optional repo path to an external M6 benchmark artifact for release-verdict"
+        required: false
+        default: ""
   push:
     tags:
       - "v*"
@@ -86,6 +91,21 @@ jobs:
         with:
           name: release-preflight
           path: target/release-preflight.json
+
+  external-verdict:
+    name: external benchmark verdict
+    if: github.event_name == 'workflow_dispatch' && inputs.benchmark_artifact != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Evaluate external M6 verdict
+        run: cargo run -p xtask -- release-verdict --input "${{ inputs.benchmark_artifact }}" --output target/release-verdict.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-verdict
+          path: target/release-verdict.json
 
   wheels:
     name: wheel ${{ matrix.os }} / ${{ matrix.target }}
