@@ -6,7 +6,10 @@
 //! remains a thin FFI adapter and owns no model math.
 #![allow(unsafe_code)]
 
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{
+    IntoPyArray, PyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadwriteArray1, PyUntypedArrayMethods,
+};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
@@ -257,10 +260,12 @@ impl PyModel {
         self.model.schema.class_labels.clone()
     }
 
+    #[pyo3(signature = (x, out=None))]
     fn predict<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
+        out: Option<Bound<'py, PyArray1<f32>>>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
@@ -270,13 +275,15 @@ impl PyModel {
                 model.predict_binned(&binned, None)
             })
             .map_err(py_err)?;
-        Ok(pred.into_pyarray(py))
+        write_or_return_array1(py, pred, out)
     }
 
+    #[pyo3(signature = (x, out=None))]
     fn predict_raw<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
+        out: Option<Bound<'py, PyArray1<f32>>>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
@@ -288,7 +295,34 @@ impl PyModel {
                 Ok::<Vec<f32>, PbError>(out)
             })
             .map_err(py_err)?;
-        Ok(raw.into_pyarray(py))
+        write_or_return_array1(py, raw, out)
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        if self.model.link != tri_boost_core::loss::Link::Logit {
+            return Err(PyTypeError::new_err(
+                "predict_proba is only available for logit-link models",
+            ));
+        }
+        let columns = raw_columns_from_array(x)?;
+        let model = Arc::clone(&self.model);
+        let pred = py
+            .detach(move || {
+                let binned = binned_for_model(&model, columns)?;
+                model.predict_binned(&binned, None)
+            })
+            .map_err(py_err)?;
+        let mut rows = Vec::with_capacity(pred.len());
+        for p1 in pred {
+            rows.push(vec![1.0 - p1, p1]);
+        }
+        PyArray::from_vec2(py, &rows).map_err(|err| {
+            InternalError::new_err(format!("could not allocate probability array: {err}"))
+        })
     }
 
     #[pyo3(signature = (x, ref_measure=None, laplace=1.0))]
@@ -441,6 +475,33 @@ fn array1_to_vec(x: PyReadonlyArray1<'_, f32>, name: &str) -> PyResult<Vec<f32>>
         ))
     })?;
     Ok(slice.to_vec())
+}
+
+fn write_or_return_array1<'py>(
+    py: Python<'py>,
+    values: Vec<f32>,
+    out: Option<Bound<'py, PyArray1<f32>>>,
+) -> PyResult<Bound<'py, PyArray1<f32>>> {
+    let Some(out) = out else {
+        return Ok(values.into_pyarray(py));
+    };
+    {
+        let mut borrowed: PyReadwriteArray1<'_, f32> = out.readwrite();
+        let out_slice = borrowed
+            .as_slice_mut()
+            .map_err(|_| PyTypeError::new_err("out must be a contiguous writable float32 array"))?;
+        if out_slice.len() != values.len() {
+            return Err(py_err(PbError::ShapeMismatch {
+                what: format!(
+                    "out len {} != prediction len {}",
+                    out_slice.len(),
+                    values.len()
+                ),
+            }));
+        }
+        out_slice.copy_from_slice(&values);
+    }
+    Ok(out)
 }
 
 fn binned_for_model(model: &Model, columns: Vec<Vec<f32>>) -> Result<BinnedMatrix, PbError> {

@@ -48,6 +48,10 @@ def test_regressor_fit_predict_serialize_and_warns_once() -> None:
         pred2 = est.predict(x)
     assert not [w for w in caught if issubclass(w.category, PrecisionWarning)]
     np.testing.assert_array_equal(pred1, pred2)
+    out = np.empty_like(pred1)
+    returned = est._model.predict(x.astype(np.float32), out=out)
+    assert returned is out
+    np.testing.assert_array_equal(out, pred1)
 
     loaded = TriBoostRegressor.from_bytes(est.to_bytes())
     np.testing.assert_array_equal(pred1, loaded.predict(x.astype(np.float32)))

@@ -277,8 +277,7 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):
     def predict_proba(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "_model")
         x32 = self._as_float32_2d_once(X)
-        p1 = np.asarray(self._model.predict(x32), dtype=np.float32)
-        return np.column_stack((1.0 - p1, p1))
+        return self._model.predict_proba(x32)
 
     def decision_function(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "_model")
