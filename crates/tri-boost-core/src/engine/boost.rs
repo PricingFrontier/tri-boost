@@ -28,7 +28,7 @@ use crate::engine::{
     low_bit, Config, ExactnessMode, FitSpec, Model, ModelSchema, ObliviousTree, Sampling,
 };
 use crate::error::PbError;
-use crate::loss::GradHess;
+use crate::loss::{GradHess, Link};
 use crate::serialize::SCHEMA_VERSION;
 
 fn invalid_config(what: &'static str) -> PbError {
@@ -300,6 +300,19 @@ pub(crate) fn fit(
         }
     }
 
+    let f0_model = if config.boosters.reanchor {
+        let delta = reanchor_delta(spec.loss.link(), y, weight, &raw)?;
+        let shifted = f64::from(f0_f32) + delta;
+        if !shifted.is_finite() || shifted < f64::from(f32::MIN) || shifted > f64::from(f32::MAX) {
+            return Err(PbError::InvalidInput {
+                what: "reanchored intercept is not representable as f32".into(),
+            });
+        }
+        shifted as f32
+    } else {
+        f0_f32
+    };
+
     let schema = ModelSchema {
         feature_names: (0..n_features).map(|i| format!("f{i}")).collect(),
         feature_kinds: x.provenance.iter().map(|p| p.kind).collect(),
@@ -308,7 +321,7 @@ pub(crate) fn fit(
         objective: spec.loss.objective_tag(),
     };
     Ok(Model {
-        f0: f0_f32,
+        f0: f0_model,
         trees,
         grids: x.grids.clone(),
         provenance: x.provenance.clone(),
@@ -317,6 +330,98 @@ pub(crate) fn fit(
         schema,
         schema_version: SCHEMA_VERSION,
     })
+}
+
+fn inverse_link_f64(link: Link, raw: f64) -> f64 {
+    match link {
+        Link::Identity => raw,
+        Link::Log => raw.clamp(-30.0, 30.0).exp(),
+        Link::Logit => {
+            if raw >= 0.0 {
+                let z = (-raw).clamp(-30.0, 30.0).exp();
+                1.0 / (1.0 + z)
+            } else {
+                let z = raw.clamp(-30.0, 30.0).exp();
+                z / (1.0 + z)
+            }
+        }
+    }
+}
+
+fn weighted_response_total(link: Link, raw: &[f32], weight: &[f32]) -> f64 {
+    let mut total = 0.0_f64;
+    for (&v, &w) in raw.iter().zip(weight) {
+        total += f64::from(w) * inverse_link_f64(link, f64::from(v));
+    }
+    total
+}
+
+fn weighted_observed_total(y: &[f32], weight: &[f32]) -> f64 {
+    y.iter()
+        .zip(weight)
+        .map(|(&yi, &wi)| f64::from(wi) * f64::from(yi))
+        .sum()
+}
+
+fn reanchor_delta(link: Link, y: &[f32], weight: &[f32], raw: &[f32]) -> Result<f64, PbError> {
+    let sum_w: f64 = weight.iter().map(|&w| f64::from(w)).sum();
+    if sum_w <= 0.0 || !sum_w.is_finite() {
+        return Err(PbError::InvalidInput {
+            what: "reanchor requires positive finite total weight".into(),
+        });
+    }
+    let observed = weighted_observed_total(y, weight);
+    if !observed.is_finite() {
+        return Err(PbError::InvalidInput {
+            what: "reanchor observed total is not finite".into(),
+        });
+    }
+    match link {
+        Link::Identity => {
+            let predicted = raw
+                .iter()
+                .zip(weight)
+                .map(|(&ri, &wi)| f64::from(wi) * f64::from(ri))
+                .sum::<f64>();
+            Ok((observed - predicted) / sum_w)
+        }
+        Link::Log => {
+            if observed <= 0.0 {
+                return Err(PbError::InvalidInput {
+                    what: "log-link reanchor requires positive observed total".into(),
+                });
+            }
+            let predicted = weighted_response_total(link, raw, weight);
+            if predicted <= 0.0 || !predicted.is_finite() {
+                return Err(PbError::InvalidInput {
+                    what: "log-link reanchor predicted total must be positive and finite".into(),
+                });
+            }
+            Ok((observed / predicted).ln())
+        }
+        Link::Logit => {
+            if observed <= 0.0 || observed >= sum_w {
+                return Err(PbError::InvalidInput {
+                    what: "logit-link reanchor requires observed positives strictly inside (0, total_weight)".into(),
+                });
+            }
+            let mut lo = -60.0_f64;
+            let mut hi = 60.0_f64;
+            for _ in 0..96 {
+                let mid = 0.5 * (lo + hi);
+                let mut predicted = 0.0_f64;
+                for (&ri, &wi) in raw.iter().zip(weight) {
+                    predicted += f64::from(wi) * inverse_link_f64(link, f64::from(ri) + mid);
+                }
+                if predicted < observed {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            Ok(0.5 * (lo + hi))
+        }
+    }
 }
 
 fn sample_rows(
@@ -422,9 +527,9 @@ mod tests {
     };
     use crate::engine::{Booster, HistPrecision};
     use crate::explain::{assert_exact_decomposition, FeatureSet, RefMeasure};
-    use crate::loss::SquaredError;
+    use crate::loss::{Loss, Poisson, SquaredError};
 
-    fn spec<'a>(loss: &'a SquaredError) -> FitSpec<'a> {
+    fn spec<'a>(loss: &'a dyn Loss) -> FitSpec<'a> {
         FitSpec {
             loss,
             weight: None,
@@ -992,6 +1097,53 @@ mod tests {
         for i in 0..x.n_rows as usize {
             assert!(predict(&model, &x, i).is_finite());
         }
+    }
+
+    #[test]
+    fn reanchor_shifts_only_intercept_and_matches_response_total() {
+        let n = 96usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 8 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| (1 + i % 7) as f32).collect();
+        let x = binned(&[x0, x1]);
+        let base_cfg = Config {
+            n_trees: 8,
+            learning_rate: 0.4,
+            lambda: 2.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            boosters: Default::default(),
+        };
+        let anchored_cfg = Config {
+            boosters: BoosterConfig {
+                reanchor: true,
+                ..BoosterConfig::default()
+            },
+            ..base_cfg.clone()
+        };
+        let base = Booster::with_config(base_cfg)
+            .fit(&x, &y, &spec(&Poisson))
+            .unwrap();
+        let anchored = Booster::with_config(anchored_cfg)
+            .fit(&x, &y, &spec(&Poisson))
+            .unwrap();
+
+        assert_eq!(base.trees, anchored.trees);
+        assert_ne!(base.f0, anchored.f0);
+        let observed: f64 = y.iter().map(|&yi| f64::from(yi)).sum();
+        let predicted: f64 = anchored
+            .predict_binned(&x, None)
+            .unwrap()
+            .iter()
+            .map(|&yi| f64::from(yi))
+            .sum();
+        assert!((predicted - observed).abs() < 1.0e-3);
+
+        let serve = crate::data::ServeBinnedMatrix(x);
+        let bank = anchored.explain(&serve, RefMeasure::default()).unwrap();
+        assert_exact_decomposition(&anchored, &bank, &serve).unwrap();
     }
 
     #[test]
