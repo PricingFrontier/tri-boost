@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use serde::Deserialize;
 use serde_json::json;
 use tri_boost_core::{
     assert_exact_decomposition, bin, bin_columns, check_feature_budget, encode_model, BinConfig,
@@ -60,6 +61,13 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("xtask release-preflight: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        "release-verdict" => match run_release_verdict_cli(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("xtask release-verdict: {err}");
                 ExitCode::FAILURE
             }
         },
@@ -143,6 +151,8 @@ fn print_usage() {
          \x20                               exactness-gated deterministic benchmark smoke\n\
          \x20 release-preflight [--seed N] [--output PATH]\n\
          \x20                               internal v1.5 lever/exactness checkpoint\n\
+         \x20 release-verdict --input PATH [--output PATH]\n\
+         \x20                               evaluate external M6 benchmark verdict\n\
          \x20 --help                        show this message"
     );
 }
@@ -213,6 +223,33 @@ fn run_release_preflight_cli(args: &[String]) -> XtaskResult<()> {
     Ok(())
 }
 
+fn run_release_verdict_cli(args: &[String]) -> XtaskResult<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_release_verdict_usage();
+        return Ok(());
+    }
+    let opts = parse_release_verdict_options(args)?;
+    let text = fs::read_to_string(&opts.input)?;
+    let suite: ReleaseBenchmarkSuite = serde_json::from_str(&text)?;
+    let verdict = evaluate_release_verdict(&suite)?;
+    let out = serde_json::to_string_pretty(&verdict)?;
+    match opts.output {
+        Some(path) => {
+            fs::write(&path, format!("{out}\n"))?;
+            println!("wrote {}", path.display());
+        }
+        None => println!("{out}"),
+    }
+    if verdict["hard_gates"]["all_passed"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        Ok(())
+    } else {
+        Err("release verdict hard gates failed".into())
+    }
+}
+
 fn parse_accuracy_options(args: &[String]) -> XtaskResult<AccuracyOptions> {
     let mut opts = AccuracyOptions::default();
     let mut i = 0usize;
@@ -239,6 +276,38 @@ fn parse_accuracy_options(args: &[String]) -> XtaskResult<AccuracyOptions> {
     Ok(opts)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ReleaseVerdictOptions {
+    input: PathBuf,
+    output: Option<PathBuf>,
+}
+
+fn parse_release_verdict_options(args: &[String]) -> XtaskResult<ReleaseVerdictOptions> {
+    let mut input = None;
+    let mut output = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args.get(i).map(String::as_str) {
+            Some("--input") => {
+                input = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("missing value after --input")?,
+                ));
+                i += 2;
+            }
+            Some("--output") => {
+                output = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("missing value after --output")?,
+                ));
+                i += 2;
+            }
+            Some(other) => return Err(format!("unknown release-verdict option `{other}`").into()),
+            None => break,
+        }
+    }
+    let input = input.ok_or("release-verdict requires --input PATH")?;
+    Ok(ReleaseVerdictOptions { input, output })
+}
+
 fn print_accuracy_usage() {
     println!(
         "USAGE: cargo run -p xtask -- accuracy [--seed N] [--output PATH] [--adversarial]\n\n\
@@ -246,6 +315,19 @@ fn print_accuracy_usage() {
          decomposition gates, then emits deviance/lift/ordered-Gini JSON. With\
          --adversarial, forces the §08 SparseFallback table-budget path and emits\
          a budget-firewall artifact."
+    );
+}
+
+fn print_release_verdict_usage() {
+    println!(
+        "USAGE: cargo run -p xtask -- release-verdict --input PATH [--output PATH]\n\n\
+         Reads an external benchmark artifact with records of the form\n\
+         {{\"datasets\":[{{\"fixture\":\"...\",\"objective\":\"...\",\
+         \"tri_boost\":{{\"deviance\":...,\"exact\":true}},\
+         \"ebm\":{{\"deviance\":...}},\"gbdt_best\":{{\"deviance\":...}}}}]}}.\n\
+         The command fails if any tri-boost model is non-exact or if tri-boost does\
+         not beat EBM on median deviance for every objective. The GBDT gap is\
+         reported, not release-blocking."
     );
 }
 
@@ -257,6 +339,129 @@ fn print_release_preflight_usage() {
          budget stress. External rival/TreeSHAP corpus checks are reported as not-run\
          by this local preflight rather than silently assumed."
     );
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseBenchmarkSuite {
+    datasets: Vec<ReleaseBenchmarkRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseBenchmarkRecord {
+    fixture: String,
+    objective: String,
+    tri_boost: TriBoostBenchmarkScore,
+    ebm: BenchmarkScore,
+    #[serde(default)]
+    gbdt_best: Option<BenchmarkScore>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TriBoostBenchmarkScore {
+    deviance: f64,
+    exact: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchmarkScore {
+    deviance: f64,
+}
+
+fn evaluate_release_verdict(suite: &ReleaseBenchmarkSuite) -> XtaskResult<serde_json::Value> {
+    if suite.datasets.is_empty() {
+        return Err("release verdict input has no datasets".into());
+    }
+    let mut exact_failures = Vec::new();
+    for record in &suite.datasets {
+        require_finite_metric(&record.fixture, "tri_boost", record.tri_boost.deviance)?;
+        require_finite_metric(&record.fixture, "ebm", record.ebm.deviance)?;
+        if let Some(gbdt) = &record.gbdt_best {
+            require_finite_metric(&record.fixture, "gbdt_best", gbdt.deviance)?;
+        }
+        if !record.tri_boost.exact {
+            exact_failures.push(record.fixture.clone());
+        }
+    }
+
+    let mut by_objective =
+        std::collections::BTreeMap::<String, Vec<&ReleaseBenchmarkRecord>>::new();
+    for record in &suite.datasets {
+        by_objective
+            .entry(record.objective.clone())
+            .or_default()
+            .push(record);
+    }
+
+    let mut objective_json = Vec::new();
+    let mut beat_ebm_all = true;
+    for (objective, records) in by_objective {
+        let tri = median(records.iter().map(|r| r.tri_boost.deviance).collect())?;
+        let ebm = median(records.iter().map(|r| r.ebm.deviance).collect())?;
+        let beat_ebm = tri < ebm;
+        beat_ebm_all &= beat_ebm;
+        let gbdt_values: Vec<f64> = records
+            .iter()
+            .filter_map(|r| r.gbdt_best.as_ref().map(|score| score.deviance))
+            .collect();
+        let gbdt = if gbdt_values.len() == records.len() {
+            Some(median(gbdt_values)?)
+        } else {
+            None
+        };
+        let gbdt_gap = gbdt.and_then(|m| (m > 0.0).then_some(finite_or_zero((tri - m) / m)));
+        objective_json.push(json!({
+            "objective": objective,
+            "datasets": records.len(),
+            "median_deviance": {
+                "tri_boost": tri,
+                "ebm": ebm,
+                "gbdt_best": gbdt
+            },
+            "hard_gate_beat_ebm": beat_ebm,
+            "reported_gbdt_relative_gap": gbdt_gap
+        }));
+    }
+
+    let exactness_passed = exact_failures.is_empty();
+    Ok(json!({
+        "schema_version": 1,
+        "status": if exactness_passed && beat_ebm_all { "pass" } else { "fail" },
+        "hard_gates": {
+            "all_passed": exactness_passed && beat_ebm_all,
+            "exactness": {
+                "passed": exactness_passed,
+                "failures": exact_failures
+            },
+            "beat_ebm_median_deviance": {
+                "passed": beat_ebm_all
+            }
+        },
+        "reported_checks": {
+            "gbdt_gap_is_release_blocking": false
+        },
+        "objectives": objective_json
+    }))
+}
+
+fn require_finite_metric(fixture: &str, model: &str, value: f64) -> XtaskResult<()> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(format!("{fixture} {model} deviance must be finite and >= 0, got {value}").into())
+    }
+}
+
+fn median(mut values: Vec<f64>) -> XtaskResult<f64> {
+    if values.is_empty() {
+        return Err("cannot take median of an empty vector".into());
+    }
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Ok(values[mid])
+    } else {
+        Ok(0.5 * (values[mid - 1] + values[mid]))
+    }
 }
 
 fn run_accuracy_fixture(seed: u64) -> XtaskResult<serde_json::Value> {
@@ -1420,5 +1625,81 @@ mod accuracy_tests {
         let violations = check_no_rival_deps(&files);
         assert_eq!(violations.len(), 1);
         assert!(violations[0].message.contains("xgboost"));
+    }
+
+    #[test]
+    fn release_verdict_passes_when_exact_and_beats_ebm_by_objective_median() {
+        let suite: ReleaseBenchmarkSuite = serde_json::from_value(json!({
+            "datasets": [
+                {
+                    "fixture": "a",
+                    "objective": "squared_error",
+                    "tri_boost": {"deviance": 0.8, "exact": true},
+                    "ebm": {"deviance": 1.0},
+                    "gbdt_best": {"deviance": 0.75}
+                },
+                {
+                    "fixture": "b",
+                    "objective": "squared_error",
+                    "tri_boost": {"deviance": 0.9, "exact": true},
+                    "ebm": {"deviance": 1.1},
+                    "gbdt_best": {"deviance": 0.85}
+                },
+                {
+                    "fixture": "c",
+                    "objective": "poisson",
+                    "tri_boost": {"deviance": 1.8, "exact": true},
+                    "ebm": {"deviance": 2.0}
+                }
+            ]
+        }))
+        .unwrap();
+        let verdict = evaluate_release_verdict(&suite).unwrap();
+        assert_eq!(verdict["status"], "pass");
+        assert_eq!(verdict["hard_gates"]["all_passed"], true);
+        assert_eq!(
+            verdict["reported_checks"]["gbdt_gap_is_release_blocking"],
+            false
+        );
+    }
+
+    #[test]
+    fn release_verdict_fails_on_non_exact_or_ebm_loss() {
+        let non_exact: ReleaseBenchmarkSuite = serde_json::from_value(json!({
+            "datasets": [{
+                "fixture": "a",
+                "objective": "squared_error",
+                "tri_boost": {"deviance": 0.8, "exact": false},
+                "ebm": {"deviance": 1.0}
+            }]
+        }))
+        .unwrap();
+        let verdict = evaluate_release_verdict(&non_exact).unwrap();
+        assert_eq!(verdict["status"], "fail");
+        assert_eq!(verdict["hard_gates"]["exactness"]["passed"], false);
+
+        let ebm_loss: ReleaseBenchmarkSuite = serde_json::from_value(json!({
+            "datasets": [
+                {
+                    "fixture": "a",
+                    "objective": "squared_error",
+                    "tri_boost": {"deviance": 1.2, "exact": true},
+                    "ebm": {"deviance": 1.0}
+                },
+                {
+                    "fixture": "b",
+                    "objective": "squared_error",
+                    "tri_boost": {"deviance": 1.3, "exact": true},
+                    "ebm": {"deviance": 1.1}
+                }
+            ]
+        }))
+        .unwrap();
+        let verdict = evaluate_release_verdict(&ebm_loss).unwrap();
+        assert_eq!(verdict["status"], "fail");
+        assert_eq!(
+            verdict["hard_gates"]["beat_ebm_median_deviance"]["passed"],
+            false
+        );
     }
 }

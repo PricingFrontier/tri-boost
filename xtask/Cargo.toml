@@ -12,5 +12,6 @@ publish = false
 # deny set does not apply to dev tooling.
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tri-boost-core = { path = "../crates/tri-boost-core", version = "0.1.0" }
