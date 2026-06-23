@@ -68,6 +68,21 @@ impl Default for Smooth {
     }
 }
 
+/// Target transform used by the categorical target-statistic encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CatTarget {
+    /// Encode the exposure-weighted mean target, matching the original TS path.
+    Mean,
+    /// Encode the weighted mean of `log(y)`, useful for positive severity targets.
+    LogMean,
+}
+
+impl Default for CatTarget {
+    fn default() -> Self {
+        Self::Mean
+    }
+}
+
 /// Configuration for one target-statistic encoder (spec §04.3/§04.12).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TsConfig {
@@ -75,6 +90,8 @@ pub struct TsConfig {
     pub leakage: LeakageScheme,
     /// Shrinkage rule.
     pub smooth: Smooth,
+    /// Target transform used before shrinkage.
+    pub target: CatTarget,
     /// Number of target borders used by the encoder's target pre-binning.
     pub target_borders: u32,
     /// Low-cardinality one-hot threshold.
@@ -88,6 +105,7 @@ impl Default for TsConfig {
         Self {
             leakage: LeakageScheme::default(),
             smooth: Smooth::default(),
+            target: CatTarget::default(),
             target_borders: 16,
             one_hot_max_size: 2,
             min_data_per_group: 10.0,
@@ -510,10 +528,10 @@ pub fn fit_cat_encoder(
             &weights
         }
     };
-    let row_terms = categorical_row_terms(y, w, spec.exposure)?;
+    let row_terms = categorical_row_terms(y, w, spec.exposure, spec.config.target)?;
     let (fit_levels, members) =
         collapse_rare_levels(levels, &row_terms, spec.config.min_data_per_group)?;
-    let base = exposure_weighted_base_rate(y, w, spec.exposure)?;
+    let base = categorical_base_from_terms(&row_terms, spec.config.target)?;
     let smooth = resolve_smooth(&fit_levels, &row_terms, base, spec.config.smooth)?;
     let mut resolved_config = spec.config.clone();
     resolved_config.smooth = smooth;
@@ -547,7 +565,15 @@ fn categorical_row_terms(
     y: &[f32],
     weight: &[f32],
     exposure: Option<&[f32]>,
+    target: CatTarget,
 ) -> Result<Vec<CatRowTerm>, PbError> {
+    if let Some(ex) = exposure {
+        if ex.len() != y.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!("categorical fit: y={}, exposure={}", y.len(), ex.len()),
+            });
+        }
+    }
     let mut out = Vec::with_capacity(y.len());
     for (i, (&yi, &wi)) in y.iter().zip(weight).enumerate() {
         if !yi.is_finite() || !wi.is_finite() || wi < 0.0 {
@@ -570,12 +596,49 @@ fn categorical_row_terms(
             None => 1.0,
         };
         let w = f64::from(wi);
-        out.push(CatRowTerm {
-            sum_y: w * f64::from(yi),
-            denom: w * e,
-        });
+        let (sum_y, denom) = match target {
+            CatTarget::Mean => (w * f64::from(yi), w * e),
+            CatTarget::LogMean => {
+                if yi <= 0.0 {
+                    return Err(PbError::InvalidInput {
+                        what: format!("cat_target='log_mean' requires y[{i}] > 0, got {yi}"),
+                    });
+                }
+                (w * f64::from(yi).ln(), w)
+            }
+        };
+        out.push(CatRowTerm { sum_y, denom });
     }
     Ok(out)
+}
+
+fn categorical_base_from_terms(rows: &[CatRowTerm], target: CatTarget) -> Result<f32, PbError> {
+    let mut sum_y = 0.0_f64;
+    let mut denom = 0.0_f64;
+    for term in rows {
+        sum_y += term.sum_y;
+        denom += term.denom;
+    }
+    if denom <= 0.0 {
+        let label = match target {
+            CatTarget::Mean => "categorical base rate denominator Σw·e",
+            CatTarget::LogMean => "categorical log-mean denominator Σw",
+        };
+        return Err(PbError::InvalidInput {
+            what: format!("{label} must be > 0"),
+        });
+    }
+    let out = (sum_y / denom) as f32;
+    if out.is_finite() {
+        Ok(out)
+    } else {
+        Err(PbError::InvalidInput {
+            what: format!(
+                "categorical base target statistic is not representable as f32: {}",
+                sum_y / denom
+            ),
+        })
+    }
 }
 
 fn full_data_encoder(
@@ -1089,6 +1152,60 @@ mod tests {
         );
         assert_eq!(enc_a.encode_label("unseen"), enc_a.base);
         assert!(train_a.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn log_mean_target_encodes_positive_targets_on_log_scale() {
+        let levels = vec!["low", "low", "high", "high"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let y = [2.0_f32, 8.0, 20.0, 80.0];
+        let weight = [1.0_f32, 3.0, 2.0, 2.0];
+        let cfg = TsConfig {
+            leakage: LeakageScheme::KFold { k: 2 },
+            smooth: Smooth::Fixed { m: 0.0 },
+            target: CatTarget::LogMean,
+            min_data_per_group: 0.0,
+            ..TsConfig::default()
+        };
+        let spec = CatFitSpec {
+            raw: FeatureId(2),
+            id: TsEncodingId(0),
+            weight: Some(&weight),
+            exposure: None,
+            config: &cfg,
+            seed: 99,
+        };
+        let (enc, train) = fit_cat_encoder(&levels, &y, spec).unwrap();
+        let low = (2.0_f32.ln() + 3.0 * 8.0_f32.ln()) / 4.0;
+        let high = (2.0 * 20.0_f32.ln() + 2.0 * 80.0_f32.ln()) / 4.0;
+        assert!((enc.encode_label("low") - low).abs() < 1e-6);
+        assert!((enc.encode_label("high") - high).abs() < 1e-6);
+        assert_eq!(enc.config.target, CatTarget::LogMean);
+        assert!(train.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn log_mean_target_rejects_non_positive_targets() {
+        let levels = vec!["a".to_owned(), "b".to_owned()];
+        let y = [1.0_f32, 0.0];
+        let cfg = TsConfig {
+            target: CatTarget::LogMean,
+            ..TsConfig::default()
+        };
+        let spec = CatFitSpec {
+            raw: FeatureId(2),
+            id: TsEncodingId(0),
+            weight: None,
+            exposure: None,
+            config: &cfg,
+            seed: 99,
+        };
+        assert!(matches!(
+            fit_cat_encoder(&levels, &y, spec),
+            Err(PbError::InvalidInput { .. })
+        ));
     }
 
     #[test]

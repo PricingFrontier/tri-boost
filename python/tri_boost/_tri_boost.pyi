@@ -30,6 +30,7 @@ class _Booster:
         n_trees: int = 1000,
         learning_rate: float = 0.05,
         lambda_: float = 1.0,
+        l1_leaf: float = 0.0,
         min_split_gain: float = 0.0,
         max_delta_step: float | None = None,
         max_bin: int = 254,
@@ -40,6 +41,12 @@ class _Booster:
         min_weight_sum_in_leaf: float = 0.0,
         path_smooth: float = 0.0,
         subsample: float | None = None,
+        colsample_bytree: float = 1.0,
+        learning_rate_decay: float = 0.0,
+        validation_fraction: float | None = None,
+        early_stopping_rounds: int = 50,
+        leaf_refine_steps: int = 0,
+        leaf_refine_backtracks: int = 4,
         mvs_min_rows: int = 1,
         hist_precision: str | None = None,
         n_bags: int = 0,
@@ -50,6 +57,12 @@ class _Booster:
         random_strength: float = 0.0,
         reanchor: bool = False,
         max_interaction_order: int = 3,
+        cat_smooth: float | None = None,
+        cat_target: str | None = None,
+        cat_leakage: str | None = None,
+        cat_n_perms: int = 1,
+        cat_k: int = 5,
+        cat_min_data_per_group: float = 10.0,
         seed: int = 0,
         n_jobs: int | None = None,
     ) -> _Booster: ...
@@ -63,6 +76,7 @@ class _Booster:
         feature_names: Sequence[str] | None = None,
         class_labels: Sequence[str] | None = None,
         monotone: Sequence[int] | None = None,
+        cat_x: Sequence[Sequence[str]] | None = None,
     ) -> _Model: ...
 
 
@@ -83,17 +97,32 @@ class _Model:
     @property
     def class_labels(self) -> list[str] | None: ...
 
-    def predict(self, x: np.ndarray, out: np.ndarray | None = None) -> np.ndarray: ...
+    def predict(
+        self,
+        x: np.ndarray,
+        out: np.ndarray | None = None,
+        cat_x: Sequence[Sequence[str]] | None = None,
+    ) -> np.ndarray: ...
 
-    def predict_raw(self, x: np.ndarray, out: np.ndarray | None = None) -> np.ndarray: ...
+    def predict_raw(
+        self,
+        x: np.ndarray,
+        out: np.ndarray | None = None,
+        cat_x: Sequence[Sequence[str]] | None = None,
+    ) -> np.ndarray: ...
 
-    def predict_proba(self, x: np.ndarray) -> np.ndarray: ...
+    def predict_proba(
+        self,
+        x: np.ndarray,
+        cat_x: Sequence[Sequence[str]] | None = None,
+    ) -> np.ndarray: ...
 
     def explain(
         self,
         x: np.ndarray,
         ref_measure: str | None = None,
         laplace: float = 1.0,
+        cat_x: Sequence[Sequence[str]] | None = None,
     ) -> _TableBank: ...
 
     def tables(
@@ -102,6 +131,7 @@ class _Model:
         ref_measure: str | None = None,
         laplace: float = 1.0,
         basis_json: str | None = None,
+        cat_x: Sequence[Sequence[str]] | None = None,
     ) -> str: ...
 
     def to_json(self) -> str: ...

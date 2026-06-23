@@ -12,13 +12,15 @@ non-normal loss" example):
     sample_weight = ClaimNb, Gamma loss. Scored by ClaimNb-weighted mean Gamma deviance + D².
 
 Fairness notes:
-  * Identical preprocessed features for every model (numeric + ORDINAL-encoded categoricals),
-    so this compares the boosting, not the categorical handling. (Native-categorical and
-    tri-boost's target-statistic encoding are a documented follow-up.)
+  * tri-boost uses its native target-statistic categorical encoding via `categorical_features`.
+    LightGBM and CatBoost use their native categorical paths. XGBoost is kept on the shared
+    ordinal-encoded matrix for version/API stability.
   * Capacity-matched, UNTUNED hyperparameters: depth 3 everywhere (tri-boost is a depth-3
     oblivious GBM by construction; CatBoost is also oblivious; LightGBM gets num_leaves=8;
     XGBoost gets max_depth=3), same learning_rate / n_estimators / L2 / max_bin. No per-library
     tuning or early stopping — a level, reproducible first pass, not a tuned bake-off.
+  * The optional "tri-boost tuned" row keeps the same exact depth-3 decomposable structure while
+    enabling conservative exact-safe accuracy knobs (reanchor and categorical TS controls).
   * CatBoost has no native Gamma loss; severity uses Tweedie(variance_power=1.9) as the closest
     proxy and is labelled as such.
 
@@ -64,10 +66,39 @@ THREADS = int(_THREADS)  # equal thread budget for every library (see top-of-fil
 TEST_SIZE = 0.2
 SEED = 0
 SAMPLE = int(os.environ.get("TRIBOOST_BENCH_SAMPLE", "0"))  # 0 = full dataset
+INCLUDE_TUNED = os.environ.get("TRIBOOST_BENCH_TUNED", "1") != "0"
 
 NUMERIC = ["VehPower", "VehAge", "DrivAge", "BonusMalus", "Density"]
 CATEGORICAL = ["VehBrand", "VehGas", "Area", "Region"]
 FEATURES = NUMERIC + CATEGORICAL
+
+# Rival GBM results are deterministic for a fixed config, so cache them to disk and only
+# re-fit tri-boost when iterating. Delete benchmarks/.bench_cache.json to force a re-run.
+_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bench_cache.json")
+CACHEABLE = {"xgboost", "lightgbm", "catboost"}  # tri-boost rows always re-fit fresh
+
+
+def _cache_key(name: str, task_name: str) -> str:
+    return (f"{name}|{task_name}|sample={SAMPLE}|n={N_ESTIMATORS}|lr={LEARNING_RATE}"
+            f"|depth={MAX_DEPTH}|l2={L2}|bin={MAX_BIN}|seed={SEED}|test={TEST_SIZE}")
+
+
+def _load_cache() -> dict:
+    if os.path.exists(_CACHE_PATH):
+        try:
+            with open(_CACHE_PATH, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (ValueError, OSError):
+            return {}
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    try:
+        with open(_CACHE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh, indent=1)
+    except OSError:
+        pass
 
 
 # ------------------------------------------------------------------------------- data
@@ -94,8 +125,8 @@ def load_frames() -> pd.DataFrame:
     return df
 
 
-def encode(train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Identical feature matrix for every model: numeric + ordinal-encoded categoricals."""
+def encode_ordinal(train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Shared numeric matrix for models run with ordinal-encoded categoricals."""
     enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
     enc.fit(train[CATEGORICAL])
 
@@ -107,12 +138,24 @@ def encode(train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarray, np.ndar
     return to_matrix(train), to_matrix(test)
 
 
+def native_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Pandas frame with numeric columns and native categorical dtypes."""
+    out = frame[FEATURES].copy()
+    for col in NUMERIC:
+        out[col] = out[col].astype("float32")
+    for col in CATEGORICAL:
+        out[col] = out[col].astype("category")
+    return out.reset_index(drop=True)
+
+
 @dataclass
 class Task:
     name: str
     power: float            # Tweedie power: 1 = Poisson, 2 = Gamma
-    X_tr: np.ndarray
-    X_te: np.ndarray
+    X_tr_ord: np.ndarray
+    X_te_ord: np.ndarray
+    X_tr_native: pd.DataFrame
+    X_te_native: pd.DataFrame
     y_tr: np.ndarray
     y_te: np.ndarray
     w_tr: np.ndarray
@@ -121,13 +164,15 @@ class Task:
 
 def make_tasks(df: pd.DataFrame) -> list[Task]:
     tr, te = train_test_split(df, test_size=TEST_SIZE, random_state=SEED)
-    Xtr, Xte = encode(tr, te)
+    Xtr_ord, Xte_ord = encode_ordinal(tr, te)
+    Xtr_native, Xte_native = native_features(tr), native_features(te)
 
     # Frequency: target = ClaimNb / Exposure, weight = Exposure.
     freq = Task(
         name="frequency (Poisson)",
         power=1.0,
-        X_tr=Xtr, X_te=Xte,
+        X_tr_ord=Xtr_ord, X_te_ord=Xte_ord,
+        X_tr_native=Xtr_native, X_te_native=Xte_native,
         y_tr=(tr["ClaimNb"] / tr["Exposure"]).to_numpy(np.float64),
         y_te=(te["ClaimNb"] / te["Exposure"]).to_numpy(np.float64),
         w_tr=tr["Exposure"].to_numpy(np.float64),
@@ -135,65 +180,135 @@ def make_tasks(df: pd.DataFrame) -> list[Task]:
     )
 
     # Severity: policies with claims, target = ClaimAmount / ClaimNb, weight = ClaimNb.
-    def sev_task(frame: pd.DataFrame, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def sev_task(
+        frame: pd.DataFrame,
+        x_ord: np.ndarray,
+        x_native: pd.DataFrame,
+    ) -> tuple[np.ndarray, pd.DataFrame, np.ndarray, np.ndarray]:
         mask = (frame["ClaimNb"].to_numpy() > 0) & (frame["ClaimAmount"].to_numpy() > 0)
         y = (frame["ClaimAmount"].to_numpy()[mask] / frame["ClaimNb"].to_numpy()[mask])
         w = frame["ClaimNb"].to_numpy(np.float64)[mask]
-        return X[mask], y.astype(np.float64), w
+        native = x_native.iloc[np.flatnonzero(mask)].reset_index(drop=True)
+        return x_ord[mask], native, y.astype(np.float64), w
 
-    Xtr_s, ytr_s, wtr_s = sev_task(tr, Xtr)
-    Xte_s, yte_s, wte_s = sev_task(te, Xte)
+    Xtr_s_ord, Xtr_s_native, ytr_s, wtr_s = sev_task(tr, Xtr_ord, Xtr_native)
+    Xte_s_ord, Xte_s_native, yte_s, wte_s = sev_task(te, Xte_ord, Xte_native)
     sev = Task(
         name="severity (Gamma)",
         power=2.0,
-        X_tr=Xtr_s, X_te=Xte_s,
+        X_tr_ord=Xtr_s_ord, X_te_ord=Xte_s_ord,
+        X_tr_native=Xtr_s_native, X_te_native=Xte_s_native,
         y_tr=ytr_s, y_te=yte_s, w_tr=wtr_s, w_te=wte_s,
     )
     return [freq, sev]
 
 
 # ----------------------------------------------------------------------------- models
-def model_builders(power: float) -> dict[str, Callable[[], Any]]:
-    """name -> () -> fitted-able estimator, for the given task power (1=Poisson, 2=Gamma)."""
-    is_poisson = power == 1.0
+@dataclass
+class ModelCase:
+    estimator: Any
+    X_tr: Any
+    X_te: Any
+    fit_kwargs: dict[str, Any]
+    note: str = ""
 
-    def tri_boost() -> Any:
+
+def model_cases(task: Task) -> dict[str, Callable[[], ModelCase]]:
+    """name -> () -> estimator plus representation-specific fit inputs."""
+    is_poisson = task.power == 1.0
+
+    def tri_boost() -> ModelCase:
         from tri_boost import TriBoostRegressor
-        return TriBoostRegressor(
+        return ModelCase(TriBoostRegressor(
             objective="poisson" if is_poisson else "gamma",
             n_trees=N_ESTIMATORS, learning_rate=LEARNING_RATE,
             lambda_=L2, max_bin=MAX_BIN, seed=SEED, n_jobs=THREADS,
+            categorical_features=CATEGORICAL,
+        ), task.X_tr_native, task.X_te_native, {}, "native TS categoricals")
+
+    def tri_boost_tuned() -> ModelCase:
+        from tri_boost import TriBoostRegressor
+        common = dict(
+            n_trees=N_ESTIMATORS,
+            learning_rate=LEARNING_RATE,
+            max_bin=MAX_BIN,
+            seed=SEED,
+            n_jobs=THREADS,
+            categorical_features=CATEGORICAL,
+            reanchor=True,
+            n_bags=4,              # OuterBag variance reduction (top accuracy lever)
+            colsample_bytree=0.7,  # per-tree axis decorrelation (restricts axis SET only → Exact)
+            leaf_refine_steps=2,   # multi-step Newton leaf refinement (Armijo-backtracked)
+        )
+        if is_poisson:
+            params = dict(
+                common,
+                objective="poisson",
+                lambda_=L2,
+                cat_target="mean",
+                cat_leakage="kfold",
+                cat_k=5,
+            )
+        else:
+            params = dict(
+                common,
+                objective="gamma",
+                lambda_=L2,
+                cat_target="log_mean",
+            )
+        return ModelCase(
+            TriBoostRegressor(**params),
+            task.X_tr_native,
+            task.X_te_native,
+            {},
+            "native TS cats; OuterBag×4 + colsample + leaf-refine + reanchor",
         )
 
-    def xgboost() -> Any:
+    def xgboost() -> ModelCase:
         from xgboost import XGBRegressor
-        return XGBRegressor(
+        return ModelCase(XGBRegressor(
             objective="count:poisson" if is_poisson else "reg:gamma",
             n_estimators=N_ESTIMATORS, learning_rate=LEARNING_RATE,
             max_depth=MAX_DEPTH, reg_lambda=L2, max_bin=MAX_BIN,
             tree_method="hist", random_state=SEED, n_jobs=THREADS,
-        )
+        ), task.X_tr_ord, task.X_te_ord, {}, "ordinal categoricals")
 
-    def lightgbm() -> Any:
+    def lightgbm() -> ModelCase:
         from lightgbm import LGBMRegressor
-        return LGBMRegressor(
+        return ModelCase(LGBMRegressor(
             objective="poisson" if is_poisson else "gamma",
             n_estimators=N_ESTIMATORS, learning_rate=LEARNING_RATE,
             max_depth=MAX_DEPTH, num_leaves=2 ** MAX_DEPTH, reg_lambda=L2,
             max_bin=MAX_BIN, random_state=SEED, n_jobs=THREADS, verbose=-1,
-        )
+        ), task.X_tr_native, task.X_te_native, {"categorical_feature": CATEGORICAL},
+            "native categoricals")
 
-    def catboost() -> Any:
+    def catboost() -> ModelCase:
         from catboost import CatBoostRegressor
         # CatBoost has no native Gamma; Tweedie(p=1.9) is the closest proxy.
         loss = "Poisson" if is_poisson else "Tweedie:variance_power=1.9"
-        return CatBoostRegressor(
+        note = "native categoricals"
+        if not is_poisson:
+            note += "; Tweedie(p=1.9) proxy (no native Gamma)"
+        return ModelCase(CatBoostRegressor(
             loss_function=loss, iterations=N_ESTIMATORS, learning_rate=LEARNING_RATE,
             depth=MAX_DEPTH, l2_leaf_reg=L2, border_count=MAX_BIN,
             random_seed=SEED, verbose=0, allow_writing_files=False, thread_count=THREADS,
-        )
+        ), task.X_tr_native, task.X_te_native, {"cat_features": CATEGORICAL}, note)
 
-    return {"tri-boost": tri_boost, "xgboost": xgboost, "lightgbm": lightgbm, "catboost": catboost}
+    cases = {
+        "tri-boost": tri_boost,
+        "xgboost": xgboost,
+        "lightgbm": lightgbm,
+        "catboost": catboost,
+    }
+    if INCLUDE_TUNED:
+        cases = {"tri-boost": tri_boost, "tri-boost tuned": tri_boost_tuned, **{
+            "xgboost": xgboost,
+            "lightgbm": lightgbm,
+            "catboost": catboost,
+        }}
+    return cases
 
 
 # ----------------------------------------------------------------------------- scoring
@@ -210,27 +325,43 @@ def run_task(task: Task) -> None:
     # Null baseline: predict the weighted-mean target.
     base_pred = np.full_like(task.y_te, np.average(task.y_tr, weights=task.w_tr))
     base_dev = deviance(task.power, task.y_te, base_pred, task.w_te)
-    print(f"    {'model':<12}{'test deviance':>16}{'D² (dev. expl.)':>18}{'fit (s)':>10}   notes")
-    print(f"    {'baseline':<12}{base_dev:>16.5f}{0.0:>18.4f}{0.0:>10.2f}   weighted-mean predictor")
+    print(f"    {'model':<16}{'test deviance':>16}{'D² (dev. expl.)':>18}{'fit (s)':>10}   notes")
+    print(f"    {'baseline':<16}{base_dev:>16.5f}{0.0:>18.4f}{0.0:>10.2f}   weighted-mean predictor")
 
-    for name, build in model_builders(task.power).items():
-        note = ""
-        if name == "catboost" and task.power == 2.0:
-            note = "Tweedie(p=1.9) proxy (no native Gamma)"
+    cache = _load_cache()
+    for name, build in model_cases(task).items():
+        key = _cache_key(name, task.name)
+        if name in CACHEABLE and key in cache:
+            e = cache[key]
+            print(f"    {name:<16}{e['deviance']:>16.5f}{e['d2']:>18.4f}"
+                  f"{e['fit_s']:>10.2f}   {e['note']}  (cached)")
+            continue
         try:
-            est = build()
+            case = build()
             t0 = time.perf_counter()
-            est.fit(task.X_tr, task.y_tr, sample_weight=task.w_tr)
+            case.estimator.fit(
+                case.X_tr,
+                task.y_tr,
+                sample_weight=task.w_tr,
+                **case.fit_kwargs,
+            )
             fit_s = time.perf_counter() - t0
-            pred = np.asarray(est.predict(task.X_te), dtype=np.float64).ravel()
+            pred = np.asarray(case.estimator.predict(case.X_te), dtype=np.float64).ravel()
             dev = deviance(task.power, task.y_te, pred, task.w_te)
             d2 = float(d2_tweedie_score(task.y_te, np.clip(pred, 1e-8, None),
                                         sample_weight=task.w_te, power=task.power))
-            if name == "tri-boost":
-                note = (note + "  " if note else "") + tri_boost_exactness(est, task.X_te[:256])
-            print(f"    {name:<12}{dev:>16.5f}{d2:>18.4f}{fit_s:>10.2f}   {note}")
+            note = case.note
+            if name.startswith("tri-boost"):
+                note = (note + "  " if note else "") + tri_boost_exactness(
+                    case.estimator,
+                    case.X_te.iloc[:256],
+                )
+            print(f"    {name:<16}{dev:>16.5f}{d2:>18.4f}{fit_s:>10.2f}   {note}")
+            if name in CACHEABLE:
+                cache[key] = {"deviance": dev, "d2": d2, "fit_s": fit_s, "note": case.note}
+                _save_cache(cache)
         except Exception as exc:  # noqa: BLE001 - benchmark robustness: never abort the table
-            print(f"    {name:<12}{'FAILED':>16}{'':>18}{'':>10}   {type(exc).__name__}: {exc}")
+            print(f"    {name:<16}{'FAILED':>16}{'':>18}{'':>10}   {type(exc).__name__}: {exc}")
 
 
 def tri_boost_exactness(est: Any, x_sample: np.ndarray) -> str:

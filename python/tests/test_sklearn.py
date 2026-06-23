@@ -26,6 +26,22 @@ def classifier_fixture() -> tuple[np.ndarray, np.ndarray]:
     return x, y
 
 
+def mixed_categorical_fixture() -> tuple[np.ndarray, np.ndarray]:
+    n = 96
+    num = (np.arange(n) % 8).astype(np.float32)
+    levels = np.asarray(["alpha", "beta", "gamma", "delta"], dtype=object)
+    brand = levels[np.arange(n) % levels.shape[0]]
+    x = np.empty((n, 2), dtype=object)
+    x[:, 0] = num
+    x[:, 1] = brand
+    y = (
+        0.15 * num
+        + np.where(brand == "beta", 1.25, 0.0)
+        + np.where(brand == "gamma", -0.75, 0.25)
+    )
+    return x, y.astype(np.float32)
+
+
 def small_regressor(**kwargs) -> TriBoostRegressor:
     return TriBoostRegressor(
         n_trees=16,
@@ -164,6 +180,134 @@ def test_booster_knobs_round_trip_and_stay_exact() -> None:
     assert est.predict(x32).shape == (x32.shape[0],)
 
 
+def test_new_accuracy_knobs_round_trip_and_stay_exact() -> None:
+    x, y = regression_fixture()
+    x32 = x.astype(np.float32)
+    est = small_regressor(
+        l1_leaf=0.01,
+        colsample_bytree=0.67,
+        learning_rate_decay=0.05,
+        validation_fraction=0.2,
+        early_stopping_rounds=3,
+        leaf_refine_steps=1,
+        leaf_refine_backtracks=3,
+    )
+    params = est.get_params()
+    assert params["l1_leaf"] == 0.01
+    assert params["colsample_bytree"] == 0.67
+    assert params["learning_rate_decay"] == 0.05
+    assert params["validation_fraction"] == 0.2
+    assert params["early_stopping_rounds"] == 3
+    assert params["leaf_refine_steps"] == 1
+    assert params["leaf_refine_backtracks"] == 3
+    assert clone(est).get_params()["colsample_bytree"] == 0.67
+
+    est.fit(x32, y)
+    assert json.loads(est.tables(x32, ref_measure="uniform"))["mode"] == "Exact"
+    assert est.predict(x32).shape == (x32.shape[0],)
+
+
+def test_new_accuracy_invalid_params_are_rejected() -> None:
+    x, y = regression_fixture()
+    x32 = x.astype(np.float32)
+    for kwargs in (
+        {"l1_leaf": -1.0},
+        {"colsample_bytree": 0.0},
+        {"learning_rate_decay": -0.1},
+        {"validation_fraction": 0.0},
+        {"validation_fraction": 0.2, "early_stopping_rounds": 0},
+        {"leaf_refine_steps": 1, "leaf_refine_backtracks": 0},
+    ):
+        with pytest.raises(Exception):
+            small_regressor(**kwargs).fit(x32, y)
+
+
+def test_regressor_native_categorical_object_array_stays_exact_and_cloneable() -> None:
+    x, y = mixed_categorical_fixture()
+    est = small_regressor(
+        categorical_features=[1],
+        cat_smooth=5.0,
+        cat_target="mean",
+        cat_leakage="kfold",
+        cat_k=3,
+        cat_min_data_per_group=0.0,
+    )
+    params = est.get_params()
+    assert params["categorical_features"] == [1]
+    assert params["cat_smooth"] == 5.0
+    assert params["cat_target"] == "mean"
+    assert params["cat_leakage"] == "kfold"
+    assert params["cat_k"] == 3
+    assert params["cat_min_data_per_group"] == 0.0
+    assert clone(est).get_params()["categorical_features"] == [1]
+
+    with pytest.warns(PrecisionWarning):
+        est.fit(x, y)
+    pred = est.predict(x)
+    assert pred.shape == (x.shape[0],)
+    assert est.n_features_in_ == 2
+    assert est._cat_indices_ == [1]
+    export = json.loads(est.tables(x, ref_measure="uniform"))
+    assert export["mode"] == "Exact"
+
+    loaded = TriBoostRegressor.from_bytes(est.to_bytes())
+    loaded.categorical_features = [1]
+    with pytest.warns(PrecisionWarning):
+        loaded_pred = loaded.predict(x)
+    np.testing.assert_array_equal(loaded_pred, pred)
+
+
+def test_regressor_native_categorical_validation_guard() -> None:
+    x, y = mixed_categorical_fixture()
+    est = small_regressor(categorical_features=[1], validation_fraction=0.2)
+    with pytest.raises(Exception, match="validation_fraction"):
+        est.fit(x, y)
+
+
+def test_regressor_native_categorical_dataframe_names_and_monotone_guard() -> None:
+    pd = pytest.importorskip("pandas")
+    x, y = mixed_categorical_fixture()
+    frame = pd.DataFrame(
+        {
+            "brand": x[:, 1],
+            "age": x[:, 0].astype(np.float32),
+        }
+    )
+
+    est = small_regressor(categorical_features=["brand"])
+    est.fit(frame, y)
+    assert est.feature_names_in_.tolist() == ["brand", "age"]
+    assert est._model.feature_names == ["age", "brand"]
+    pred = est.predict(frame)
+    assert pred.shape == (frame.shape[0],)
+
+    with pytest.raises(ValueError, match="monotone_constraints"):
+        small_regressor(
+            categorical_features=["brand"],
+            monotone_constraints={"age": 1},
+        ).fit(frame, y)
+
+
+def test_classifier_native_categorical_predict_proba() -> None:
+    x, y_reg = mixed_categorical_fixture()
+    y = np.where(y_reg > np.median(y_reg), "high", "low")
+    clf = TriBoostClassifier(
+        n_trees=18,
+        learning_rate=0.2,
+        lambda_=1.0,
+        max_bin=32,
+        seed=11,
+        categorical_features=[1],
+    )
+    with pytest.warns(PrecisionWarning):
+        clf.fit(x, y)
+    proba = clf.predict_proba(x)
+    assert proba.shape == (x.shape[0], 2)
+    np.testing.assert_allclose(proba.sum(axis=1), 1.0, rtol=0.0, atol=1.0e-6)
+    export = json.loads(clf.tables(x, ref_measure="uniform"))
+    assert export["mode"] == "Exact"
+
+
 def test_outer_bag_is_thread_count_deterministic() -> None:
     # Bagging folds convex weights into tree alphas — still byte-identical across n_jobs.
     x, y = regression_fixture()
@@ -176,3 +320,22 @@ def test_invalid_hist_precision_is_rejected() -> None:
     x, y = regression_fixture()
     with pytest.raises(Exception):
         small_regressor(hist_precision="nonsense").fit(x.astype(np.float32), y)
+
+
+def test_reanchor_defaults_on_for_log_link_only() -> None:
+    # reanchor=None ⇒ link-aware default: ON for log-link (gamma/poisson/tweedie),
+    # OFF for identity/logit. Removes post-shrinkage aggregate bias for free.
+    rng = np.random.RandomState(0)
+    x = rng.rand(400, 3).astype(np.float32)
+    y = (1.0 + 2.0 * x[:, 0] + 0.5 * rng.rand(400)).astype(np.float32)  # positive (gamma-safe)
+    common = dict(n_trees=40, max_bin=32, seed=0)
+    # Gamma (log link): default reanchors → differs from explicitly-off.
+    g_def = TriBoostRegressor(objective="gamma", **common).fit(x, y).predict(x)
+    g_off = TriBoostRegressor(objective="gamma", reanchor=False, **common).fit(x, y).predict(x)
+    assert not np.allclose(g_def, g_off)
+    # SquaredError (identity link): default does NOT reanchor → identical to explicitly-off.
+    s_def = TriBoostRegressor(objective="squared_error", **common).fit(x, y).predict(x)
+    s_off = TriBoostRegressor(
+        objective="squared_error", reanchor=False, **common
+    ).fit(x, y).predict(x)
+    np.testing.assert_array_equal(s_def, s_off)

@@ -16,8 +16,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Arc;
 use tri_boost_core::boosters::{BoosterConfig, DartSpec, EnsembleSpec, NesterovSpec, RefitSpec};
+use tri_boost_core::cat::{CatTarget, LeakageScheme, Smooth, TsConfig, TsEncodingId};
 use tri_boost_core::constraints::{CredibilityFloor, InteractionPolicy, MonoSign, MonotoneMap};
-use tri_boost_core::data::{bin, bin_columns, BinConfig, BinnedMatrix};
+use tri_boost_core::data::{
+    bin, bin_columns, bin_serve_columns, bin_train_columns, BinConfig, BinnedMatrix,
+    CategoricalColumn, FeatureId, NumericColumn, ServeCategoricalColumn,
+};
 use tri_boost_core::engine::{Booster, Config, FitSpec, HistPrecision, Model, Sampling};
 use tri_boost_core::error::{Invariant, PbError};
 use tri_boost_core::explain::{RefMeasure, TableBank};
@@ -125,6 +129,7 @@ struct PyBooster {
     objective: Objective,
     credibility: CredibilityFloor,
     interaction: InteractionPolicy,
+    cat_config: TsConfig,
     seed: u64,
     n_jobs: Option<usize>,
 }
@@ -155,6 +160,28 @@ fn parse_sampling(subsample: Option<f32>, mvs_min_rows: u32) -> Sampling {
     }
 }
 
+fn parse_cat_target(name: Option<&str>) -> Result<CatTarget, PbError> {
+    match name.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("mean") | Some("rate") => Ok(CatTarget::Mean),
+        Some("log_mean") | Some("logmean") | Some("log") => Ok(CatTarget::LogMean),
+        Some(other) => Err(PbError::InvalidConfig {
+            what: format!("cat_target must be 'mean' or 'log_mean', got {other:?}"),
+        }),
+    }
+}
+
+fn parse_cat_leakage(name: Option<&str>, n_perms: u32, k: u32) -> Result<LeakageScheme, PbError> {
+    match name.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("ordered") => Ok(LeakageScheme::Ordered { n_perms }),
+        Some("kfold") | Some("k_fold") | Some("crossfit") | Some("cross_fit") => {
+            Ok(LeakageScheme::KFold { k })
+        }
+        Some(other) => Err(PbError::InvalidConfig {
+            what: format!("cat_leakage must be 'ordered' or 'kfold', got {other:?}"),
+        }),
+    }
+}
+
 #[pymethods]
 impl PyBooster {
     #[new]
@@ -163,6 +190,7 @@ impl PyBooster {
         n_trees=1000,
         learning_rate=0.05,
         lambda_=1.0,
+        l1_leaf=0.0,
         min_split_gain=0.0,
         max_delta_step=None,
         max_bin=254,
@@ -173,6 +201,12 @@ impl PyBooster {
         min_weight_sum_in_leaf=0.0,
         path_smooth=0.0,
         subsample=None,
+        colsample_bytree=1.0,
+        learning_rate_decay=0.0,
+        validation_fraction=None,
+        early_stopping_rounds=50,
+        leaf_refine_steps=0,
+        leaf_refine_backtracks=4,
         mvs_min_rows=1,
         hist_precision=None,
         n_bags=0,
@@ -183,6 +217,12 @@ impl PyBooster {
         random_strength=0.0,
         reanchor=false,
         max_interaction_order=3,
+        cat_smooth=None,
+        cat_target=None,
+        cat_leakage=None,
+        cat_n_perms=1,
+        cat_k=5,
+        cat_min_data_per_group=10.0,
         seed=0,
         n_jobs=None
     ))]
@@ -190,6 +230,7 @@ impl PyBooster {
         n_trees: u32,
         learning_rate: f32,
         lambda_: f32,
+        l1_leaf: f32,
         min_split_gain: f32,
         max_delta_step: Option<f32>,
         max_bin: u8,
@@ -200,6 +241,12 @@ impl PyBooster {
         min_weight_sum_in_leaf: f32,
         path_smooth: f32,
         subsample: Option<f32>,
+        colsample_bytree: f32,
+        learning_rate_decay: f32,
+        validation_fraction: Option<f32>,
+        early_stopping_rounds: u32,
+        leaf_refine_steps: u8,
+        leaf_refine_backtracks: u8,
         mvs_min_rows: u32,
         hist_precision: Option<String>,
         n_bags: u16,
@@ -210,6 +257,12 @@ impl PyBooster {
         random_strength: f32,
         reanchor: bool,
         max_interaction_order: u8,
+        cat_smooth: Option<f32>,
+        cat_target: Option<String>,
+        cat_leakage: Option<String>,
+        cat_n_perms: u32,
+        cat_k: u32,
+        cat_min_data_per_group: f32,
         seed: u64,
         n_jobs: Option<usize>,
     ) -> PyResult<Self> {
@@ -249,9 +302,16 @@ impl PyBooster {
             n_trees,
             learning_rate,
             lambda: lambda_,
+            l1_leaf,
             min_split_gain,
             max_delta_step,
             sampling: parse_sampling(subsample, mvs_min_rows),
+            colsample_bytree,
+            learning_rate_decay,
+            validation_fraction,
+            early_stopping_rounds,
+            leaf_refine_steps,
+            leaf_refine_backtracks,
             hist_precision: parse_hist_precision(hist_precision.as_deref()).map_err(py_err)?,
             boosters,
         };
@@ -272,6 +332,20 @@ impl PyBooster {
             max_order: max_interaction_order,
             ..InteractionPolicy::default()
         };
+        // Categorical target-statistic config: default to empirical-Bayes Auto smoothing
+        // (spec §04), overridable by a fixed pseudo-count via `cat_smooth`.
+        let cat_config = TsConfig {
+            leakage: parse_cat_leakage(cat_leakage.as_deref(), cat_n_perms, cat_k)
+                .map_err(py_err)?,
+            smooth: match cat_smooth {
+                None => Smooth::Auto,
+                Some(m) => Smooth::Fixed { m },
+            },
+            target: parse_cat_target(cat_target.as_deref()).map_err(py_err)?,
+            min_data_per_group: cat_min_data_per_group,
+            ..TsConfig::default()
+        };
+        cat_config.validate().map_err(py_err)?;
         let objective = Objective::parse(objective, tweedie_rho).map_err(py_err)?;
         if matches!(n_jobs, Some(0)) {
             return Err(py_err(PbError::InvalidConfig {
@@ -284,12 +358,13 @@ impl PyBooster {
             objective,
             interaction,
             credibility,
+            cat_config,
             seed,
             n_jobs,
         })
     }
 
-    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None))]
+    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None))]
     #[allow(clippy::too_many_arguments)]
     fn fit(
         &self,
@@ -301,6 +376,9 @@ impl PyBooster {
         feature_names: Option<Vec<String>>,
         class_labels: Option<Vec<String>>,
         monotone: Option<Vec<i8>>,
+        // Native categorical columns as per-row string labels: `cat_x[j]` is one column,
+        // appended after the numeric columns of `x` (raw ids assigned sequentially).
+        cat_x: Option<Vec<Vec<String>>>,
     ) -> PyResult<PyModel> {
         let columns = raw_columns_from_array(x)?;
         let y = array1_to_vec(y, "y")?;
@@ -318,6 +396,7 @@ impl PyBooster {
                     feature_names,
                     class_labels,
                     monotone,
+                    cat_x,
                 )
             })
             .map_err(py_err)?;
@@ -367,36 +446,38 @@ impl PyModel {
         self.model.schema.class_labels.clone()
     }
 
-    #[pyo3(signature = (x, out=None))]
+    #[pyo3(signature = (x, out=None, cat_x=None))]
     fn predict<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
         out: Option<Bound<'py, PyArray1<f32>>>,
+        cat_x: Option<Vec<Vec<String>>>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
         let pred = py
             .detach(move || {
-                let binned = binned_for_model(&model, columns)?;
+                let binned = serve_binned_for_model(&model, columns, cat_x)?;
                 model.predict_binned(&binned, None)
             })
             .map_err(py_err)?;
         write_or_return_array1(py, pred, out)
     }
 
-    #[pyo3(signature = (x, out=None))]
+    #[pyo3(signature = (x, out=None, cat_x=None))]
     fn predict_raw<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
         out: Option<Bound<'py, PyArray1<f32>>>,
+        cat_x: Option<Vec<Vec<String>>>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
         let raw = py
             .detach(move || {
-                let binned = binned_for_model(&model, columns)?;
+                let binned = serve_binned_for_model(&model, columns, cat_x)?;
                 let mut out = vec![0.0_f32; binned.n_rows as usize];
                 model.score_trees(&binned, None, &mut out)?;
                 Ok::<Vec<f32>, PbError>(out)
@@ -405,10 +486,12 @@ impl PyModel {
         write_or_return_array1(py, raw, out)
     }
 
+    #[pyo3(signature = (x, cat_x=None))]
     fn predict_proba<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
+        cat_x: Option<Vec<Vec<String>>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         if self.model.link != tri_boost_core::loss::Link::Logit {
             return Err(PyTypeError::new_err(
@@ -419,7 +502,7 @@ impl PyModel {
         let model = Arc::clone(&self.model);
         let pred = py
             .detach(move || {
-                let binned = binned_for_model(&model, columns)?;
+                let binned = serve_binned_for_model(&model, columns, cat_x)?;
                 model.predict_binned(&binned, None)
             })
             .map_err(py_err)?;
@@ -437,27 +520,29 @@ impl PyModel {
         })
     }
 
-    #[pyo3(signature = (x, ref_measure=None, laplace=1.0))]
+    #[pyo3(signature = (x, ref_measure=None, laplace=1.0, cat_x=None))]
     fn explain(
         &self,
         py: Python<'_>,
         x: PyReadonlyArray2<'_, f32>,
         ref_measure: Option<String>,
         laplace: f32,
+        cat_x: Option<Vec<Vec<String>>>,
     ) -> PyResult<PyTableBank> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
         let w = parse_ref_measure(ref_measure, laplace).map_err(py_err)?;
         let bank = py
             .detach(move || {
-                let binned = binned_for_model(&model, columns)?;
+                let binned = serve_binned_for_model(&model, columns, cat_x)?;
                 model.explain(&tri_boost_core::data::ServeBinnedMatrix(binned), w)
             })
             .map_err(py_err)?;
         Ok(PyTableBank { bank })
     }
 
-    #[pyo3(signature = (x, ref_measure=None, laplace=1.0, basis_json=None))]
+    #[pyo3(signature = (x, ref_measure=None, laplace=1.0, basis_json=None, cat_x=None))]
+    #[allow(clippy::too_many_arguments)]
     fn tables(
         &self,
         py: Python<'_>,
@@ -465,13 +550,14 @@ impl PyModel {
         ref_measure: Option<String>,
         laplace: f32,
         basis_json: Option<&str>,
+        cat_x: Option<Vec<Vec<String>>>,
     ) -> PyResult<String> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
         let w = parse_ref_measure(ref_measure, laplace).map_err(py_err)?;
         let basis = parse_rating_basis(basis_json)?;
         py.detach(move || {
-            let binned = binned_for_model(&model, columns)?;
+            let binned = serve_binned_for_model(&model, columns, cat_x)?;
             let bank = model.explain(&tri_boost_core::data::ServeBinnedMatrix(binned), w)?;
             let export =
                 bank.to_rating_export(model.link, &model.mode, &model.schema, basis.as_ref())?;
@@ -563,11 +649,27 @@ fn fit_owned(
     feature_names: Option<Vec<String>>,
     class_labels: Option<Vec<String>>,
     monotone: Option<Vec<i8>>,
+    cat_x: Option<Vec<Vec<String>>>,
 ) -> Result<Model, PbError> {
-    let refs: Vec<&[f32]> = columns.iter().map(Vec::as_slice).collect();
-    let x = bin_columns(&refs, weight.as_deref(), &state.bin_config, state.seed)?;
-    let monotone_map = build_monotone_map(monotone.as_deref(), columns.len())?;
-    let run = || {
+    let n_numeric = columns.len();
+    let n_cat = cat_x.as_ref().map_or(0, Vec::len);
+    let monotone_map = build_monotone_map(monotone.as_deref(), n_numeric + n_cat)?;
+    if cat_x.is_some() && !monotone_map.is_empty() {
+        return Err(PbError::InvalidConfig {
+            what: "monotone constraints with native categorical features are not yet \
+                   supported in the Python path"
+                .into(),
+        });
+    }
+    if cat_x.is_some() && state.config.validation_fraction.is_some() {
+        return Err(PbError::InvalidConfig {
+            what: "validation_fraction with native categorical target statistics is not \
+                   leakage-free yet; use an external validation split or disable native \
+                   categoricals for internal early stopping"
+                .into(),
+        });
+    }
+    let run = || -> Result<Model, PbError> {
         let loss = state.objective.instantiate()?;
         let spec = FitSpec {
             loss: loss.as_loss(),
@@ -578,7 +680,55 @@ fn fit_owned(
             credibility: state.credibility,
             seed: state.seed,
         };
-        Booster::with_config(state.config.clone()).fit(&x, &y, &spec)
+        match &cat_x {
+            None => {
+                let refs: Vec<&[f32]> = columns.iter().map(Vec::as_slice).collect();
+                let x = bin_columns(&refs, weight.as_deref(), &state.bin_config, state.seed)?;
+                Booster::with_config(state.config.clone()).fit(&x, &y, &spec)
+            }
+            // Native categorical path: numeric columns keep raw ids `0..n_numeric`, each
+            // categorical column gets a sequential raw id after them, so the serve-time
+            // `bin_serve_columns` re-aligns by raw without any extra index bookkeeping.
+            Some(cats) => {
+                let numeric = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, values)| {
+                        Ok::<_, PbError>(NumericColumn {
+                            raw: FeatureId(raw_id(i)?),
+                            values,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let categorical = cats
+                    .iter()
+                    .enumerate()
+                    .map(|(j, levels)| {
+                        Ok::<_, PbError>(CategoricalColumn {
+                            raw: FeatureId(raw_id(n_numeric + j)?),
+                            id: TsEncodingId(0),
+                            levels,
+                            config: &state.cat_config,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let fitted = bin_train_columns(
+                    &numeric,
+                    &categorical,
+                    &y,
+                    weight.as_deref(),
+                    exposure.as_deref(),
+                    &state.bin_config,
+                    state.seed,
+                )?;
+                Booster::with_config(state.config.clone()).fit_train(
+                    &fitted.train,
+                    &y,
+                    &spec,
+                    fitted.cat_encoders,
+                )
+            }
+        }
     };
     let mut model = if let Some(n_jobs) = state.n_jobs {
         rayon::ThreadPoolBuilder::new()
@@ -676,6 +826,58 @@ fn write_or_return_array1<'py>(
         out_slice.copy_from_slice(&values);
     }
     Ok(out)
+}
+
+/// Convert a feature position into a raw [`FeatureId`], guarding the `u32` cast.
+fn raw_id(i: usize) -> Result<u32, PbError> {
+    u32::try_from(i).map_err(|_| PbError::InvalidInput {
+        what: "more than u32::MAX features is out of scope for v1".into(),
+    })
+}
+
+/// Rebuild a serve [`BinnedMatrix`] for prediction/explanation. The numeric-only fast
+/// path bins through the model grids positionally; the categorical path re-encodes string
+/// labels through the frozen [`crate::ModelSchema`] encoders via [`bin_serve_columns`]
+/// (matched by raw id, so numeric `0..n_numeric` then sequential categorical ids align
+/// with how `fit` laid the axes out).
+fn serve_binned_for_model(
+    model: &Model,
+    numeric_cols: Vec<Vec<f32>>,
+    cat_x: Option<Vec<Vec<String>>>,
+) -> Result<BinnedMatrix, PbError> {
+    let Some(cats) = cat_x else {
+        return binned_for_model(model, numeric_cols);
+    };
+    let n_numeric = numeric_cols.len();
+    let numeric = numeric_cols
+        .iter()
+        .enumerate()
+        .map(|(i, values)| {
+            Ok::<_, PbError>(NumericColumn {
+                raw: FeatureId(raw_id(i)?),
+                values,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let categorical = cats
+        .iter()
+        .enumerate()
+        .map(|(j, levels)| {
+            Ok::<_, PbError>(ServeCategoricalColumn {
+                raw: FeatureId(raw_id(n_numeric + j)?),
+                id: TsEncodingId(0),
+                levels,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let serve = bin_serve_columns(
+        &numeric,
+        &categorical,
+        &model.grids,
+        &model.provenance,
+        &model.schema.cat_encoders,
+    )?;
+    Ok(serve.0)
 }
 
 fn binned_for_model(model: &Model, columns: Vec<Vec<f32>>) -> Result<BinnedMatrix, PbError> {

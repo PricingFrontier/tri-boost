@@ -29,15 +29,13 @@ dynamic = ["version"]
 # cross_val_score, so they require sklearn present — but the raw _Booster/_Model API does
 # not, so we don't force scikit-learn (+scipy/joblib) onto the core install path.
 sklearn = ["scikit-learn>=1.2"]
-# Benchmark / dev tooling: rival GBMs + data wrangling for the §13 accuracy benchmarks
-# (e.g. French MTPL frequency/severity). Never part of the published runtime.
+# Benchmark / dev tooling: data wrangling for the §13 accuracy benchmarks
+# (e.g. French MTPL frequency/severity). Rival GBMs are installed explicitly in
+# local dev environments so they never appear in shipped wheel metadata.
 bench = [
   "scikit-learn>=1.2",
   "pandas>=1.5",
   "pyarrow>=10.0",
-  "xgboost>=2.0",
-  "lightgbm>=4.0",
-  "catboost>=1.2",
 ]
 
 [tool.maturin]

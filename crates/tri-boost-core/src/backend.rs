@@ -224,6 +224,10 @@ pub enum Stage {
     SplitNoise = 6,
     /// DART tree-dropout masks (§09.6).
     Dart = 7,
+    /// Per-tree column subsampling masks (§06.5).
+    Cols = 8,
+    /// Internal validation holdout carving for early stopping (§06.6).
+    Holdout = 9,
 }
 
 /// Construct the per-work-unit [`Pcg64`] from the frozen [`pb_seed`] mixer

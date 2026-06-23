@@ -897,6 +897,13 @@ fn accuracy_config(boosters: BoosterConfig) -> Config {
             rate: 0.75,
             min_rows: 48,
         },
+        l1_leaf: 0.0,
+        colsample_bytree: 1.0,
+        learning_rate_decay: 0.0,
+        validation_fraction: None,
+        early_stopping_rounds: 50,
+        leaf_refine_steps: 0,
+        leaf_refine_backtracks: 4,
         hist_precision: HistPrecision::QuantizedI32,
         boosters,
     }

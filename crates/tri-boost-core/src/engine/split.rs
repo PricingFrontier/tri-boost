@@ -34,6 +34,8 @@ fn internal(what: &'static str) -> impl Fn() -> PbError {
 pub(crate) struct GrowConfig<'a> {
     /// L2 leaf regularizer `λ` (in `w* = −G/(H+λ)` and the gain).
     pub lambda: f64,
+    /// L1 leaf regularizer used to soft-threshold aggregated gradients.
+    pub l1_leaf: f64,
     /// Learning rate applied to each leaf value.
     pub lr: f64,
     /// `gamma` floor: a level terminates if the best gain is `<= min_split_gain`.
@@ -176,6 +178,7 @@ pub(crate) struct MonotoneScan<'a> {
     chosen: &'a [Option<MonoSign>],
     candidate_axis_signs: &'a [Option<MonoSign>],
     lr: f64,
+    l1_leaf: f64,
     max_delta_step: Option<f64>,
 }
 
@@ -189,20 +192,43 @@ pub(crate) struct RankingContext<'a> {
     table_penalties: Option<&'a [f64]>,
 }
 
-/// The Newton term `G²/(H+λ)`, guarded so a non-positive denominator contributes 0
-/// rather than `inf`/`NaN` (with `λ>0` and `H≥0` it never binds, but stays safe for
-/// general losses).
-fn newton_term(g: f64, h: f64, lambda: f64) -> f64 {
+/// Twice the constrained quadratic improvement for a leaf.
+///
+/// Without L1/clamping this is `G²/(H+λ)`, matching the usual split-gain algebra.
+/// When `l1_leaf` or `max_delta_step` is active, the split scan must rank the gain
+/// the emitted leaf value can actually realize rather than the unconstrained Newton
+/// optimum.
+fn newton_term(g: f64, h: f64, lambda: f64, l1_leaf: f64, max_delta_step: Option<f64>) -> f64 {
     let denom = h + lambda;
     if denom > 0.0 {
-        g * g / denom
+        let g = soft_threshold(g, l1_leaf);
+        let w = match max_delta_step {
+            Some(d) => (-g / denom).clamp(-d, d),
+            None => -g / denom,
+        };
+        (-2.0 * g * w - denom * w * w).max(0.0)
     } else {
         0.0
     }
 }
 
-fn newton_leaf(g: f64, h: f64, lambda: f64, lr: f64, max_delta_step: Option<f64>) -> f64 {
+fn soft_threshold(g: f64, l1_leaf: f64) -> f64 {
+    if l1_leaf <= 0.0 {
+        return g;
+    }
+    g.signum() * (g.abs() - l1_leaf).max(0.0)
+}
+
+fn newton_leaf(
+    g: f64,
+    h: f64,
+    lambda: f64,
+    l1_leaf: f64,
+    lr: f64,
+    max_delta_step: Option<f64>,
+) -> f64 {
     let denom = h + lambda;
+    let g = soft_threshold(g, l1_leaf);
     let w = if denom > 0.0 { -g / denom } else { 0.0 };
     let w = match max_delta_step {
         Some(d) => w.clamp(-d, d),
@@ -337,11 +363,14 @@ pub(crate) fn clamp_monotone(
 ///
 /// # Errors
 /// [`PbError::Internal`] on an out-of-range histogram offset (a build/shape bug).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn best_level_split(
     hist: &Hist,
     axes: &[u32],
     n_data_bins: &[usize],
     lambda: f64,
+    l1_leaf: f64,
+    max_delta_step: Option<f64>,
     min_split_gain: f64,
     ranking: RankingContext<'_>,
     credibility: &CredibilityFloor,
@@ -418,6 +447,8 @@ pub(crate) fn best_level_split(
                     *total_g.get(l).unwrap_or(&0.0),
                     *total_h.get(l).unwrap_or(&0.0),
                     lambda,
+                    l1_leaf,
+                    max_delta_step,
                 )
             })
             .sum();
@@ -468,7 +499,8 @@ pub(crate) fn best_level_split(
                     };
                     let tg = *total_g.get(leaf).ok_or_else(internal("tg"))?;
                     let th = *total_h.get(leaf).ok_or_else(internal("th"))?;
-                    acc += newton_term(lg, lh, lambda) + newton_term(tg - lg, th - lh, lambda);
+                    acc += newton_term(lg, lh, lambda, l1_leaf, max_delta_step)
+                        + newton_term(tg - lg, th - lh, lambda, l1_leaf, max_delta_step);
                     if check_cred && credible {
                         let dlc = *data_l_c.get(leaf).ok_or_else(internal("dlc"))?;
                         let dlw = *data_l_w.get(leaf).ok_or_else(internal("dlw"))?;
@@ -529,11 +561,17 @@ pub(crate) fn best_level_split(
                         *values
                             .get_mut(low)
                             .ok_or_else(internal("monotone low value"))? =
-                            newton_leaf(lg, lh, lambda, scan.lr, scan.max_delta_step);
+                            newton_leaf(lg, lh, lambda, scan.l1_leaf, scan.lr, scan.max_delta_step);
                         *values
                             .get_mut(high)
-                            .ok_or_else(internal("monotone high value"))? =
-                            newton_leaf(tg - lg, th - lh, lambda, scan.lr, scan.max_delta_step);
+                            .ok_or_else(internal("monotone high value"))? = newton_leaf(
+                            tg - lg,
+                            th - lh,
+                            lambda,
+                            scan.l1_leaf,
+                            scan.lr,
+                            scan.max_delta_step,
+                        );
                     }
                     if !candidate_monotone_ok(&values, scan.level + 1, &signs)? {
                         continue;
@@ -581,12 +619,14 @@ pub(crate) fn best_level_split(
 ///
 /// # Errors
 /// [`PbError::Internal`] if a row's leaf id is out of range or an index escapes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn leaf_values(
     gh: &GradHess,
     rows: &[u32],
     leaf_of_row: &[u8],
     depth: usize,
     lambda: f64,
+    l1_leaf: f64,
     lr: f64,
     max_delta_step: Option<f64>,
 ) -> Result<[f32; 8], PbError> {
@@ -608,7 +648,7 @@ pub(crate) fn leaf_values(
     }
     let mut leaves = [0.0_f32; 8];
     for j in 0..n_leaves {
-        let gj = *g.get(j).ok_or_else(internal("g[j]"))?;
+        let gj = soft_threshold(*g.get(j).ok_or_else(internal("g[j]"))?, l1_leaf);
         let hj = *h.get(j).ok_or_else(internal("h[j]"))?;
         let denom = hj + lambda;
         let w = if denom > 0.0 { -gj / denom } else { 0.0 };
@@ -683,6 +723,7 @@ fn apply_path_smooth(
     leaf_count: &[u64; 8],
     depth: usize,
     lambda: f64,
+    l1_leaf: f64,
     lr: f64,
     max_delta_step: Option<f64>,
     path_smooth: f64,
@@ -714,7 +755,7 @@ fn apply_path_smooth(
             let v = if level == depth {
                 f64::from(*leaves.get(j).ok_or_else(internal("ps leaf v"))?)
             } else {
-                newton_leaf(g, h, lambda, lr, max_delta_step)
+                newton_leaf(g, h, lambda, l1_leaf, lr, max_delta_step)
             };
             let parent_s = if parent_is_virtual {
                 0.0
@@ -780,6 +821,7 @@ pub(crate) fn refit_tree_leaves(
         &leaf_of_row,
         usize::from(tree.depth),
         cfg.lambda,
+        cfg.l1_leaf,
         cfg.lr,
         cfg.max_delta_step,
     )?;
@@ -797,6 +839,7 @@ pub(crate) fn refit_tree_leaves(
             &lc,
             depth,
             cfg.lambda,
+            cfg.l1_leaf,
             cfg.lr,
             cfg.max_delta_step,
             f64::from(cfg.credibility.path_smooth),
@@ -895,6 +938,7 @@ pub(crate) fn grow_oblivious_tree(
             chosen: &split_signs,
             candidate_axis_signs: &candidate_axis_signs,
             lr: cfg.lr,
+            l1_leaf: cfg.l1_leaf,
             max_delta_step: cfg.max_delta_step,
         });
         let cand = match best_level_split(
@@ -902,6 +946,8 @@ pub(crate) fn grow_oblivious_tree(
             &admissible,
             &n_data_bins,
             cfg.lambda,
+            cfg.l1_leaf,
+            cfg.max_delta_step,
             cfg.min_split_gain,
             RankingContext {
                 monotone: monotone_scan,
@@ -955,6 +1001,7 @@ pub(crate) fn grow_oblivious_tree(
         &leaf_of_row,
         depth,
         cfg.lambda,
+        cfg.l1_leaf,
         cfg.lr,
         cfg.max_delta_step,
     )?;
@@ -972,6 +1019,7 @@ pub(crate) fn grow_oblivious_tree(
             &lc,
             depth,
             cfg.lambda,
+            cfg.l1_leaf,
             cfg.lr,
             cfg.max_delta_step,
             f64::from(cfg.credibility.path_smooth),
@@ -1050,6 +1098,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn l1_leaf_soft_thresholds_leaf_values_and_gain() {
+        let gh = gradhess(&[-0.5, 0.5], &[1.0, 1.0]);
+        let rows = [0u32, 1];
+        let leaf_of_row = [0u8, 1];
+        let no_l1 = leaf_values(&gh, &rows, &leaf_of_row, 1, 0.0, 0.0, 1.0, None).unwrap();
+        let l1 = leaf_values(&gh, &rows, &leaf_of_row, 1, 0.0, 1.0, 1.0, None).unwrap();
+        assert!(no_l1[0] > 0.0);
+        assert!(no_l1[1] < 0.0);
+        assert_eq!(l1[0], 0.0);
+        assert_eq!(l1[1], 0.0);
+
+        let mut hist = Hist::try_zeros(1, 1, 3).unwrap();
+        let left = hist.offset(0, 0, 1).unwrap();
+        hist.g[left] = -0.5;
+        hist.h[left] = 1.0;
+        hist.count[left] = 1;
+        let right = hist.offset(0, 0, 2).unwrap();
+        hist.g[right] = 0.5;
+        hist.h[right] = 1.0;
+        hist.count[right] = 1;
+        assert!(best_level_split(
+            &hist,
+            &[0],
+            &[2],
+            0.0,
+            0.0,
+            None,
+            0.0,
+            RankingContext::default(),
+            &CredibilityFloor::default(),
+        )
+        .unwrap()
+        .is_some());
+        assert!(best_level_split(
+            &hist,
+            &[0],
+            &[2],
+            0.0,
+            1.0,
+            None,
+            0.0,
+            RankingContext::default(),
+            &CredibilityFloor::default(),
+        )
+        .unwrap()
+        .is_none());
+    }
+
     /// Hand-built 1-leaf histogram (1 axis, 3 bins: missing + 2 data) with a non-zero
     /// missing mass. The Newton gain and the learned missing direction match the
     /// closed form computed by hand.
@@ -1072,6 +1169,8 @@ mod tests {
             &[0],
             &[2],
             1.0,
+            0.0,
+            None,
             0.0,
             RankingContext::default(),
             &CredibilityFloor::default(),
@@ -1113,6 +1212,8 @@ mod tests {
             &[0],
             &[2],
             1.0,
+            0.0,
+            None,
             0.0,
             RankingContext {
                 noise,
@@ -1160,6 +1261,8 @@ mod tests {
             &[2, 2],
             1.0,
             0.0,
+            None,
+            0.0,
             RankingContext::default(),
             &CredibilityFloor::default(),
         )
@@ -1174,6 +1277,8 @@ mod tests {
             &[2, 2],
             1.0,
             0.0,
+            None,
+            0.0,
             RankingContext {
                 table_penalties: Some(&[0.5, 1.0]),
                 ..RankingContext::default()
@@ -1184,6 +1289,54 @@ mod tests {
         .unwrap();
         assert_eq!(penalized.axis, 1);
         assert!((penalized.gain - 9.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn max_delta_step_is_reflected_in_split_gain() {
+        let mut hist = Hist::try_zeros(1, 2, 3).unwrap();
+        let set_axis = |hist: &mut Hist, axis: usize, g: f64, h: f64| {
+            let l = hist.offset(0, axis, 1).unwrap();
+            let r = hist.offset(0, axis, 2).unwrap();
+            hist.g[l] = -g;
+            hist.h[l] = h;
+            hist.count[l] = 1;
+            hist.g[r] = g;
+            hist.h[r] = h;
+            hist.count[r] = 1;
+        };
+        set_axis(&mut hist, 0, 100.0, 1.0);
+        set_axis(&mut hist, 1, 150.0, 1000.0);
+
+        let unclamped = best_level_split(
+            &hist,
+            &[0, 1],
+            &[2, 2],
+            0.0,
+            0.0,
+            None,
+            0.0,
+            RankingContext::default(),
+            &CredibilityFloor::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(unclamped.axis, 0);
+
+        let clamped = best_level_split(
+            &hist,
+            &[0, 1],
+            &[2, 2],
+            0.0,
+            0.0,
+            Some(0.1),
+            0.0,
+            RankingContext::default(),
+            &CredibilityFloor::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(clamped.axis, 1);
+        assert!((clamped.gain - 20.0).abs() < 1.0e-9);
     }
 
     #[test]
@@ -1207,6 +1360,8 @@ mod tests {
             &[0],
             &[2],
             1.0,
+            0.0,
+            None,
             1.0,
             RankingContext::default(),
             &CredibilityFloor::default()
@@ -1222,7 +1377,7 @@ mod tests {
         let gh = gradhess(&[1.0, 2.0, -4.0, -1.0], &[1.0, 1.0, 1.0, 1.0]);
         let rows = [0u32, 1, 2, 3];
         let leaf_of_row = [0u8, 0, 1, 1];
-        let leaves = leaf_values(&gh, &rows, &leaf_of_row, 1, 1.0, 0.1, None).unwrap();
+        let leaves = leaf_values(&gh, &rows, &leaf_of_row, 1, 1.0, 0.0, 0.1, None).unwrap();
         // w*_0 = -3/(2+1) = -1 ⇒ leaf 0.1·-1 = -0.1; w*_1 = 5/3 ⇒ leaf 0.16667.
         assert!((leaves[0] - (-0.1)).abs() < 1e-6);
         assert!((leaves[1] - (5.0 / 3.0 * 0.1) as f32).abs() < 1e-6);
@@ -1238,13 +1393,13 @@ mod tests {
         let gh = gradhess(&[-100.0], &[0.01]); // g=-100, h=0.01 ⇒ w* = 10000 uncapped
         let rows = [0u32];
         let leaf_of_row = [0u8];
-        let uncapped = leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 0.1, None).unwrap();
+        let uncapped = leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 0.0, 0.1, None).unwrap();
         assert!(
             uncapped[0] > 100.0,
             "uncapped leaf should be huge, got {}",
             uncapped[0]
         );
-        let capped = leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 0.1, Some(0.5)).unwrap();
+        let capped = leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 0.0, 0.1, Some(0.5)).unwrap();
         // |w*| clamped to 0.5 ⇒ leaf = 0.1·0.5 = 0.05.
         assert!(
             (capped[0] - 0.05).abs() < 1e-6,
@@ -1259,7 +1414,7 @@ mod tests {
         let rows = [0u32];
         let leaf_of_row = [0u8];
         assert!(matches!(
-            leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 1.0, None),
+            leaf_values(&gh, &rows, &leaf_of_row, 0, 0.0, 0.0, 1.0, None),
             Err(PbError::InvalidInput { .. })
         ));
     }
@@ -1308,6 +1463,7 @@ mod tests {
     fn cfg(lambda: f64, lr: f64, min_split_gain: f64, max_order: u8) -> GrowConfig<'static> {
         GrowConfig {
             lambda,
+            l1_leaf: 0.0,
             lr,
             min_split_gain,
             max_order,
@@ -1359,6 +1515,8 @@ mod tests {
                 &[2],
                 1.0,
                 0.0,
+                None,
+                0.0,
                 RankingContext::default(),
                 floor,
             )
@@ -1402,11 +1560,11 @@ mod tests {
         let base = [1.0_f32, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         // ps = 0 ⇒ exact no-op.
         let mut a = base;
-        apply_path_smooth(&mut a, &lg, &lh, &lc, 1, 0.0, 1.0, None, 0.0).unwrap();
+        apply_path_smooth(&mut a, &lg, &lh, &lc, 1, 0.0, 0.0, 1.0, None, 0.0).unwrap();
         assert_eq!(a, base);
         // ps = 2 ⇒ each leaf shrinks toward the root (0) by the factor n/(n+ps)=10/12.
         let mut s = base;
-        apply_path_smooth(&mut s, &lg, &lh, &lc, 1, 0.0, 1.0, None, 2.0).unwrap();
+        apply_path_smooth(&mut s, &lg, &lh, &lc, 1, 0.0, 0.0, 1.0, None, 2.0).unwrap();
         assert!((s[0] - 10.0 / 12.0).abs() < 1e-6);
         assert!((s[1] + 10.0 / 12.0).abs() < 1e-6);
     }
@@ -1688,6 +1846,8 @@ mod tests {
             &[0],
             &[2],
             1.0,
+            0.0,
+            None,
             0.0,
             RankingContext::default(),
             &CredibilityFloor::default(),

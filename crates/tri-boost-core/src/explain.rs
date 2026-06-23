@@ -2548,6 +2548,13 @@ mod tests {
             max_delta_step: None,
             sampling: Default::default(),
             hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             boosters: Default::default(),
         }
     }

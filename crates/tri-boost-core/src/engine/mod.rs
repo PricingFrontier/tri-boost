@@ -147,6 +147,63 @@ impl ObliviousTree {
     }
 }
 
+pub(crate) fn tree_split_columns<'a>(
+    tree: &ObliviousTree,
+    columns: &'a [Vec<u8>],
+) -> Result<Vec<&'a [u8]>, PbError> {
+    let mut out = Vec::with_capacity(tree.splits.len());
+    for split in &tree.splits {
+        out.push(
+            columns
+                .get(split.axis as usize)
+                .ok_or_else(|| PbError::Internal {
+                    what: "tree scorer: split axis out of range".into(),
+                })?
+                .as_slice(),
+        );
+    }
+    Ok(out)
+}
+
+pub(crate) fn tree_leaf_index_for_row_with_columns(
+    tree: &ObliviousTree,
+    columns: &[&[u8]],
+    row: usize,
+) -> Result<usize, PbError> {
+    if columns.len() != tree.splits.len() {
+        return Err(PbError::Internal {
+            what: "tree scorer: split column count mismatch".into(),
+        });
+    }
+    let mut idx = 0usize;
+    for (level, (split, col)) in tree.splits.iter().zip(columns).enumerate() {
+        let bin = *col.get(row).ok_or_else(|| PbError::Internal {
+            what: "tree scorer: row out of split column".into(),
+        })?;
+        idx |= usize::from(low_bit(bin, split.bin_le, split.missing_left)) << level;
+    }
+    if idx >= 8 {
+        return Err(PbError::Internal {
+            what: "tree scorer: leaf index escaped 0..8".into(),
+        });
+    }
+    Ok(idx)
+}
+
+pub(crate) fn tree_value_for_row_with_columns(
+    tree: &ObliviousTree,
+    columns: &[&[u8]],
+    row: usize,
+) -> Result<f32, PbError> {
+    let idx = tree_leaf_index_for_row_with_columns(tree, columns, row)?;
+    tree.leaves
+        .get(idx)
+        .copied()
+        .ok_or_else(|| PbError::Internal {
+            what: "tree scorer: leaf index escaped 0..8".into(),
+        })
+}
+
 /// The per-`(leaf, axis, bin)` gradient/hessian histogram accumulator (spec §06.3),
 /// struct-of-arrays in `[leaf][axis][bin]` row-major order with a **uniform `n_bins`
 /// stride** (the max grid bins over the built axes; shorter axes leave their high
@@ -579,15 +636,17 @@ impl Model {
                 });
             }
         }
-        let mut row = vec![0u8; self.grids.len()];
+        let tree_columns: Vec<Vec<&[u8]>> = self
+            .trees
+            .iter()
+            .map(|(_, tree)| tree_split_columns(tree, &x.data))
+            .collect::<Result<_, _>>()?;
         for r in 0..n_rows {
-            for (slot, col) in row.iter_mut().zip(&x.data) {
-                *slot = *col.get(r).ok_or_else(|| PbError::Internal {
-                    what: "validated binned column lost a row".into(),
-                })?;
-            }
             let off = offset.and_then(|o| o.get(r).copied()).unwrap_or(0.0);
-            let score = self.score_trees_row(&row, off)?;
+            let mut score = self.f0 + off;
+            for ((alpha, tree), columns) in self.trees.iter().zip(&tree_columns) {
+                score += *alpha * tree_value_for_row_with_columns(tree, columns, r)?;
+            }
             let dst = out.get_mut(r).ok_or_else(|| PbError::Internal {
                 what: "score_trees output row escaped buffer".into(),
             })?;
@@ -721,6 +780,8 @@ pub struct Config {
     pub learning_rate: f32,
     /// L2 leaf regularizer `λ` (in `w* = −G/(H+λ)` and the gain).
     pub lambda: f32,
+    /// L1 leaf regularizer applied by soft-thresholding aggregated gradients.
+    pub l1_leaf: f32,
     /// `gamma` floor: a level terminates if the best gain is `<= min_split_gain`.
     pub min_split_gain: f32,
     /// Leaf-stage `|w*|`-clamp (LightGBM `max_delta_step`, §05.6/§06.4). `None` falls
@@ -729,6 +790,19 @@ pub struct Config {
     pub max_delta_step: Option<f32>,
     /// Row sampler used for split search. [`Sampling::Full`] is the inert default.
     pub sampling: Sampling,
+    /// Per-tree axis subsampling rate. `1.0` scans every axis.
+    pub colsample_bytree: f32,
+    /// Deterministic decay for per-round learning rate:
+    /// `lr_t = learning_rate / (1 + learning_rate_decay * t)`.
+    pub learning_rate_decay: f32,
+    /// Optional deterministic internal validation fraction for early stopping.
+    pub validation_fraction: Option<f32>,
+    /// Patience in boosting rounds once `validation_fraction` is enabled.
+    pub early_stopping_rounds: u32,
+    /// Extra per-tree leaf Newton refinement steps after a structure is fixed.
+    pub leaf_refine_steps: u8,
+    /// Backtracking attempts per leaf-refinement step.
+    pub leaf_refine_backtracks: u8,
     /// Histogram precision used for split search.
     pub hist_precision: HistPrecision,
     /// Exactness-preserving predictiveness boosters (§09). Defaults are all inert.
@@ -741,9 +815,16 @@ impl Default for Config {
             n_trees: 1000,
             learning_rate: 0.05,
             lambda: 1.0,
+            l1_leaf: 0.0,
             min_split_gain: 0.0,
             max_delta_step: None,
             sampling: Sampling::Full,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
             hist_precision: HistPrecision::FullF64,
             boosters: crate::boosters::BoosterConfig::default(),
         }
@@ -775,6 +856,11 @@ impl Config {
                 what: format!("lambda must be finite and >= 0, got {}", self.lambda),
             });
         }
+        if !self.l1_leaf.is_finite() || self.l1_leaf < 0.0 {
+            return Err(PbError::InvalidConfig {
+                what: format!("l1_leaf must be finite and >= 0, got {}", self.l1_leaf),
+            });
+        }
         if !self.min_split_gain.is_finite() || self.min_split_gain < 0.0 {
             return Err(PbError::InvalidConfig {
                 what: format!(
@@ -804,6 +890,43 @@ impl Config {
                     });
                 }
             }
+        }
+        if !self.colsample_bytree.is_finite()
+            || self.colsample_bytree <= 0.0
+            || self.colsample_bytree > 1.0
+        {
+            return Err(PbError::InvalidConfig {
+                what: format!(
+                    "colsample_bytree must be finite and in (0, 1], got {}",
+                    self.colsample_bytree
+                ),
+            });
+        }
+        if !self.learning_rate_decay.is_finite() || self.learning_rate_decay < 0.0 {
+            return Err(PbError::InvalidConfig {
+                what: format!(
+                    "learning_rate_decay must be finite and >= 0, got {}",
+                    self.learning_rate_decay
+                ),
+            });
+        }
+        if let Some(frac) = self.validation_fraction {
+            if !frac.is_finite() || frac <= 0.0 || frac >= 1.0 {
+                return Err(PbError::InvalidConfig {
+                    what: format!("validation_fraction must be finite and in (0, 1), got {frac}"),
+                });
+            }
+            if self.early_stopping_rounds == 0 {
+                return Err(PbError::InvalidConfig {
+                    what: "early_stopping_rounds must be > 0 when validation_fraction is set"
+                        .into(),
+                });
+            }
+        }
+        if self.leaf_refine_steps > 0 && self.leaf_refine_backtracks == 0 {
+            return Err(PbError::InvalidConfig {
+                what: "leaf_refine_backtracks must be > 0 when leaf_refine_steps is enabled".into(),
+            });
         }
         self.boosters.validate()?;
         Ok(())
@@ -846,7 +969,7 @@ impl Booster {
     /// [`PbError::InvalidConfig`] on a bad config; [`PbError::ShapeMismatch`] on a
     /// length mismatch; plus any propagated [`Loss`]/binning/grow error.
     pub fn fit(&self, x: &BinnedMatrix, y: &[f32], spec: &FitSpec) -> Result<Model, PbError> {
-        boost::fit(&self.config, x, y, spec)
+        boost::fit(&self.config, x, y, spec, &CatEncoderStore::new())
     }
 
     /// Fit from the explicit training-matrix role and persist its frozen
@@ -866,8 +989,10 @@ impl Booster {
         spec: &FitSpec,
         cat_encoders: CatEncoderStore,
     ) -> Result<Model, PbError> {
-        let mut model = boost::fit(&self.config, &x.0, y, spec)?;
-        model.schema.cat_encoders = cat_encoders;
+        // Thread the encoders into the fit so every model built — including each OuterBag /
+        // GreedySelect member validated inside `soup_models` — carries them, not just the
+        // single-fit result (R-CATSERVE: the souped/member models also serve via these).
+        let model = boost::fit(&self.config, &x.0, y, spec, &cat_encoders)?;
         model.validate()?;
         Ok(model)
     }

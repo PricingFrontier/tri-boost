@@ -1,12 +1,11 @@
 //! The full-precision histogram engine (spec §06.3, milestone M1.3).
 //!
-//! v1 accumulates full-precision [`GradHess`] into `f64` [`Hist`] cells (the
-//! `i64`-quantized path is M5-QHIST, v1.5). The build is **feature-parallel**: each
-//! axis is accumulated on its own rayon task, sequentially over rows in a fixed
-//! order, into a disjoint region of the `[leaf][axis][bin]` tensor. So the result is
-//! a FIXED-ORDER fold — byte-identical regardless of thread count (the §1
-//! determinism `[GATE]`) — and memory-bounded (no per-row-chunk full-histogram
-//! duplication; that row-parallel variant is a §11 perf concern for narrow data).
+//! v1 accumulates full-precision [`GradHess`] into `f64` [`Hist`] cells. The build is
+//! **feature-parallel** and, for large row sets, **row-chunk parallel** within each
+//! axis: chunks accumulate sequentially, then reduce in deterministic chunk order into
+//! a disjoint region of the `[leaf][axis][bin]` tensor. So the result is a FIXED-ORDER
+//! fold — byte-identical regardless of thread count (the §1 determinism `[GATE]`) —
+//! while narrow/small data keeps the lower-overhead sequential axis path.
 //!
 //! The subtraction trick (`Hist_R = Hist_parent − Hist_L`) is integer-exact for
 //! `count`; for `g`/`h` it is bit-exact for well-conditioned gradients (verified to
@@ -26,6 +25,9 @@ use crate::engine::{GradScale, Hist, QuantGradHess};
 use crate::error::PbError;
 use crate::loss::GradHess;
 use rayon::prelude::*;
+
+const ROW_PAR_MIN_ROWS: usize = 32_768;
+const ROW_PAR_CHUNK_ROWS: usize = 8_192;
 
 /// Deterministic quantization re-seed coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +76,7 @@ fn offset3(
 /// (sampled) feature columns to build. The bin stride is uniform — the max grid
 /// `n_bins` over `axes` — so shorter-grid axes leave their high bins zeroed.
 ///
-/// Feature-parallel + sequential-within-axis ⇒ a fixed-order fold ⇒ thread-count
-/// independent.
+/// Feature-parallel + fixed-order row-chunk reduction ⇒ thread-count independent.
 ///
 /// # Errors
 /// [`PbError::Internal`] if any `axis`, row id, leaf id, or bin id is out of range
@@ -359,6 +360,43 @@ fn accumulate_axis(
     max_bins: usize,
     weight: &[f32],
 ) -> Result<AxisHist, PbError> {
+    if rows.len() < ROW_PAR_MIN_ROWS {
+        return accumulate_axis_sequential(
+            x,
+            gh,
+            rows,
+            leaf_of_row,
+            n_leaves,
+            axis,
+            max_bins,
+            weight,
+        );
+    }
+    let chunks: Result<Vec<AxisHist>, PbError> = rows
+        .par_chunks(ROW_PAR_CHUNK_ROWS)
+        .map(|chunk| {
+            accumulate_axis_sequential(x, gh, chunk, leaf_of_row, n_leaves, axis, max_bins, weight)
+        })
+        .collect();
+    let chunks = chunks?;
+    let mut out = AxisHist::try_zeros(n_leaves, max_bins)?;
+    for chunk in &chunks {
+        add_axis_hist(&mut out, chunk)?;
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_axis_sequential(
+    x: &BinnedMatrix,
+    gh: &GradHess,
+    rows: &[u32],
+    leaf_of_row: &[u8],
+    n_leaves: usize,
+    axis: u32,
+    max_bins: usize,
+    weight: &[f32],
+) -> Result<AxisHist, PbError> {
     let col = x
         .data
         .get(axis as usize)
@@ -389,8 +427,81 @@ fn accumulate_axis(
     Ok(out)
 }
 
+fn add_axis_hist(dst: &mut AxisHist, src: &AxisHist) -> Result<(), PbError> {
+    if dst.g.len() != src.g.len()
+        || dst.h.len() != src.h.len()
+        || dst.wsum.len() != src.wsum.len()
+        || dst.count.len() != src.count.len()
+    {
+        return Err(PbError::Internal {
+            what: "axis histogram chunk shape mismatch".into(),
+        });
+    }
+    for (d, s) in dst.g.iter_mut().zip(&src.g) {
+        *d += *s;
+    }
+    for (d, s) in dst.h.iter_mut().zip(&src.h) {
+        *d += *s;
+    }
+    for (d, s) in dst.wsum.iter_mut().zip(&src.wsum) {
+        *d += *s;
+    }
+    for (d, s) in dst.count.iter_mut().zip(&src.count) {
+        *d = d
+            .checked_add(*s)
+            .ok_or_else(oob("axis histogram chunk count overflow"))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn accumulate_axis_quantized(
+    x: &BinnedMatrix,
+    qgh: &QuantGradHess,
+    rows: &[u32],
+    leaf_of_row: &[u8],
+    n_leaves: usize,
+    axis: u32,
+    max_bins: usize,
+    weight: &[f32],
+) -> Result<AxisQHist, PbError> {
+    if rows.len() < ROW_PAR_MIN_ROWS {
+        return accumulate_axis_quantized_sequential(
+            x,
+            qgh,
+            rows,
+            leaf_of_row,
+            n_leaves,
+            axis,
+            max_bins,
+            weight,
+        );
+    }
+    let chunks: Result<Vec<AxisQHist>, PbError> = rows
+        .par_chunks(ROW_PAR_CHUNK_ROWS)
+        .map(|chunk| {
+            accumulate_axis_quantized_sequential(
+                x,
+                qgh,
+                chunk,
+                leaf_of_row,
+                n_leaves,
+                axis,
+                max_bins,
+                weight,
+            )
+        })
+        .collect();
+    let chunks = chunks?;
+    let mut out = AxisQHist::try_zeros(n_leaves, max_bins)?;
+    for chunk in &chunks {
+        add_axis_qhist(&mut out, chunk)?;
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_axis_quantized_sequential(
     x: &BinnedMatrix,
     qgh: &QuantGradHess,
     rows: &[u32],
@@ -436,6 +547,37 @@ fn accumulate_axis_quantized(
             .ok_or_else(oob("quant bin count overflow"))?;
     }
     Ok(out)
+}
+
+fn add_axis_qhist(dst: &mut AxisQHist, src: &AxisQHist) -> Result<(), PbError> {
+    if dst.g.len() != src.g.len()
+        || dst.h.len() != src.h.len()
+        || dst.wsum.len() != src.wsum.len()
+        || dst.count.len() != src.count.len()
+    {
+        return Err(PbError::Internal {
+            what: "axis quant histogram chunk shape mismatch".into(),
+        });
+    }
+    for (d, s) in dst.g.iter_mut().zip(&src.g) {
+        *d = d
+            .checked_add(*s)
+            .ok_or_else(oob("axis quant histogram chunk g overflow"))?;
+    }
+    for (d, s) in dst.h.iter_mut().zip(&src.h) {
+        *d = d
+            .checked_add(*s)
+            .ok_or_else(oob("axis quant histogram chunk h overflow"))?;
+    }
+    for (d, s) in dst.wsum.iter_mut().zip(&src.wsum) {
+        *d += *s;
+    }
+    for (d, s) in dst.count.iter_mut().zip(&src.count) {
+        *d = d
+            .checked_add(*s)
+            .ok_or_else(oob("axis quant histogram chunk count overflow"))?;
+    }
+    Ok(())
 }
 
 /// The subtraction trick (spec §06.3): `Hist_R = Hist_parent − Hist_L`, computed
@@ -620,6 +762,38 @@ mod tests {
         };
         assert_eq!(bits(&h1), bits(&h2));
         assert_eq!(bits(&h1), bits(&h8));
+    }
+
+    #[test]
+    fn row_parallel_histogram_is_byte_identical_across_thread_counts() {
+        let n = ROW_PAR_MIN_ROWS + 1024;
+        let c0: Vec<u8> = (0..n).map(|i| ((i % 13) + 1) as u8).collect();
+        let c1: Vec<u8> = (0..n).map(|i| ((i * 7 % 17) + 1) as u8).collect();
+        let x = matrix(vec![c0, c1], &[14, 18]);
+        let g: Vec<f32> = (0..n).map(|i| ((i % 19) as f32 - 9.0) * 0.125).collect();
+        let h: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32).collect();
+        let gh = gradhess(&g, &h);
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let leaf_of_row: Vec<u8> = (0..n).map(|i| (i % 4) as u8).collect();
+        let axes = [0u32, 1];
+        let run = |nt: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| build_hist(&x, &gh, &rows, &leaf_of_row, 4, &axes).unwrap())
+        };
+        let bits = |h: &Hist| -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u32>) {
+            (
+                h.g.iter().map(|v| v.to_bits()).collect(),
+                h.h.iter().map(|v| v.to_bits()).collect(),
+                h.wsum.iter().map(|v| v.to_bits()).collect(),
+                h.count.clone(),
+            )
+        };
+        let h1 = run(1);
+        assert_eq!(bits(&h1), bits(&run(2)));
+        assert_eq!(bits(&h1), bits(&run(8)));
     }
 
     #[test]
