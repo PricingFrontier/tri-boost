@@ -136,3 +136,43 @@ def test_negative_credibility_floor_is_rejected() -> None:
     x, y = regression_fixture()
     with pytest.raises(Exception):
         small_regressor(min_sum_hessian_in_leaf=-1.0).fit(x.astype(np.float32), y)
+
+
+def test_booster_knobs_round_trip_and_stay_exact() -> None:
+    # The §06/§09/§07 levers (ensemble, sampling, hist precision, refit, interaction order)
+    # are now reachable from Python; they survive get_params/clone and stay exactly
+    # decomposable (every booster is leaf-scalar / tree-alpha / intercept level).
+    x, y = regression_fixture()
+    x32 = x.astype(np.float32)
+    est = small_regressor(
+        n_bags=3,
+        subsample=0.8,
+        hist_precision="quantized",
+        ridge_refit_l2=0.5,
+        random_strength=0.1,
+        reanchor=True,
+        max_interaction_order=2,
+    )
+    params = est.get_params()
+    assert params["n_bags"] == 3
+    assert params["hist_precision"] == "quantized"
+    assert params["max_interaction_order"] == 2
+    assert clone(est).get_params()["subsample"] == 0.8
+
+    est.fit(x32, y)
+    assert json.loads(est.tables(x32, ref_measure="uniform"))["mode"] == "Exact"
+    assert est.predict(x32).shape == (x32.shape[0],)
+
+
+def test_outer_bag_is_thread_count_deterministic() -> None:
+    # Bagging folds convex weights into tree alphas — still byte-identical across n_jobs.
+    x, y = regression_fixture()
+    a = small_regressor(n_bags=4, n_jobs=1).fit(x.astype(np.float32), y).to_bytes()
+    b = small_regressor(n_bags=4, n_jobs=2).fit(x.astype(np.float32), y).to_bytes()
+    assert a == b
+
+
+def test_invalid_hist_precision_is_rejected() -> None:
+    x, y = regression_fixture()
+    with pytest.raises(Exception):
+        small_regressor(hist_precision="nonsense").fit(x.astype(np.float32), y)

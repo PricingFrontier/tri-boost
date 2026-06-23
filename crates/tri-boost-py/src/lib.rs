@@ -15,9 +15,10 @@ use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Arc;
+use tri_boost_core::boosters::{BoosterConfig, DartSpec, EnsembleSpec, NesterovSpec, RefitSpec};
 use tri_boost_core::constraints::{CredibilityFloor, InteractionPolicy, MonoSign, MonotoneMap};
 use tri_boost_core::data::{bin, bin_columns, BinConfig, BinnedMatrix};
-use tri_boost_core::engine::{Booster, Config, FitSpec, Model, Sampling};
+use tri_boost_core::engine::{Booster, Config, FitSpec, HistPrecision, Model, Sampling};
 use tri_boost_core::error::{Invariant, PbError};
 use tri_boost_core::explain::{RefMeasure, TableBank};
 use tri_boost_core::loss::{Gamma, Logistic, Loss, Poisson, SquaredError, Tweedie};
@@ -123,8 +124,35 @@ struct PyBooster {
     bin_config: BinConfig,
     objective: Objective,
     credibility: CredibilityFloor,
+    interaction: InteractionPolicy,
     seed: u64,
     n_jobs: Option<usize>,
+}
+
+/// Resolve the `hist_precision` kwarg into the core enum.
+fn parse_hist_precision(name: Option<&str>) -> Result<HistPrecision, PbError> {
+    match name.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("full") | Some("f64") | Some("fullf64") => Ok(HistPrecision::FullF64),
+        Some("quantized") | Some("qhist") | Some("i32") | Some("quantizedi32") => {
+            Ok(HistPrecision::QuantizedI32)
+        }
+        Some(other) => Err(PbError::InvalidConfig {
+            what: format!("hist_precision must be 'full' or 'quantized', got {other:?}"),
+        }),
+    }
+}
+
+/// Resolve the `subsample` kwarg into a row-sampling strategy (`None`/`1.0` ⇒ full rows;
+/// `0 < r < 1` ⇒ MVS at that rate, with `mvs_min_rows` as the floor).
+fn parse_sampling(subsample: Option<f32>, mvs_min_rows: u32) -> Sampling {
+    match subsample {
+        None => Sampling::Full,
+        Some(rate) if rate >= 1.0 => Sampling::Full,
+        Some(rate) => Sampling::Mvs {
+            rate,
+            min_rows: mvs_min_rows.max(1),
+        },
+    }
 }
 
 #[pymethods]
@@ -144,6 +172,17 @@ impl PyBooster {
         min_sum_hessian_in_leaf=0.0,
         min_weight_sum_in_leaf=0.0,
         path_smooth=0.0,
+        subsample=None,
+        mvs_min_rows=1,
+        hist_precision=None,
+        n_bags=0,
+        ridge_refit_l2=None,
+        ridge_refit_max_iter=5,
+        nesterov=false,
+        dart_drop_rate=None,
+        random_strength=0.0,
+        reanchor=false,
+        max_interaction_order=3,
         seed=0,
         n_jobs=None
     ))]
@@ -160,18 +199,61 @@ impl PyBooster {
         min_sum_hessian_in_leaf: f32,
         min_weight_sum_in_leaf: f32,
         path_smooth: f32,
+        subsample: Option<f32>,
+        mvs_min_rows: u32,
+        hist_precision: Option<String>,
+        n_bags: u16,
+        ridge_refit_l2: Option<f32>,
+        ridge_refit_max_iter: u8,
+        nesterov: bool,
+        dart_drop_rate: Option<f32>,
+        random_strength: f32,
+        reanchor: bool,
+        max_interaction_order: u8,
         seed: u64,
         n_jobs: Option<usize>,
     ) -> PyResult<Self> {
+        let ensemble = if n_bags == 0 {
+            EnsembleSpec::Off
+        } else {
+            EnsembleSpec::OuterBag { n_bags }
+        };
+        let refit_leaves = match ridge_refit_l2 {
+            None => RefitSpec::Off,
+            Some(l2) => RefitSpec::Ridge {
+                l2,
+                max_iter: ridge_refit_max_iter,
+                every_k_trees: None,
+            },
+        };
+        let nesterov = if nesterov {
+            NesterovSpec::Agbm {
+                momentum_correction: false,
+            }
+        } else {
+            NesterovSpec::Off
+        };
+        let dart = dart_drop_rate.map(|drop_rate| DartSpec {
+            drop_rate,
+            normalize: true,
+        });
+        let boosters = BoosterConfig {
+            refit_leaves,
+            nesterov,
+            ensemble,
+            dart,
+            random_strength,
+            reanchor,
+        };
         let config = Config {
             n_trees,
             learning_rate,
             lambda: lambda_,
             min_split_gain,
             max_delta_step,
-            sampling: Sampling::Full,
-            hist_precision: Default::default(),
-            boosters: Default::default(),
+            sampling: parse_sampling(subsample, mvs_min_rows),
+            hist_precision: parse_hist_precision(hist_precision.as_deref()).map_err(py_err)?,
+            boosters,
         };
         config.validate().map_err(py_err)?;
         let bin_config = BinConfig {
@@ -186,6 +268,10 @@ impl PyBooster {
             path_smooth,
         };
         credibility.validate().map_err(py_err)?;
+        let interaction = InteractionPolicy {
+            max_order: max_interaction_order,
+            ..InteractionPolicy::default()
+        };
         let objective = Objective::parse(objective, tweedie_rho).map_err(py_err)?;
         if matches!(n_jobs, Some(0)) {
             return Err(py_err(PbError::InvalidConfig {
@@ -196,6 +282,7 @@ impl PyBooster {
             config,
             bin_config,
             objective,
+            interaction,
             credibility,
             seed,
             n_jobs,
@@ -487,7 +574,7 @@ fn fit_owned(
             weight: weight.as_deref(),
             exposure: exposure.as_deref(),
             monotone: monotone_map.clone(),
-            interaction: InteractionPolicy::default(),
+            interaction: state.interaction.clone(),
             credibility: state.credibility,
             seed: state.seed,
         };
