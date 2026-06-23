@@ -418,7 +418,13 @@ impl TableBank {
                 sobol: *sobol.get(&table.u).unwrap_or(&0.0),
             });
         }
-        tables.sort_by(|a, b| b.sobol.total_cmp(&a.sobol));
+        // Sobol-descending, with the feature set as an explicit secondary key so the
+        // export order is total and stable regardless of the input table order.
+        tables.sort_by(|a, b| {
+            b.sobol
+                .total_cmp(&a.sobol)
+                .then_with(|| a.feature_set.cmp(&b.feature_set))
+        });
         Ok(RatingExport {
             format_version: FORMAT_VERSION,
             schema_version: SCHEMA_VERSION,

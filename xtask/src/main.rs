@@ -1889,6 +1889,60 @@ mod accuracy_tests {
     }
 
     #[test]
+    fn serialized_field_gates_catch_forbidden_fields_and_pass_clean_types() {
+        // A Serialize-deriving struct with a HashMap field is flagged.
+        let dirty_map = [SourceFile {
+            path: PathBuf::from("crates/tri-boost-core/src/x.rs"),
+            lines: vec![
+                "#[derive(Serialize, Deserialize)]".to_owned(),
+                "pub struct Bad {".to_owned(),
+                "    pub m: HashMap<u32, u32>,".to_owned(),
+                "}".to_owned(),
+            ],
+        }];
+        assert_eq!(check_no_hashmap_serialized(&dirty_map).len(), 1);
+
+        // A `usize` field on a serialized struct is flagged.
+        let dirty_usize = [SourceFile {
+            path: PathBuf::from("x.rs"),
+            lines: vec![
+                "#[derive(Serialize)]".to_owned(),
+                "struct B {".to_owned(),
+                "    pub n: usize,".to_owned(),
+                "}".to_owned(),
+            ],
+        }];
+        assert_eq!(check_no_usize_serialized(&dirty_usize).len(), 1);
+
+        // A clean serialized struct (BTreeMap + fixed-width) is NOT flagged.
+        let clean = [SourceFile {
+            path: PathBuf::from("x.rs"),
+            lines: vec![
+                "#[derive(Serialize, Deserialize)]".to_owned(),
+                "pub struct Good {".to_owned(),
+                "    pub m: BTreeMap<u32, u32>,".to_owned(),
+                "    pub n: u64,".to_owned(),
+                "}".to_owned(),
+            ],
+        }];
+        assert!(check_no_hashmap_serialized(&clean).is_empty());
+        assert!(check_no_usize_serialized(&clean).is_empty());
+
+        // A NON-serialized struct with a HashMap is out of scope (gate is derive-scoped).
+        let non_serialized = [SourceFile {
+            path: PathBuf::from("x.rs"),
+            lines: vec![
+                "pub struct Scratch {".to_owned(),
+                "    pub m: HashMap<u32, u32>,".to_owned(),
+                "    pub n: usize,".to_owned(),
+                "}".to_owned(),
+            ],
+        }];
+        assert!(check_no_hashmap_serialized(&non_serialized).is_empty());
+        assert!(check_no_usize_serialized(&non_serialized).is_empty());
+    }
+
+    #[test]
     fn docs_gate_requires_release_recipes() {
         let root = env::temp_dir().join(format!("tri-boost-docs-gate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);

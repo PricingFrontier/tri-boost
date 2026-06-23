@@ -1955,7 +1955,9 @@ impl TableBank {
                 (t.u.clone(), s)
             })
             .collect();
-        out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // Sobol-descending with the feature set as an explicit secondary key, so the
+        // ranking is total and stable regardless of table insertion order.
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
     }
 
