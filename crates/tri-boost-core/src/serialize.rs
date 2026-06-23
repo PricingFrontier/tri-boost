@@ -115,6 +115,39 @@ pub fn decode_doc_json(s: &str) -> Result<ModelDoc, PbError> {
     Ok(doc)
 }
 
+/// Migrate a JSON [`ModelDoc`] value from `from_format_version` to the current model.
+///
+/// There are no historical versions before [`FORMAT_VERSION`] yet, so the only
+/// accepted migration today is the identity migration. The explicit facade is still
+/// useful: newer documents fail closed before deserialization details leak, and future
+/// version shims have a single public entry point.
+///
+/// # Errors
+/// [`PbError::Serialization`] if `from_format_version` is newer than this build, has
+/// no registered migration path, disagrees with the document's own version, or if the
+/// migrated model fails validation.
+pub fn migrate(value: serde_json::Value, from_format_version: u32) -> Result<Model, PbError> {
+    if from_format_version > FORMAT_VERSION {
+        return Err(PbError::Serialization(format!(
+            "cannot migrate future format_version {from_format_version}; this build supports {FORMAT_VERSION}"
+        )));
+    }
+    if from_format_version != FORMAT_VERSION {
+        return Err(PbError::Serialization(format!(
+            "no migration path registered from format_version {from_format_version} to {FORMAT_VERSION}"
+        )));
+    }
+    let doc: ModelDoc = serde_json::from_value(value).map_err(serialization_error)?;
+    if doc.format_version != from_format_version {
+        return Err(PbError::Serialization(format!(
+            "document format_version {} disagrees with requested migration source {from_format_version}",
+            doc.format_version
+        )));
+    }
+    validate_doc(&doc)?;
+    Ok(doc.model)
+}
+
 /// Encode a bare [`Model`] (wrapped in a current-version [`ModelDoc`]) to binary.
 ///
 /// # Errors
@@ -400,6 +433,43 @@ mod tests {
     }
 
     #[test]
+    fn migrate_identity_loads_current_version_and_revalidates() {
+        let doc = ModelDoc::new(crate::explain::fixture_model());
+        let value = serde_json::to_value(&doc).unwrap();
+        assert_eq!(migrate(value, FORMAT_VERSION).unwrap(), doc.model);
+
+        let value = serde_json::to_value(&doc).unwrap();
+        assert!(matches!(
+            migrate(value, FORMAT_VERSION + 1),
+            Err(PbError::Serialization(_))
+        ));
+
+        let mut mismatched = serde_json::to_value(&doc).unwrap();
+        mismatched["format_version"] = serde_json::json!(FORMAT_VERSION + 1);
+        assert!(matches!(
+            migrate(mismatched, FORMAT_VERSION),
+            Err(PbError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn schema_metadata_round_trips_through_json_and_bincode() {
+        let mut model = crate::explain::fixture_model();
+        model.schema.feature_names = vec!["territory".into(), "age_band".into()];
+        model.schema.class_labels = Some(vec!["low".into(), "high".into()]);
+
+        let json = model.to_json().unwrap();
+        let from_json = Model::from_json(&json).unwrap();
+        assert_eq!(from_json.schema.feature_names, model.schema.feature_names);
+        assert_eq!(from_json.schema.class_labels, model.schema.class_labels);
+
+        let bytes = model.to_bincode().unwrap();
+        let from_bytes = Model::from_bincode(&bytes).unwrap();
+        assert_eq!(from_bytes.schema.feature_names, model.schema.feature_names);
+        assert_eq!(from_bytes.schema.class_labels, model.schema.class_labels);
+    }
+
+    #[test]
     fn bumped_format_version_is_rejected() {
         let mut doc = ModelDoc::new(crate::explain::fixture_model());
         doc.format_version = FORMAT_VERSION + 1;
@@ -431,6 +501,14 @@ mod tests {
         doc.model.trees[0].1.splits[0].axis = 99;
         let bytes = encode_doc(&doc).unwrap();
         assert!(decode_doc(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_revalidates_schema_lengths() {
+        let mut doc = ModelDoc::new(crate::explain::fixture_model());
+        doc.model.schema.feature_kinds.pop();
+        let json = encode_doc_json(&doc).unwrap();
+        assert!(decode_doc_json(&json).is_err());
     }
 
     #[test]

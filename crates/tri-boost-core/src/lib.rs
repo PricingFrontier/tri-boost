@@ -76,8 +76,8 @@ pub use boosters::{
 
 pub use serialize::{
     decode_doc, decode_doc_json, decode_model, decode_model_json, encode_doc, encode_doc_json,
-    encode_model, encode_model_json, AxisExport, ModelDoc, RatingBasis, RatingExport, RatingTable,
-    FORMAT_VERSION, SCHEMA_VERSION,
+    encode_model, encode_model_json, migrate, AxisExport, ModelDoc, RatingBasis, RatingExport,
+    RatingTable, FORMAT_VERSION, SCHEMA_VERSION,
 };
 
 pub use scoring::{PackedTree, ScoringBank, TableScoringBank};
