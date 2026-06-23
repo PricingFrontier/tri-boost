@@ -226,6 +226,9 @@ pub struct RatingTable {
     pub relativities: Option<Vec<f64>>,
     /// Per-cell support counts, display-only.
     pub support: Vec<f64>,
+    /// Optional per-cell standard-error band, display-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_band: Option<Vec<f64>>,
     /// Cached table variance.
     pub variance: f64,
     /// Sobol share under the bank's reference measure.
@@ -338,6 +341,10 @@ impl TableBank {
                 values: values.values().to_vec(),
                 relativities,
                 support: table.support.values().to_vec(),
+                se_band: table
+                    .se_band
+                    .as_ref()
+                    .map(|band| band.per_cell.values().to_vec()),
                 variance: table.variance,
                 sobol: *sobol.get(&table.u).unwrap_or(&0.0),
             });

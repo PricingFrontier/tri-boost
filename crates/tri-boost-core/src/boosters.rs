@@ -8,7 +8,9 @@
 
 use crate::data::BorderGrid;
 use crate::error::PbError;
-use crate::explain::{purify_raw_effects, FeatureSet, RawEffect, RefMeasure, TableBank, Tensor};
+use crate::explain::{
+    purify_raw_effects, FeatureSet, RawEffect, RefMeasure, SeBand, TableBank, Tensor,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 const WEIGHT_SUM_TOL: f64 = 1.0e-6;
@@ -588,6 +590,98 @@ fn collect_supports(members: &[(f32, TableBank)]) -> BTreeSet<FeatureSet> {
     supports
 }
 
+fn mapped_raw_effects(
+    bank: &TableBank,
+    union_grids: &[BorderGrid],
+    scale: f64,
+) -> Result<Vec<RawEffect>, PbError> {
+    let mut out = Vec::with_capacity(bank.tables.len());
+    for table in &bank.tables {
+        let extents = table_extents(union_grids, &table.u)?;
+        let mut values = Tensor::try_zeros(extents.clone())?;
+        let mut support = Tensor::try_zeros(extents.clone())?;
+        walk_extents(&extents, |target_coord| {
+            let src = source_coord(union_grids, &bank.merged_grids, &table.u, target_coord)?;
+            let value = table.values.at(&src).ok_or_else(|| PbError::Internal {
+                what: "member value coordinate out of range".into(),
+            })?;
+            let count = table.support.at(&src).ok_or_else(|| PbError::Internal {
+                what: "member support coordinate out of range".into(),
+            })?;
+            values.add(target_coord, scale * value)?;
+            support.add(target_coord, scale * count)?;
+            Ok(())
+        })?;
+        out.push(RawEffect {
+            u: table.u.clone(),
+            values,
+            support,
+        });
+    }
+    Ok(out)
+}
+
+fn table_value(bank: &TableBank, u: &FeatureSet, coord: &[usize]) -> Result<f64, PbError> {
+    let Some(table) = bank.tables.iter().find(|table| &table.u == u) else {
+        return Ok(0.0);
+    };
+    table.values.at(coord).ok_or_else(|| PbError::Internal {
+        what: "SE-band coordinate out of range".into(),
+    })
+}
+
+fn attach_se_bands(
+    bank: &mut TableBank,
+    members: &[(f32, TableBank)],
+    union_grids: &[BorderGrid],
+    w: &RefMeasure,
+) -> Result<(), PbError> {
+    let positive: Vec<(f64, &TableBank)> = members
+        .iter()
+        .filter_map(|(alpha, member)| {
+            if *alpha > 0.0 {
+                Some((f64::from(*alpha), member))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if positive.len() < 2 {
+        return Ok(());
+    }
+    let mut projected = Vec::with_capacity(positive.len());
+    for (alpha, member) in &positive {
+        let effects = mapped_raw_effects(member, union_grids, 1.0)?;
+        let member_bank = purify_raw_effects(member.f0, union_grids.to_vec(), w.clone(), effects)?;
+        projected.push((*alpha, member_bank));
+    }
+    let sum_alpha_sq: f64 = projected.iter().map(|(alpha, _)| alpha * alpha).sum();
+    let denom = 1.0 - sum_alpha_sq;
+    if denom <= 0.0 {
+        return Ok(());
+    }
+    for table in &mut bank.tables {
+        let extents = table.values.shape();
+        let mut band = Tensor::try_zeros(extents.clone())?;
+        walk_extents(&extents, |coord| {
+            let mean = table.values.at(coord).ok_or_else(|| PbError::Internal {
+                what: "SE-band mean coordinate out of range".into(),
+            })?;
+            let mut ss = 0.0_f64;
+            for (alpha, member_bank) in &projected {
+                let value = table_value(member_bank, &table.u, coord)?;
+                let delta = value - mean;
+                ss += alpha * delta * delta;
+            }
+            let sample_var = (ss / denom).max(0.0);
+            let se = sample_var.sqrt() * sum_alpha_sq.sqrt();
+            band.set(coord, se)
+        })?;
+        table.se_band = Some(SeBand { per_cell: band });
+    }
+    Ok(())
+}
+
 /// Average exact table banks on their lossless union grid (§09.5).
 ///
 /// The operation is intentionally narrow: all member banks must already be purified
@@ -716,7 +810,9 @@ pub fn average_banks(members: &[(f32, TableBank)], w: &RefMeasure) -> Result<Tab
             support: effect.support,
         })
         .collect();
-    purify_raw_effects(f0, union_grids, w.clone(), raw_effects)
+    let mut bank = purify_raw_effects(f0, union_grids.clone(), w.clone(), raw_effects)?;
+    attach_se_bands(&mut bank, members, &union_grids, w)?;
+    Ok(bank)
 }
 
 #[cfg(test)]
@@ -780,6 +876,13 @@ mod tests {
             }
         }
         assert_eq!(avg.reference_measure(), &RefMeasure::Uniform);
+        for table in &avg.tables {
+            let band = table
+                .se_band
+                .as_ref()
+                .expect("averaged banks carry SE bands");
+            assert!(band.per_cell.values().iter().all(|se| se.abs() < 1.0e-12));
+        }
     }
 
     #[test]
@@ -889,5 +992,6 @@ mod tests {
         let main0 = table(&avg, &[0]);
         let mean0: f64 = main0.values.values().iter().sum::<f64>() / main0.values.len() as f64;
         assert!(mean0.abs() < 1.0e-10);
+        assert!(main0.se_band.is_some());
     }
 }

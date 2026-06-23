@@ -67,7 +67,7 @@ pub use constraints::{
 
 pub use explain::{
     assert_exact_decomposition, check_feature_budget, AxisId, EffectTable, ExactTol, FeatureSet,
-    OverflowPolicy, PurifyMode, RefMeasure, TableBank, TableBudget, Tensor,
+    OverflowPolicy, PurifyMode, RefMeasure, SeBand, TableBank, TableBudget, Tensor,
 };
 
 pub use boosters::{

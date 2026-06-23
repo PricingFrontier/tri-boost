@@ -262,9 +262,17 @@ impl FeatureSet {
     }
 }
 
+/// Per-cell standard-error bands for bagged/averaged rating-table displays (§09.5).
+/// This is display-only metadata: invariant checks and inference never read it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeBand {
+    /// Per-cell standard error, parallel to [`EffectTable::values`].
+    pub per_cell: Tensor,
+}
+
 /// One purified effect tensor for feature set `u`, on the merged grid (spec §2.7).
-/// `support` is per-cell effective training-row count (display metadata) — excluded
-/// from the five invariant checks and from inference (scoring reads `values` only).
+/// `support` and `se_band` are display metadata — excluded from the five invariant
+/// checks and from inference (scoring reads `values` only).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectTable {
     /// The raw feature set this effect is over.
@@ -275,6 +283,9 @@ pub struct EffectTable {
     pub values: Tensor,
     /// Per-cell training-row count (display-only; same extents as `values`).
     pub support: Tensor,
+    /// Optional per-cell standard-error band, display-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_band: Option<SeBand>,
     /// `w`-weighted variance of this effect, `σ²(f_u)`.
     pub variance: f64,
 }
@@ -1077,6 +1088,7 @@ fn purify(
             axes,
             values,
             support,
+            se_band: None,
             variance,
         });
     }
