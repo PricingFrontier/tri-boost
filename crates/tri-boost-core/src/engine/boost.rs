@@ -2309,7 +2309,9 @@ fn refine_tree_leaves_after_grow(
     }
     let columns = tree_split_columns(tree, &x.data)?;
     let n_leaves = 1usize << usize::from(tree.depth);
-    let memberships = tree_memberships_for_rows(tree, &columns, rows, n_leaves)?;
+    let memberships = prof::timed("refine.members", || {
+        tree_memberships_for_rows(tree, &columns, rows, n_leaves)
+    })?;
     // The line search reads y/weight and the base score ONLY at `rows`, and only the 8 leaf
     // VALUES change per trial. Gather those three into DENSE per-tree buffers ONCE (constant
     // across every step + backtrack), so each trial is a single contiguous fill + the
@@ -2327,7 +2329,10 @@ fn refine_tree_leaves_after_grow(
     // `apply_membership_leaves`'s output over `rows`, so `deviance` matches the old path exactly.
     let mut trial_raw_sub = base_sub.clone();
     fill_leaf_raw_contiguous(&mut trial_raw_sub, &base_sub, &memberships, &tree.leaves)?;
-    let mut best_deviance = f64::from(loss.deviance(&y_sub, &trial_raw_sub, &w_sub)?);
+    let init_dev = prof::timed("refine.init_dev", || {
+        loss.deviance(&y_sub, &trial_raw_sub, &w_sub)
+    })?;
+    let mut best_deviance = f64::from(init_dev);
     let mut gh = GradHess::default();
 
     for _ in 0..config.leaf_refine_steps {
