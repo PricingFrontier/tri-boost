@@ -38,7 +38,7 @@ ROI-ordered work queue; each is a genuine generalizing technique a rival uses th
 | 2 | Histogram subtraction (parent−child), QuantizedI32-only | LightGBM | G5 | M | safe | queued |
 | 3 | Integer-space quantized hist scan (unlocks #2) + QHIST default | LightGBM | G5 | S | safe | queued |
 | 4 | Cyclic/round-robin per-feature boosting | EBM | G1 | L | safe | ❌ REJECTED (measured worse) |
-| 5 | Automatic categorical CTR combination axes | CatBoost | G3+G2 | L | conditional | queued |
+| 5 | Automatic categorical CTR combination axes | CatBoost | G3+G2 | L | conditional | ❌ REJECTED (breaks G0 + doesn't generalize) |
 | 6 | FAST pairwise interaction detection (populate InteractionPolicy.groups) | EBM | G1 | L | safe | queued |
 | 7 | Hessian-weighted quantile bin borders | XGBoost | G2 | M | safe | queued |
 
@@ -70,5 +70,16 @@ its bagging + tiny-lr shape smoothing, NOT the cyclic schedule. **Reverted** (no
 Corollary: the "compose cyclic with bagging/interactions = EBM recipe" plan (#5/#6 dependency on #4) is
 weakened — if pursuing G1 mains later, test BAGGING on greedy mains, not cyclic.
 
+### #5 Categorical CTR combinations (CatBoost) — ❌ REJECTED (2026-06-25, prototype only, no code shipped)
+Python prototype (pairwise-concatenated tuple columns as ordinary TS axes). TWO disqualifiers:
+1. **Breaks the decomposition rule.** A combo `a__b` is a 2-way original interaction smuggled in as a
+   1-way axis, so the model is only ≤3rd-order in COMBO space — in ORIGINAL features, a combo inside a
+   2-/3-way table is an order-4–6 effect presented as ≤3-way. Mechanically the I2 gates pass (combos are
+   ordinary axes), but the ≤3rd-order-in-your-features guarantee (the product) is violated.
+2. **Doesn't even generalize.** All-36-pairs amazon +1.63%; top-8-cats (28 combos): amazon +0.63%,
+   **kick −0.74%**, allstate +0.08%. Helps one dataset, hurts another — dataset-dependent, not a technique.
+Decision: do NOT ship. Pursue the G0-CLEAN categorical technique instead → #1 (per-split gradient re-sort:
+sharpens single-categorical splits, no new features, no order inflation).
+
 ## Implemented techniques (committed wins)
-_(none yet)_
+_(none yet — implementing #1)_
