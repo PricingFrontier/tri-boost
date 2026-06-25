@@ -171,3 +171,10 @@ bound, not compute-bound — 4 threads can't beat one memory bus, and rayon coor
 indirection add net overhead. Would help compute-bound losses (logistic/poisson `exp`/`sigmoid`) on huge
 data, but regresses the common SE case and the benchmark can't validate the log-link gain. Reverted.
 Lesson: only parallelize COMPUTE-bound per-row work, not memory-bound.
+
+### ✅ WIN #2 — Eliminate leaf-refine's duplicate tree-walk [G5]
+Leaf-refine walked the tree TWICE per tree: once for `tree_memberships_for_rows`, again for the initial raw
+(`raw_with_tree_leaves`). The second is derivable from the first — the initial raw is `base + leaf[membership]`
+(reuse `apply_membership_leaves`). Removed the second walk; `raw_with_tree_leaves` is now `#[cfg(test)]` (the
+equality test's reference). BYTE-IDENTICAL (diamonds 0.08896). Diamonds wall 24.7s → **23.9s**. Generalizes
+to every leaf_refine>0 fit. Cumulative with WIN #1: **29.6s → 23.9s (~19%)** on diamonds.

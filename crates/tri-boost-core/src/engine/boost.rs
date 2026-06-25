@@ -2304,7 +2304,10 @@ fn refine_tree_leaves_after_grow(
     let n_leaves = 1usize << usize::from(tree.depth);
     let eval_rows: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
     let memberships = tree_memberships_for_rows(tree, &columns, rows, n_leaves)?;
-    let mut raw = raw_with_tree_leaves(base_raw, tree, &columns, &tree.leaves)?;
+    // Derive the initial raw from the memberships just computed — no SECOND tree walk. `rows` get
+    // base + leaf; entries outside `rows` keep base_raw (never read: deviance/grad aggregate on `rows`).
+    let mut raw = base_raw.to_vec();
+    apply_membership_leaves(&mut raw, base_raw, rows, &memberships, &tree.leaves)?;
     let mut best_deviance = deviance_for_rows(loss, y, &raw, weight, &eval_rows)?;
     let mut gh = GradHess::default();
     // Reused scratch for the per-trial raw (membership-filled, no tree re-walk). Cloned once so
@@ -2463,6 +2466,10 @@ fn tree_memberships_for_rows(
     Ok(out)
 }
 
+/// Tree-walk reconstruction of `raw = base + leaf(row)`. Superseded in production by the
+/// membership-based [`apply_membership_leaves`] (no per-row walk); retained as the independent
+/// reference the equality test checks the fast path against.
+#[cfg(test)]
 fn raw_with_tree_leaves(
     base_raw: &[f32],
     tree: &ObliviousTree,
@@ -2489,7 +2496,7 @@ fn raw_with_tree_leaves(
 /// Overwrite `out[rows[i]] = base_raw[rows[i]] + leaves[memberships[i]]` using the precomputed leaf
 /// memberships — NO per-row tree re-walk. A tree's contribution to `raw` is exactly its leaf value, so
 /// for the leaf-refinement line search (whose only per-trial change is the 8 leaf VALUES) this produces
-/// values bit-identical to [`raw_with_tree_leaves`] on `rows`, far cheaper. Entries outside `rows` are
+/// values bit-identical to a full tree-walk reconstruction on `rows`, far cheaper. Entries outside `rows` are
 /// left untouched (they are never read: the line search evaluates deviance only on `rows`).
 fn apply_membership_leaves(
     out: &mut [f32],
