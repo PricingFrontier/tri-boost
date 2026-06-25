@@ -205,3 +205,27 @@ ACCEPT. Keeps the contiguous fold the refuted attempt lost. BYTE-IDENTICAL (`fil
   **1.530s (−41%)**, wall 12.5s → 11.9s; kick 13.485s → **12.107s (−10%)**, wall 43.2s → 41.9s. (Diamonds
   wins bigger: SE deviance is cheap so gather/alloc was a larger share; kick's logistic deviance is
   compute-bound, so the kept SIMD fold dominates.) Generalizes to every leaf_refine>0 fit.
+
+### ⚪ Subset-only refine refactor (drop full-raw buffer) — NEUTRAL, not committed (2026-06-25)
+Refactored the whole leaf-refine pass onto the dense subset buffers (grad_hess over `*_sub`, contiguous
+aggregate, no full-length `raw` materialization, no `base_raw.to_vec()` per tree). BYTE-IDENTICAL (scores
+unchanged). But measured NEUTRAL (within run noise): the o3 config has no row subsampling, so `rows == n`
+and the subset grad_hess has the same row count, while the "scattered" aggregate over `gh[rows[i]]` was
+already sequential (rows are sorted). It also narrowed grad_hess's finite-checks to in-sample rows (an
+error-path change) for no speed payoff. Reverted — a cleaner shape with no measured benefit isn't worth the
+semantic change. (Would help under bagging/subsample<1, which the benchmark doesn't use.)
+
+### ✅ WIN #4 — Unit-weight histogram fast path (skip per-row Σw) [G5]
+`grow.hist_build` is the largest phase outside leaf_refine (33-38% of wall, on every dataset). The hot
+accumulation loop folds 4 arrays per row — g, h, **wsum**, count. But when the caller supplies NO sample
+weights (the common case + the entire benchmark), the weight vector is the engine's materialized all-ones,
+so `wsum[idx] == count[idx]` EXACTLY in f64 (Σ 1.0 over a bin = its integer count, exact for count<2^53).
+A new `GrowConfig.unit_weight` flag (set iff `spec.weight.is_none()`) lets the histogram SKIP the per-row
+weight read + Σw add (LLVM unswitches the loop-invariant branch) and set `wsum = count` afterwards. The
+flag is conservative — `false` whenever weights were provided, even if all 1.0 — so it never risks a wrong
+Σw. Subtraction/quantized paths untouched. BYTE-IDENTICAL: pinned bit-for-bit (g/h/wsum/count) for both the
+sequential and row-chunk-parallel branches by `unit_weight_fast_path_is_bit_identical_to_full_sigma_w`;
+end-to-end scores unchanged (diamonds 0.09022, kick 0.76975) across 3 reps each.
+- **Measured (fixed config n=2000, refine=4, no-es, 4 threads; means of 3 reps):** diamonds
+  `grow.hist_build` ~4.20s → **~3.90s (−7%)**; kick ~16.0s → **~14.4s (−10%)**. Wall diamonds ~12.5→~11.8s,
+  kick ~41.9→~40.0s. Generalizes to every unweighted fit (the default), all objectives.

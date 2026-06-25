@@ -81,6 +81,7 @@ fn offset3(
 /// # Errors
 /// [`PbError::Internal`] if any `axis`, row id, leaf id, or bin id is out of range
 /// (the engine builds these so it is a bug, surfaced as a typed error not a panic).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_histogram(
     x: &BinnedMatrix,
     gh: &GradHess,
@@ -89,6 +90,7 @@ pub(crate) fn build_histogram(
     n_leaves: usize,
     axes: &[u32],
     weight: &[f32],
+    unit_weight: bool,
 ) -> Result<Hist, PbError> {
     let mut max_bins = 0usize;
     for &a in axes {
@@ -103,7 +105,19 @@ pub(crate) fn build_histogram(
     // Each axis is built independently (disjoint output region) on its own task.
     let subs: Result<Vec<AxisHist>, PbError> = axes
         .par_iter()
-        .map(|&a| accumulate_axis(x, gh, rows, leaf_of_row, n_leaves, a, max_bins, weight))
+        .map(|&a| {
+            accumulate_axis(
+                x,
+                gh,
+                rows,
+                leaf_of_row,
+                n_leaves,
+                a,
+                max_bins,
+                weight,
+                unit_weight,
+            )
+        })
         .collect();
     let subs = subs?;
 
@@ -350,6 +364,7 @@ impl AxisHist {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn accumulate_axis(
     x: &BinnedMatrix,
     gh: &GradHess,
@@ -359,6 +374,7 @@ fn accumulate_axis(
     axis: u32,
     max_bins: usize,
     weight: &[f32],
+    unit_weight: bool,
 ) -> Result<AxisHist, PbError> {
     if rows.len() < ROW_PAR_MIN_ROWS {
         return accumulate_axis_sequential(
@@ -370,12 +386,23 @@ fn accumulate_axis(
             axis,
             max_bins,
             weight,
+            unit_weight,
         );
     }
     let chunks: Result<Vec<AxisHist>, PbError> = rows
         .par_chunks(ROW_PAR_CHUNK_ROWS)
         .map(|chunk| {
-            accumulate_axis_sequential(x, gh, chunk, leaf_of_row, n_leaves, axis, max_bins, weight)
+            accumulate_axis_sequential(
+                x,
+                gh,
+                chunk,
+                leaf_of_row,
+                n_leaves,
+                axis,
+                max_bins,
+                weight,
+                unit_weight,
+            )
         })
         .collect();
     let chunks = chunks?;
@@ -387,6 +414,7 @@ fn accumulate_axis(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn accumulate_axis_sequential(
     x: &BinnedMatrix,
     gh: &GradHess,
@@ -396,13 +424,17 @@ fn accumulate_axis_sequential(
     axis: u32,
     max_bins: usize,
     weight: &[f32],
+    unit_weight: bool,
 ) -> Result<AxisHist, PbError> {
     let col = x
         .data
         .get(axis as usize)
         .ok_or_else(oob("axis has no column"))?;
     let mut out = AxisHist::try_zeros(n_leaves, max_bins)?;
-    // Sequential over rows in their given (fixed) order ⇒ deterministic f64 fold.
+    // Sequential over rows in their given (fixed) order ⇒ deterministic f64 fold. When
+    // `unit_weight`, the per-row weight read + `Σw` add are skipped (the loop-invariant branch
+    // is hoisted by LLVM into two loop variants), and `wsum` is set from `count` afterwards —
+    // bit-exact, since for unit weights `Σ 1.0` over a bin equals its (integer, <2^53) count.
     for &r in rows {
         let ru = r as usize;
         let bin = usize::from(*col.get(ru).ok_or_else(oob("row out of column"))?);
@@ -417,12 +449,21 @@ fn accumulate_axis_sequential(
             f64::from(*gh.g.get(ru).ok_or_else(oob("gh.g"))?);
         *out.h.get_mut(idx).ok_or_else(oob("h cell"))? +=
             f64::from(*gh.h.get(ru).ok_or_else(oob("gh.h"))?);
-        *out.wsum.get_mut(idx).ok_or_else(oob("wsum cell"))? +=
-            f64::from(*weight.get(ru).ok_or_else(oob("weight"))?);
+        if !unit_weight {
+            *out.wsum.get_mut(idx).ok_or_else(oob("wsum cell"))? +=
+                f64::from(*weight.get(ru).ok_or_else(oob("weight"))?);
+        }
         let c = out.count.get_mut(idx).ok_or_else(oob("count cell"))?;
         // count <= rows.len() <= n_rows <= u32::MAX, so this never actually overflows;
         // checked_add keeps it panic-free under overflow-checks regardless.
         *c = c.checked_add(1).ok_or_else(oob("bin count overflow"))?;
+    }
+    if unit_weight {
+        // wsum == count for unit weights (Σ 1.0 == count, exact in f64). Per-chunk this gives
+        // each chunk's count; `add_axis_hist` then sums them, matching the per-row Σw exactly.
+        for (w, &c) in out.wsum.iter_mut().zip(&out.count) {
+            *w = f64::from(c);
+        }
     }
     Ok(out)
 }
@@ -681,6 +722,7 @@ mod tests {
             n_leaves,
             axes,
             &vec![1.0_f32; gh.g.len()],
+            false,
         )
     }
 
@@ -1036,17 +1078,19 @@ mod tests {
         let weight = [0.5_f32, 2.0, 1.5, 4.0];
         let rows: Vec<u32> = (0..4).collect();
         let one_leaf = vec![0u8; 4];
-        let hist = build_histogram(&x, &gh, &rows, &one_leaf, 1, &[0], &weight).unwrap();
+        let hist = build_histogram(&x, &gh, &rows, &one_leaf, 1, &[0], &weight, false).unwrap();
         let o1 = hist.offset(0, 0, 1).unwrap();
         let o2 = hist.offset(0, 0, 2).unwrap();
         // bin1 = rows 0,2 (w 0.5+1.5=2.0); bin2 = rows 1,3 (w 2.0+4.0=6.0).
         assert!((hist.wsum[o1] - 2.0).abs() < 1e-12);
         assert!((hist.wsum[o2] - 6.0).abs() < 1e-12);
         // Σw obeys the subtraction trick exactly for this well-conditioned data.
-        let parent = build_histogram(&x, &gh, &rows, &one_leaf, 1, &[0], &weight).unwrap();
-        let left = build_histogram(&x, &gh, &rows[..2], &one_leaf, 1, &[0], &weight).unwrap();
+        let parent = build_histogram(&x, &gh, &rows, &one_leaf, 1, &[0], &weight, false).unwrap();
+        let left =
+            build_histogram(&x, &gh, &rows[..2], &one_leaf, 1, &[0], &weight, false).unwrap();
         let right = subtract(&parent, &left).unwrap();
-        let direct = build_histogram(&x, &gh, &rows[2..], &one_leaf, 1, &[0], &weight).unwrap();
+        let direct =
+            build_histogram(&x, &gh, &rows[2..], &one_leaf, 1, &[0], &weight, false).unwrap();
         for (a, b) in right.wsum.iter().zip(&direct.wsum) {
             assert!((a - b).abs() < 1e-9, "wsum subtraction drift {a} vs {b}");
         }
@@ -1058,6 +1102,65 @@ mod tests {
         let hist = build_hist(&x, &gh, &rows, &leaf_of_row, 4, &[0, 1]).unwrap();
         for (w, &c) in hist.wsum.iter().zip(&hist.count) {
             assert!((w - f64::from(c)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn unit_weight_fast_path_is_bit_identical_to_full_sigma_w() {
+        // The `unit_weight=true` fast path (skip per-row Σw, set wsum=count) must produce a
+        // histogram bit-for-bit equal to the full Σw path fed all-ones — the byte-identity
+        // the engine relies on whenever the caller supplied no weights. Exercise both the
+        // sequential and the row-chunk-parallel branches (rows >= ROW_PAR_MIN_ROWS).
+        let (xs, gh_s, rows_s, leaf_s) = fixture();
+        let ones_s = vec![1.0_f32; gh_s.g.len()];
+        let big_n = ROW_PAR_MIN_ROWS + 257;
+        let cols: Vec<Vec<u8>> = vec![
+            (0..big_n).map(|i| (i % 7) as u8 + 1).collect(),
+            (0..big_n).map(|i| (i % 5) as u8 + 1).collect(),
+        ];
+        let xb = matrix(cols, &[8, 6]);
+        let gh_b = gradhess(
+            &(0..big_n)
+                .map(|i| (i % 11) as f32 - 5.0)
+                .collect::<Vec<_>>(),
+            &(0..big_n).map(|i| 1.0 + (i % 3) as f32).collect::<Vec<_>>(),
+        );
+        let rows_b: Vec<u32> = (0..big_n as u32).collect();
+        let leaf_b = vec![0u8; big_n];
+        let ones_b = vec![1.0_f32; big_n];
+        for (x, gh, rows, leaf, ones, nl, axes) in [
+            (
+                &xs,
+                &gh_s,
+                &rows_s,
+                &leaf_s,
+                &ones_s,
+                4usize,
+                &[0u32, 1][..],
+            ),
+            (
+                &xb,
+                &gh_b,
+                &rows_b,
+                &leaf_b,
+                &ones_b,
+                1usize,
+                &[0u32, 1][..],
+            ),
+        ] {
+            let slow = build_histogram(x, gh, rows, leaf, nl, axes, ones, false).unwrap();
+            let fast = build_histogram(x, gh, rows, leaf, nl, axes, ones, true).unwrap();
+            assert_eq!(slow.g.len(), fast.g.len());
+            for i in 0..slow.g.len() {
+                assert_eq!(slow.g[i].to_bits(), fast.g[i].to_bits(), "g cell {i}");
+                assert_eq!(slow.h[i].to_bits(), fast.h[i].to_bits(), "h cell {i}");
+                assert_eq!(
+                    slow.wsum[i].to_bits(),
+                    fast.wsum[i].to_bits(),
+                    "wsum cell {i}"
+                );
+                assert_eq!(slow.count[i], fast.count[i], "count cell {i}");
+            }
         }
     }
 }

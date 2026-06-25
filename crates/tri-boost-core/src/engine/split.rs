@@ -65,6 +65,12 @@ pub(crate) struct GrowConfig<'a> {
     /// inert. The three hard floors veto a candidate whose level produces any
     /// under-supported cell; `path_smooth` shrinks final leaves toward their parent.
     pub credibility: CredibilityFloor,
+    /// `true` iff every sample weight is exactly `1.0` (the engine sets this only when the
+    /// caller supplied NO weights, so the weight vector is the materialized all-ones). It
+    /// lets the histogram skip the per-row `Σw` accumulation and set `wsum = count` (which
+    /// is bit-exact for unit weights: summing `1.0` `k<2^53` times is exact). Conservative:
+    /// `false` whenever weights were provided, even if they happen to all be `1.0`.
+    pub unit_weight: bool,
 }
 
 /// A candidate level split with its summed Newton gain.
@@ -910,9 +916,16 @@ pub(crate) fn grow_oblivious_tree(
         let n_leaves = 1usize << level;
         let hist =
             crate::engine::boost::prof::timed("grow.hist_build", || match cfg.hist_precision {
-                HistPrecision::FullF64 => {
-                    build_histogram(x, gh, rows, &leaf_of_row, n_leaves, &admissible, weight)
-                }
+                HistPrecision::FullF64 => build_histogram(
+                    x,
+                    gh,
+                    rows,
+                    &leaf_of_row,
+                    n_leaves,
+                    &admissible,
+                    weight,
+                    cfg.unit_weight,
+                ),
                 HistPrecision::QuantizedI32 => build_quantized_histogram(
                     x,
                     gh,
@@ -1479,6 +1492,9 @@ mod tests {
             monotone: None,
             table_budget_penalty: None,
             credibility: CredibilityFloor::default(),
+            // Slow Σw path in grow tests (always correct for any weights); the dedicated
+            // `unit_weight_*` hist tests pin the fast path's bit-identity directly.
+            unit_weight: false,
         }
     }
 

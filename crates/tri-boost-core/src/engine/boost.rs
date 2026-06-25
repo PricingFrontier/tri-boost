@@ -410,6 +410,10 @@ fn fit_single(
             spec.interaction.table_budget_cells,
         ),
         credibility: spec.credibility,
+        // No caller weights ⇒ `weight` is the materialized all-ones, so the histogram can
+        // set `wsum = count` instead of summing 1.0 per row (bit-exact). Provided weights
+        // (even if all 1.0) keep the full Σw path — conservative and always correct.
+        unit_weight: spec.weight.is_none(),
     };
 
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
