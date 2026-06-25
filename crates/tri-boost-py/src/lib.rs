@@ -282,13 +282,17 @@ impl PyBooster {
                 every_k_trees: None,
             },
         };
-        let nesterov = if nesterov {
-            NesterovSpec::Agbm {
-                momentum_correction: false,
-            }
-        } else {
-            NesterovSpec::Off
-        };
+        if nesterov {
+            // AGBM look-ahead currently diverges (the §09.4 momentum-correction step is not
+            // implemented), so refuse it loudly rather than silently produce a blown-up model.
+            return Err(py_err(PbError::InvalidConfig {
+                what: "nesterov/AGBM acceleration is experimental and currently unstable \
+                       (it diverges; the momentum-correction step is not yet implemented) — \
+                       it is not supported in this release"
+                    .into(),
+            }));
+        }
+        let nesterov = NesterovSpec::Off;
         let dart = dart_drop_rate.map(|drop_rate| DartSpec {
             drop_rate,
             normalize: true,
@@ -609,7 +613,9 @@ impl PyTableBank {
 
     #[getter]
     fn n_tables(&self) -> usize {
-        self.bank.tables.len()
+        // Total effect tables in the decomposition, including factored over-budget order-3
+        // effects (§08.10) — which are real f_u terms, just stored per-tree, not densified.
+        self.bank.tables.len() + self.bank.factored.len()
     }
 
     fn score_cells(&self, cells: Vec<u32>) -> PyResult<f64> {

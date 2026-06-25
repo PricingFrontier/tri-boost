@@ -154,6 +154,14 @@ def test_negative_credibility_floor_is_rejected() -> None:
         small_regressor(min_sum_hessian_in_leaf=-1.0).fit(x.astype(np.float32), y)
 
 
+def test_nesterov_is_rejected_as_unstable() -> None:
+    # AGBM/Nesterov acceleration currently diverges (momentum correction unimplemented),
+    # so the Python surface refuses it loudly rather than return a blown-up model.
+    x, y = regression_fixture()
+    with pytest.raises(Exception, match="nesterov"):
+        small_regressor(nesterov=True).fit(x.astype(np.float32), y)
+
+
 def test_booster_knobs_round_trip_and_stay_exact() -> None:
     # The §06/§09/§07 levers (ensemble, sampling, hist precision, refit, interaction order)
     # are now reachable from Python; they survive get_params/clone and stay exactly
