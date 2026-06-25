@@ -24,5 +24,8 @@ __pycache__/
 # Benchmark rival-result cache (generated; rivals are deterministic per config)
 benchmarks/.bench_cache.json
 benchmarks/.suite_cache.json
+benchmarks/.fair_cache.json
 benchmarks/.data_cache/
+# Benchmark scratch (logs, probes, spikes — underscore-prefixed, regenerable)
+benchmarks/_*
 speed_accuracy_work.md

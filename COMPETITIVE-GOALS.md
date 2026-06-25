@@ -21,18 +21,45 @@ toward any goal** — decomposability is the product; accuracy and speed are the
 - A goal is **settled across a benchmark suite (TabArena), not a single dataset** — single-dataset
   wins/losses below are *evidence*, not verdicts.
 
-### Fair-comparison protocol (required before any goal is called "met")
+### Fair-comparison protocol — IMPLEMENTED in `benchmarks/fair_compare.py` (2026-06-25)
 
-The current evidence is **not yet a fair fight** and must be re-run under one protocol:
+The protocol below is now a harness, not a wish. `fair_compare.py` runs it with a **frozen rival
+baseline** (`benchmarks/.fair_cache.json`): rivals are fit ONCE and cached; tri-boost is NEVER cached
+(its Rust core changes between iterations) and always re-fits + re-runs the live G0 decomposability
+check. So iterating a tri-boost lever re-fits only the 3 tri rows and reads every rival from cache.
 
-1. **Converged budgets, not fixed.** Oblivious trees are weaker per-tree, so tri-boost needs more
-   iterations; rivals self-converge or get early-stopping. The diamonds rival numbers below were at
-   `n=400` (under-fit) while tri-boost was at `n=4000` — **re-run rivals to convergence** before trusting.
-2. **Matched depth** where the goal specifies it (rivals `max_depth=3`; CatBoost `depth=3`).
-3. **Matched categorical handling** (ordinal vs native TS vs the rival's native cats — stated per row).
-4. **Same metric, split, seed**; report mean ± noise over seeds, not a single split.
-5. **Speed on a fixed thread budget** (the sandbox over-subscribes OpenMP at `n_jobs=-1`; use
-   `TRIBOOST_BENCH_THREADS`).
+1. **Converged budgets, each model at ITS OWN convergence.** Rivals (XGBoost/LightGBM/CatBoost) get
+   held-out early stopping (they converge fast and overfit at a fixed 4000); EBM self-converges;
+   tri-boost gets early stopping too BUT with far more patience (`rounds=500` vs rivals' `50`) —
+   oblivious trees improve in tiny increments, so an impatient stop under-fits badly (measured:
+   `rounds=50` cost miami **−6.7%**, stopping at ~40 trees; `rounds=500` recovers it and still catches
+   genuine overfit like kick **+1.6%**).
+2. **Matched depth** (rivals `max_depth=3`; CatBoost `depth=3`).
+3. **Matched native categoricals** — XGBoost/LightGBM/CatBoost all use native cats; tri uses
+   ordinal-where-a-natural-order-is-known (diamonds) else native TS; EBM native.
+4. **Same metric, split, seed**; the split is fixed (model-seed sweep is the cheap default; split-seed
+   sweep a documented extension).
+5. **Speed on a fixed thread budget** (`FAIR_THREADS`, default 4; the sandbox over-subscribes OpenMP
+   at `n_jobs=-1`). EBM gets more threads (`FAIR_EBM_THREADS`) — its metric is thread-invariant.
+
+**Measured fair results (2026-06-25, converged, decomposable, single split/seed)** — RMSE-log↓ for
+regression, ROC-AUC↑ for classification; tri = order-3, early-stopped (rounds=500):
+
+| dataset | tri o3 | EBM o2 | xgb d3 | lgbm d3 | cat d3-ctr1 | cat default | G1 | G2 | G3 |
+|---|---|---|---|---|---|---|---|---|---|
+| miami_housing | **0.13203** | 0.13853 | 0.13908 | 0.14039 | 0.13581 | 0.12931 | ✅+4.7% | ✅+5–6% | ✅+2.8% |
+| particulate | **0.33824** | _(skipped)_ | 0.34452 | 0.34264 | 0.34797 | 0.32207 | n/a | ✅+1.3–1.8% | ✅+2.8% |
+| allstate | **0.54009** | 0.54160 | 0.54695 | 0.54450 | 0.54096 | 0.53614 | ✅+0.3% | ✅+0.8–1.3% | ✅+0.2% |
+| diamonds | **0.08896** | 0.09159 | 0.08805 | 0.08725 | 0.09035 | 0.08617 | ✅+2.9% | ❌−1–2% | ✅+1.5% |
+| kick | **0.77614** | 0.78493 | 0.76868 | 0.77329 | 0.77510 | 0.77872 | ❌−1.1% | ✅+0.4–1.0% | ✅+0.1% |
+| amazon_access | **0.84506** | _(skipped)_ | 0.85950 | 0.85727 | 0.87304 | 0.91081 | n/a | ❌ | ❌ |
+
+EBM intentionally not run on the two giant datasets (particulate 315k / amazon high-card) — too slow to
+converge in tractable time; compared on the four where it ran. **Net standing across the suite (all @
+fully decomposable):** G1 (beat EBM) **3/4**, G2 (beat xgb+lgbm @ d3) **4/6**, G3 (beat constrained
+CatBoost) **5/6**. tri wins where order-3 interactions pay off (miami/particulate/allstate — spatial &
+insurance) and loses on amazon (all-categorical → TS-encoding weakness) and diamonds-G2 (fine-continuous
+→ leaf-wise depth-3 is more expressive). Reproduce: `python benchmarks/fair_compare.py`.
 
 ---
 
@@ -141,19 +168,26 @@ combinations, ordered boosting) — the practical ceiling.
 Every row below is implicitly **"@ fully decomposable" (G0)** — a standing only counts if the same
 fitted model also emits an exact ≤3rd-order fANOVA decomposition.
 
-| # | Goal | Status | Best current evidence |
-|---|---|---|---|
-| **G0** | **Fully decomposable (binding on all)** | ✅ **held** | factored §08.10 path keeps `mode=Exact` at n=4000 |
-| G1 | Beat EBM @ depth 3 | ✅ on diamonds | tri 0.0885 vs EBM 0.0916 |
-| G1 | Beat EBM @ depth 2 | ❌ close | tri 0.0924 vs EBM 0.0916 (−0.8%) |
-| G1 | Beat EBM @ depth 1 | ❓ unmeasured | tri mains 0.112; EBM mains TBD |
-| G2 | Beat XGB/LGBM @ depth 3 | ⚠️ mixed / not fair yet | wins diamonds(*under-fit rivals*), loses MTPL freq ~0.3% |
-| G3 | Beat CatBoost @ depth 3, ctr 1 | ❓ unmeasured (constrained) | ~tie vs default-CTR CatBoost on MTPL |
-| G4 | Approach default CatBoost | 🎯 aspirational | gap TBD; bounded by order-3 cap |
-| G5 | LightGBM-speed @ depth 3 | ❌ ~5× slower | tri 14s vs LGBM 2.8s (MTPL 542k) |
+Updated **2026-06-25** with the fair-harness measurements above (converged, matched, decomposable; single
+split/seed; full per-dataset table in the protocol section).
 
-**Honest summary:** the one *clean* win today is **G1@depth-3** (beat EBM by using order-3 while staying
-exactly decomposable). Everything else is either close-but-behind (G1@2, G2), unmeasured under the fair
-protocol (G2 converged, G3 constrained, G1@1), bounded by the design cap (G4), or a known engineering gap
-(G5). Next step for any of these: stand up the fair-comparison harness (converged, matched depth/encoding)
-across TabArena rather than trusting single-dataset numbers.
+| # | Goal | Status | Cross-suite standing (fair, @ decomposable) |
+|---|---|---|---|
+| **G0** | **Fully decomposable (binding on all)** | ✅ **held** | every benchmarked tri model emits exact ≤3rd-order tables (`mode=Exact`); factored §08.10 path holds at n=4000 |
+| G1 | Beat EBM @ order-3 | ✅ **3/4** | WIN miami +4.7%, diamonds +2.9%, allstate +0.3%; lose kick −1.1% (EBM not run on particulate/amazon) |
+| G1 | Beat EBM @ order-2 | ❌ mostly behind | loses diamonds −1.1%, miami, kick, allstate (−0.2 to −1.1%) — EBM's order-2 GAM shape is sharper |
+| G1 | Beat EBM @ order-1 (mains) | ❌ behind | loses everywhere (−0.2 to −4.4%) — main-effect shape quality is EBM's strength |
+| G2 | Beat XGB/LGBM @ depth 3 | ✅ **4/6** | WIN miami/particulate/allstate/kick; lose diamonds (−1–2%) + amazon |
+| G3 | Beat CatBoost @ depth 3, ctr 1 | ✅ **5/6** | WIN all but amazon — the fairest fight (CatBoost is also oblivious), exact-Newton leaves pay off |
+| G4 | Approach default CatBoost | 🎯 gap reported | +0.7% (allstate) to +7.2% (amazon); ceiling, not chased |
+| G5 | LightGBM-speed @ depth 3 | ❌ ~15× slower | tri ~12–210s vs lgbm <1–23s; engineering gap (Phase-3 track) |
+
+**Honest summary (fair, converged):** tri-boost — **while staying exactly decomposable** — now wins
+**G3 on 5/6**, **G2 on 4/6**, and **G1 on 3/4 datasets where EBM ran**. It wins where order-3 interactions
+matter (miami spatial, particulate, allstate insurance) and loses where they don't help it: **amazon**
+(all-categorical → TS encoding trails native cat handling) and **diamonds-G2** (fine-continuous → leaf-wise
+depth-3 is strictly more expressive than depth-3 oblivious). G1@order-1/2 confirm tri wins by being a
+*richer model class* (order-3), not a better low-order GAM — EBM's heavy-bagged main-effect shapes still
+edge it at equal order. Remaining frontiers: main-effect refinement (G1@1/@2), categorical encoding for
+all-cat data (amazon/G2), and training speed (G5). Iterate with `python benchmarks/fair_compare.py`
+(`FAIR_G0=off` for fast accuracy-only loops); rivals are frozen, only tri re-fits.
