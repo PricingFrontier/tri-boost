@@ -149,4 +149,16 @@ only 8 leaf values change → fusable to one membership pass, O(8) exact for squ
 (7.9s) — where subtraction would help (~3s). Both exactness-preserving. backtrack_eval is the bigger, safer first win.
 
 ## Implemented techniques (committed wins)
-_(none yet — next: fuse refine.backtrack_eval, the profiled #1 bottleneck)_
+
+### ✅ WIN #1 — Fuse leaf-refine backtrack eval (membership-based, no tree re-walk) [G5]
+The profiled #1 bottleneck. The leaf-refinement line search re-scored the whole tree every trial via
+`raw_with_tree_leaves` (route each row through the splits) + a separate deviance pass. But the leaf
+MEMBERSHIPS are fixed and only the 8 leaf VALUES change per trial — so `raw[rows] = base_raw + leaves[membership]`
+is computable with no tree walk, reusing one buffer. New `apply_membership_leaves` + a reused `trial_raw`
+buffer (swap on accept). EXACTNESS-PRESERVING (byte-identical: a tree's contribution to raw IS its leaf
+value; locked by test `membership_leaf_fill_matches_tree_walk_bit_for_bit`).
+- **Measured (diamonds o3, profiler):** `refine.backtrack_eval` 8.93s → **4.14s (−54%)**; wall 29.6s → **24.7s (−17%)**.
+- **Accuracy byte-identical** (diamonds 0.08896, allstate 0.54009 — exact). allstate wall neutral (histogram-
+  dominated there, so backtrack is a smaller fraction). 221 core + 20 py + stubtest green; profiler confirms
+  the saving internally (not wall noise). Generalizes: helps any leaf_refine>0 fit, hurts none.
+NEXT G5 target (now #1 by profile): `grow.hist_build` (7.6s) — histogram subtraction on the quantized path.

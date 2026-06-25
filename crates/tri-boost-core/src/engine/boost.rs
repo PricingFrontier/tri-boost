@@ -2307,6 +2307,9 @@ fn refine_tree_leaves_after_grow(
     let mut raw = raw_with_tree_leaves(base_raw, tree, &columns, &tree.leaves)?;
     let mut best_deviance = deviance_for_rows(loss, y, &raw, weight, &eval_rows)?;
     let mut gh = GradHess::default();
+    // Reused scratch for the per-trial raw (membership-filled, no tree re-walk). Cloned once so
+    // entries outside `rows` stay finite (they are never read by the deviance, which uses `rows`).
+    let mut trial_raw = raw.clone();
 
     for _ in 0..config.leaf_refine_steps {
         prof::timed("refine.grad_hess", || {
@@ -2378,17 +2381,21 @@ fn refine_tree_leaves_after_grow(
                 usize::from(tree.depth),
                 monotone,
             )?;
-            let (trial_raw, deviance) = prof::timed(
-                "refine.backtrack_eval",
-                || -> Result<(Vec<f32>, f64), PbError> {
-                    let tr = raw_with_tree_leaves(base_raw, tree, &columns, &trial_leaves)?;
-                    let dv = deviance_for_rows(loss, y, &tr, weight, &eval_rows)?;
-                    Ok((tr, dv))
-                },
-            )?;
+            let deviance = prof::timed("refine.backtrack_eval", || -> Result<f64, PbError> {
+                apply_membership_leaves(
+                    &mut trial_raw,
+                    base_raw,
+                    rows,
+                    &memberships,
+                    &trial_leaves,
+                )?;
+                deviance_for_rows(loss, y, &trial_raw, weight, &eval_rows)
+            })?;
             if deviance < best_deviance {
                 tree.leaves = trial_leaves;
-                raw = trial_raw;
+                // `trial_raw` is the accepted full raw on `rows`; swap it in (no realloc), keeping the
+                // old buffer as the next trial's scratch.
+                std::mem::swap(&mut raw, &mut trial_raw);
                 best_deviance = deviance;
                 accepted = true;
                 break;
@@ -2479,6 +2486,41 @@ fn raw_with_tree_leaves(
     Ok(out)
 }
 
+/// Overwrite `out[rows[i]] = base_raw[rows[i]] + leaves[memberships[i]]` using the precomputed leaf
+/// memberships — NO per-row tree re-walk. A tree's contribution to `raw` is exactly its leaf value, so
+/// for the leaf-refinement line search (whose only per-trial change is the 8 leaf VALUES) this produces
+/// values bit-identical to [`raw_with_tree_leaves`] on `rows`, far cheaper. Entries outside `rows` are
+/// left untouched (they are never read: the line search evaluates deviance only on `rows`).
+fn apply_membership_leaves(
+    out: &mut [f32],
+    base_raw: &[f32],
+    rows: &[u32],
+    memberships: &[u8],
+    leaves: &[f32; 8],
+) -> Result<(), PbError> {
+    for (&r, &leaf) in rows.iter().zip(memberships) {
+        let ru = r as usize;
+        let base = *base_raw.get(ru).ok_or_else(|| PbError::Internal {
+            what: "leaf refinement base_raw row escaped".into(),
+        })?;
+        let lv = *leaves
+            .get(usize::from(leaf))
+            .ok_or_else(|| PbError::Internal {
+                what: "leaf refinement membership leaf escaped".into(),
+            })?;
+        let value = f64::from(base) + f64::from(lv);
+        if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+            return Err(PbError::InvalidInput {
+                what: "leaf refinement raw is not finite/representable".into(),
+            });
+        }
+        *out.get_mut(ru).ok_or_else(|| PbError::Internal {
+            what: "leaf refinement out row escaped".into(),
+        })? = value as f32;
+    }
+    Ok(())
+}
+
 /// Add a freshly-grown tree's contribution to every row's raw score (spec §06.6
 /// sample→leaf update). Scores ALL rows (not just the round's subsample) so the next
 /// round's gradients are correct everywhere. Panic-free; uses the canonical low bit.
@@ -2538,6 +2580,49 @@ mod tests {
     fn predict(model: &Model, x: &BinnedMatrix, row: usize) -> f64 {
         let bins: Vec<u8> = x.data.iter().map(|c| c[row]).collect();
         model.ensemble_f64(&bins).unwrap()
+    }
+
+    /// The leaf-refinement line search reconstructs `raw` from precomputed leaf MEMBERSHIPS
+    /// (`apply_membership_leaves`) instead of re-walking the tree each trial. That fast path must
+    /// be BIT-IDENTICAL to the tree-walk reconstruction (`raw_with_tree_leaves`) on the rows — the
+    /// invariant that makes the speed optimization exactness-preserving.
+    #[test]
+    fn membership_leaf_fill_matches_tree_walk_bit_for_bit() {
+        let n = 240usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 3) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| x0[i] + 2.0 * x1[i] - x2[i] + x0[i] * x1[i])
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let sqe = SquaredError;
+        let model = Booster::with_config(Config {
+            n_trees: 6,
+            learning_rate: 0.5,
+            lambda: 1.0,
+            ..Config::default()
+        })
+        .fit(&x, &y, &spec(&sqe))
+        .unwrap();
+        let tree = &model.trees[0].1;
+        let columns = tree_split_columns(tree, &x.data).unwrap();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let n_leaves = 1usize << usize::from(tree.depth);
+        let memberships = tree_memberships_for_rows(tree, &columns, &rows, n_leaves).unwrap();
+        let base_raw = vec![0.37_f32; n];
+        let walk = raw_with_tree_leaves(&base_raw, tree, &columns, &tree.leaves).unwrap();
+        let mut fill = vec![0.0_f32; n];
+        apply_membership_leaves(&mut fill, &base_raw, &rows, &memberships, &tree.leaves).unwrap();
+        for r in 0..n {
+            assert_eq!(
+                walk[r].to_bits(),
+                fill[r].to_bits(),
+                "row {r}: tree-walk {} != membership-fill {}",
+                walk[r],
+                fill[r]
+            );
+        }
     }
 
     /// Gate G2 (exact): an additive piecewise-constant target on 2 features is
