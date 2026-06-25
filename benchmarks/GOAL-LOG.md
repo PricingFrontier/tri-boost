@@ -37,7 +37,7 @@ ROI-ordered work queue; each is a genuine generalizing technique a rival uses th
 | 1 | Per-split categorical gradient re-sort (Fisher optimal split) | LightGBM | G2+G3(+G1) | L | conditional | **next** |
 | 2 | Histogram subtraction (parent−child), QuantizedI32-only | LightGBM | G5 | M | safe | queued |
 | 3 | Integer-space quantized hist scan (unlocks #2) + QHIST default | LightGBM | G5 | S | safe | queued |
-| 4 | Cyclic/round-robin per-feature boosting | EBM | G1 | L | safe | queued |
+| 4 | Cyclic/round-robin per-feature boosting | EBM | G1 | L | safe | ❌ REJECTED (measured worse) |
 | 5 | Automatic categorical CTR combination axes | CatBoost | G3+G2 | L | conditional | queued |
 | 6 | FAST pairwise interaction detection (populate InteractionPolicy.groups) | EBM | G1 | L | safe | queued |
 | 7 | Hessian-weighted quantile bin borders | XGBoost | G2 | M | safe | queued |
@@ -50,5 +50,25 @@ Sequencing: #1 first (multi-goal: amazon on G2+G3 at once). Then #3+#2 together 
 Then #4 (suite-wide G1 order-1). #5/#6 compose with #4 (EBM's mains-first recipe falls out). #7 last. Re-measure
 G5 after #2/#3 before bothering with GOSS. Every step: live G0 `tables()` check (FAIR_G0=o3) green before commit.
 
-## Implemented techniques (filled by the loop, with measured deltas vs frozen rivals)
-_(none committed yet — starting #1)_
+## Attempted techniques (with measured deltas vs frozen rivals)
+
+### #4 Cyclic/round-robin boosting (EBM) — ❌ REJECTED, reverted (2026-06-25)
+Built end-to-end (`Schedule::{Greedy,Cyclic}` core + FFI + sklearn + `.pyi` + round-robin-stump test,
+all gates green, stays exactly decomposable order-1). Measured tri order-1 **cyclic vs greedy vs EBM mains**
+across the 4 EBM datasets — **cyclic lost to greedy on ALL of them**:
+
+| dataset | tri o1 greedy | tri o1 cyclic | cyclic vs greedy | greedy vs EBM |
+|---|---|---|---|---|
+| diamonds | 0.11214 | 0.11663 | −4.0% | −4.4% |
+| miami | 0.17139 | 0.17592 | −2.6% | −2.9% |
+| kick | 0.76469 | 0.76424 | −0.06% | +0.2% (greedy beats EBM) |
+| allstate | 0.56287 | 0.56421 | −0.24% | −0.2% |
+
+**Why it failed**: forcing round-robin wastes rounds uniformly refining low-signal features, while tri's
+greedy adaptively concentrates on high-gain ones — greedy is already a better mains learner. EBM's edge is
+its bagging + tiny-lr shape smoothing, NOT the cyclic schedule. **Reverted** (no strictly-worse knob ships).
+Corollary: the "compose cyclic with bagging/interactions = EBM recipe" plan (#5/#6 dependency on #4) is
+weakened — if pursuing G1 mains later, test BAGGING on greedy mains, not cyclic.
+
+## Implemented techniques (committed wins)
+_(none yet)_
