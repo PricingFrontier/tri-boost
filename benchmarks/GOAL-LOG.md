@@ -34,7 +34,7 @@ ROI-ordered work queue; each is a genuine generalizing technique a rival uses th
 
 | # | technique | source | goals | effort | G0 | status |
 |---|---|---|---|---|---|---|
-| 1 | Per-split categorical gradient re-sort (Fisher optimal split) | LightGBM | G2+G3(+G1) | L | conditional | **next** |
+| 1 | Per-split categorical gradient re-sort (Fisher optimal split) | LightGBM | G2+G3(+G1) | L | conditional | ❌ REJECTED by design (inert-or-invasive) |
 | 2 | Histogram subtraction (parent−child), QuantizedI32-only | LightGBM | G5 | M | safe | queued |
 | 3 | Integer-space quantized hist scan (unlocks #2) + QHIST default | LightGBM | G5 | S | safe | queued |
 | 4 | Cyclic/round-robin per-feature boosting | EBM | G1 | L | safe | ❌ REJECTED (measured worse) |
@@ -81,5 +81,21 @@ Python prototype (pairwise-concatenated tuple columns as ordinary TS axes). TWO 
 Decision: do NOT ship. Pursue the G0-CLEAN categorical technique instead → #1 (per-split gradient re-sort:
 sharpens single-categorical splits, no new features, no order inflation).
 
+### #1 Per-split categorical gradient re-sort (LightGBM) — ❌ REJECTED by design analysis (2026-06-25, no code)
+Architect design pass (read the full split/low_bit/explain architecture). Verdict: not worth building.
+- **The cheap version is INERT on this suite.** Re-ranking categorical bins by ROUND-0 gradient ratio
+  g/(h+λ) — the only variant that keeps the contiguous-split machinery (and all of explain.rs) untouched —
+  equals tri's existing target-mean Fisher order for squared-error (gradient order == −target-mean order)
+  and is near-identical for logistic. It changes nothing on diamonds/miami/particulate/allstate/kick/amazon.
+- **The version that DIFFERS (per-level re-rank with current residuals) is disproportionately invasive.**
+  It makes categorical splits NON-CONTIGUOUS sets in bin order, which breaks the shared `low_bit` primitive
+  AND the merged-grid abstraction in explain.rs (`rep_model_bin`/`model_bin_to_cell`/`build_cell_maps` are
+  pure contiguous-border arithmetic) — requiring a refined per-bin→cell merged grid, a SECOND serialized
+  wire format for `TableBank.merged_grids`, a `Split` change, and exhaustive re-proof of all 5 I2 gates.
+  ~2–3 weeks with high silent-G0-breakage risk.
+- **Wrong target anyway.** Single-axis re-sort cannot capture amazon's TUPLE-interaction signal (the actual
+  G2/G3 loss). Per the architect: neither variant addresses it.
+Decision: skip. Pivot to the safe, biggest-gap, genuine technique → #2/#3 (LightGBM histogram subtraction, G5).
+
 ## Implemented techniques (committed wins)
-_(none yet — implementing #1)_
+_(none yet — next: #2/#3 G5 histogram subtraction, engine-only/G0-safe)_
