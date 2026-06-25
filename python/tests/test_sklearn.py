@@ -290,6 +290,38 @@ def test_regressor_native_categorical_object_array_stays_exact_and_cloneable() -
     np.testing.assert_array_equal(loaded_pred, pred)
 
 
+def test_monotone_with_native_categorical_remaps_and_is_enforced() -> None:
+    # Categorical at index 0, numeric at index 1 — exercises the positional->axis-order remap
+    # (native cats reorder numeric-first), so monotone_constraints=[0, +1] must land the +1 on
+    # the numeric axis, not the categorical one. Verify it fits, stays Exact, and is enforced.
+    n = 300
+    rng = np.random.default_rng(1)
+    cat = rng.choice(list("PQR"), n)
+    num = rng.uniform(0.0, 5.0, n).astype(np.float32)
+    x = np.empty((n, 2), dtype=object)
+    x[:, 0] = cat
+    x[:, 1] = num
+    y = (
+        0.6 * num
+        + np.where(cat == "P", 1.0, np.where(cat == "Q", -0.5, 0.0))
+        + rng.normal(0.0, 0.3, n)
+    ).astype(np.float32)
+    est = TriBoostRegressor(
+        objective="squared_error", n_trees=120, learning_rate=0.25, max_bin=32, seed=7,
+        categorical_features=[0], monotone_constraints=[0, 1],
+    )
+    est.fit(x, y)  # must NOT raise
+    exp = json.loads(est.tables(x[:64], ref_measure="uniform"))
+    assert exp["mode"] == "Exact"
+    # For each fixed category, prediction is non-decreasing in the (constrained) numeric.
+    for c in ["P", "Q", "R"]:
+        grid = np.empty((20, 2), dtype=object)
+        grid[:, 0] = c
+        grid[:, 1] = np.linspace(0.0, 5.0, 20).astype(np.float32)
+        pred = np.asarray(est.predict(grid))
+        assert np.all(np.diff(pred) >= -1e-6), f"monotone +1 violated for cat {c}: {pred}"
+
+
 def test_native_categorical_early_stopping_kfold_allowed_ordered_gated() -> None:
     # KFold cross-fit (the default) gives OOF per-row encodings, so the carved validation
     # fold excludes each row's own target → internal early-stopping is leakage-free + allowed.
@@ -323,11 +355,11 @@ def test_regressor_native_categorical_dataframe_names_and_monotone_guard() -> No
     pred = est.predict(frame)
     assert pred.shape == (frame.shape[0],)
 
-    with pytest.raises(ValueError, match="monotone_constraints"):
-        small_regressor(
-            categorical_features=["brand"],
-            monotone_constraints={"age": 1},
-        ).fit(frame, y)
+    # Monotone on a numeric feature with a native categorical present is now supported
+    # (the sign vector is remapped to the numeric-first axis order); fits + stays Exact.
+    mono = small_regressor(categorical_features=["brand"], monotone_constraints={"age": 1})
+    mono.fit(frame, y)
+    assert json.loads(mono.tables(frame.iloc[:48], ref_measure="uniform"))["mode"] == "Exact"
 
 
 def test_classifier_native_categorical_predict_proba() -> None:

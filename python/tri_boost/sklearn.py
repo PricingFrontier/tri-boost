@@ -377,10 +377,6 @@ class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped 
                 f"feature_names length {len(feature_names)} != n_features {n_features}"
             )
         cat_idx = self._resolve_categorical(n_features, feature_names)
-        if cat_idx and self.monotone_constraints is not None:
-            raise ValueError(
-                "monotone_constraints with native categorical features are not yet supported"
-            )
         x32, cat_x, axis_names = self._split_columns(x, cat_idx, feature_names)
         y32 = _as_float32_1d(y, "y")
         if x32.shape[0] != y32.shape[0]:
@@ -399,7 +395,14 @@ class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped 
                 raise ValueError(
                     f"exposure has {exposure32.shape[0]} rows but y has {y32.shape[0]}"
                 )
-        monotone = None if cat_idx else self._resolve_monotone(n_features, feature_names)
+        # Monotone signs are positional over the ORIGINAL features; native categoricals
+        # reorder the design (numeric axes first, then categoricals, per `_split_columns`),
+        # so remap the sign vector to that axis order before handing it to the core.
+        monotone = self._resolve_monotone(n_features, feature_names)
+        if monotone is not None and cat_idx:
+            cat_set = set(cat_idx)
+            numeric_idx = [i for i in range(n_features) if i not in cat_set]
+            monotone = [monotone[i] for i in numeric_idx] + [monotone[j] for j in cat_idx]
         model = self._new_booster().fit(
             x32,
             y32,

@@ -680,13 +680,6 @@ fn fit_owned(
     let n_numeric = columns.len();
     let n_cat = cat_x.as_ref().map_or(0, Vec::len);
     let monotone_map = build_monotone_map(monotone.as_deref(), n_numeric + n_cat)?;
-    if cat_x.is_some() && !monotone_map.is_empty() {
-        return Err(PbError::InvalidConfig {
-            what: "monotone constraints with native categorical features are not yet \
-                   supported in the Python path"
-                .into(),
-        });
-    }
     // Internal early-stopping needs the validation fold's categorical encodings to exclude
     // each val row's own target. KFold cross-fit (the default) produces exactly that — OOF
     // per-row training encodings (cat.rs `kfold_training_encodings` excludes the row's whole
