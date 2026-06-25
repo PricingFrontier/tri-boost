@@ -295,6 +295,21 @@ test green; real-data scores unchanged: diamonds 0.11376/0.09022, kick 0.77228/0
   diamonds `hist_build` 0.877 → **0.682s (−22%)**, wall 1.42 → 1.14s. o3 (n=2000, refine=4): kick `hist_build`
   ~16s → **8.66s (−46%)**, wall → 28.3s; diamonds ~4.2 → 3.26s. Generalizes to every FullF64 depth-≥2 fit.
 
+### ✅ WIN #7 — Row-parallel log-link grad_hess [G5] — BYTE-IDENTICAL (corrects the earlier revert)
+The earlier grad_hess row-parallelization was reverted as "net-neutral", but that verdict was a measurement
+artifact: with a COLD rayon pool the first parallel call (the main `grad_hess`) absorbed the one-time pool
+spin-up, which the profiler attributed to that phase and masked the refine-phase win. Now that WIN #6's
+deviance work warms the pool, a clean re-test shows the real picture. grad_hess is a row-independent MAP, so
+parallelizing it is **bit-identical** to the sequential loop regardless of thread count (no fold, no drift —
+unlike the deviance) — pinned by `log_link_grad_hess_parallel_path_is_bit_identical_across_thread_counts`.
+New `fill_grad_hess_parallel` applied to Logistic/Poisson/Gamma/Tweedie; **SquaredError stays sequential**
+(g=w(F−y), h=w — a trivial per-row term, memory-bandwidth bound, where parallelism does not pay).
+- **Byte-identical:** real-data scores unchanged (kick 0.76975; diamonds 0.09022, SE unaffected). 231 core +
+  20 py green; clippy + fmt clean.
+- **Measured (o3, n=2000, refine=4, 4 threads, warm pool):** kick `refine.grad_hess` 4.13s → **2.97s (−28%)**
+  (no main-grad_hess regression this time), wall → ~26.2s; diamonds unchanged (SE sequential). Helps every
+  log-link fit. Cumulative kick o3 this session: 37.1s → **~26.2s (−29%)**.
+
 ### ✅ WIN #6 — Chunked-parallel log-link deviance fold [G5] — accuracy-neutral
 With byte-identity relaxed, profiled the o3 bottleneck: kick `refine.backtrack_eval` (the leaf-refine
 line-search deviance) was the single biggest sub-phase at 11.74s. The log-link deviance is COMPUTE-bound

@@ -105,6 +105,60 @@ fn finish_deviance(obj: &str, acc: f64) -> Result<f32, PbError> {
 /// Row chunk size for the chunked-parallel deviance fold of compute-bound (log-link) objectives.
 const PAR_DEVIANCE_CHUNK: usize = 8_192;
 
+/// Row-parallel `(g, h)` fill for compute-bound (log-link) objectives. `out.{g,h}[i]` is an
+/// independent function of row `i`, so this is a **map, not a reduction** — bit-identical to the
+/// sequential loop regardless of thread count (no drift). `per_row(y, raw, weight)` returns the
+/// UNCHECKED `(g, h)`; the per-row finite guards run here. Below the chunk size a sequential fold
+/// runs. Squared-error keeps its sequential kernel.
+fn fill_grad_hess_parallel<F>(
+    obj: &'static str,
+    out: &mut GradHess,
+    y: &[f32],
+    raw: &[f32],
+    weight: &[f32],
+    per_row: F,
+) -> Result<(), PbError>
+where
+    F: Fn(f32, f32, f32) -> (f32, f32) + Sync,
+{
+    let n = y.len();
+    out.g.clear();
+    out.g.resize(n, 0.0);
+    out.h.clear();
+    out.h.resize(n, 0.0);
+    let body = |base: usize, gc: &mut [f32], hc: &mut [f32], yc: &[f32], rc: &[f32], wc: &[f32]| {
+        for (k, ((gi, hi), ((&yi, &fi), &wi))) in gc
+            .iter_mut()
+            .zip(hc.iter_mut())
+            .zip(yc.iter().zip(rc).zip(wc))
+            .enumerate()
+        {
+            let i = base + k;
+            require_finite(obj, "y", i, yi)?;
+            require_finite(obj, "raw", i, fi)?;
+            require_weight(obj, i, wi)?;
+            let (g, h) = per_row(yi, fi, wi);
+            let (g, h) = ensure_finite_grad_hess(obj, i, g, h)?;
+            *gi = g;
+            *hi = h;
+        }
+        Ok::<(), PbError>(())
+    };
+    if n < PAR_DEVIANCE_CHUNK {
+        return body(0, &mut out.g, &mut out.h, y, raw, weight);
+    }
+    out.g
+        .par_chunks_mut(PAR_DEVIANCE_CHUNK)
+        .zip(out.h.par_chunks_mut(PAR_DEVIANCE_CHUNK))
+        .zip(y.par_chunks(PAR_DEVIANCE_CHUNK))
+        .zip(raw.par_chunks(PAR_DEVIANCE_CHUNK))
+        .zip(weight.par_chunks(PAR_DEVIANCE_CHUNK))
+        .enumerate()
+        .try_for_each(|(ci, ((((gc, hc), yc), rc), wc))| {
+            body(ci * PAR_DEVIANCE_CHUNK, gc, hc, yc, rc, wc)
+        })
+}
+
 /// Chunked-parallel `(Σw, acc)` deviance fold for COMPUTE-bound (log-link) objectives. The rows are
 /// split into FIXED-size chunks; each chunk folds sequentially into a local `(Σw, acc)`, and the
 /// chunk partials are then combined in CHUNK ORDER. So the result is **thread-count-independent**
@@ -510,28 +564,13 @@ impl Loss for Logistic {
             n,
             &[("raw", raw.len()), ("weight", weight.len())],
         )?;
-        out.g.clear();
-        out.g.resize(n, 0.0);
-        out.h.clear();
-        out.h.resize(n, 0.0);
+        // Compute-bound (sigmoid per row) ⇒ row-parallel map, bit-identical to the sequential
+        // kernel (no fold, no drift): g = w(σ−y), h = w·σ(1−σ) floored.
         let floor = self.hessian_floor();
-        for (i, (gi, hi, &yi, &fi, &wi)) in
-            izip!(&mut out.g, &mut out.h, y, raw, weight).enumerate()
-        {
-            require_finite("logistic", "y", i, yi)?;
-            require_finite("logistic", "raw", i, fi)?;
-            require_weight("logistic", i, wi)?;
+        fill_grad_hess_parallel("logistic", out, y, raw, weight, |yi, fi, wi| {
             let s = stable_sigmoid(fi);
-            let (g, h) = ensure_finite_grad_hess(
-                "logistic",
-                i,
-                wi * (s - yi),
-                (wi * s * (1.0 - s)).max(floor),
-            )?;
-            *gi = g;
-            *hi = h;
-        }
-        Ok(())
+            (wi * (s - yi), (wi * s * (1.0 - s)).max(floor))
+        })
     }
 
     fn init_score(
@@ -656,24 +695,12 @@ impl Loss for Poisson {
             n,
             &[("raw", raw.len()), ("weight", weight.len())],
         )?;
-        out.g.clear();
-        out.g.resize(n, 0.0);
-        out.h.clear();
-        out.h.resize(n, 0.0);
+        // Compute-bound (exp per row) ⇒ row-parallel map, bit-identical: μ=exp(F), g=w(μ−y), h=w·μ.
         let floor = self.hessian_floor();
-        for (i, (gi, hi, &yi, &fi, &wi)) in
-            izip!(&mut out.g, &mut out.h, y, raw, weight).enumerate()
-        {
-            require_finite("poisson", "y", i, yi)?;
-            require_finite("poisson", "raw", i, fi)?;
-            require_weight("poisson", i, wi)?;
+        fill_grad_hess_parallel("poisson", out, y, raw, weight, |yi, fi, wi| {
             let mu = clamp_exp(fi);
-            let (g, h) =
-                ensure_finite_grad_hess("poisson", i, wi * (mu - yi), (wi * mu).max(floor))?;
-            *gi = g;
-            *hi = h;
-        }
-        Ok(())
+            (wi * (mu - yi), (wi * mu).max(floor))
+        })
     }
 
     fn init_score(
@@ -770,24 +797,13 @@ impl Loss for Gamma {
             n,
             &[("raw", raw.len()), ("weight", weight.len())],
         )?;
-        out.g.clear();
-        out.g.resize(n, 0.0);
-        out.h.clear();
-        out.h.resize(n, 0.0);
+        // Compute-bound (exp per row) ⇒ row-parallel map, bit-identical: t=y·e^{−F}, g=w(1−t), h=w·t.
         let floor = self.hessian_floor();
-        for (i, (gi, hi, &yi, &fi, &wi)) in
-            izip!(&mut out.g, &mut out.h, y, raw, weight).enumerate()
-        {
-            require_finite("gamma", "y", i, yi)?;
-            require_finite("gamma", "raw", i, fi)?;
-            require_weight("gamma", i, wi)?;
+        fill_grad_hess_parallel("gamma", out, y, raw, weight, |yi, fi, wi| {
             let em = clamp_exp(-fi); // e^{−F} = y/μ factor base
             let t = yi * em; // y·e^{−F}
-            let (g, h) = ensure_finite_grad_hess("gamma", i, wi * (1.0 - t), (wi * t).max(floor))?;
-            *gi = g;
-            *hi = h;
-        }
-        Ok(())
+            (wi * (1.0 - t), (wi * t).max(floor))
+        })
     }
 
     fn init_score(
@@ -909,30 +925,20 @@ impl Loss for Tweedie {
             n,
             &[("raw", raw.len()), ("weight", weight.len())],
         )?;
-        out.g.clear();
-        out.g.resize(n, 0.0);
-        out.h.clear();
-        out.h.resize(n, 0.0);
+        // Compute-bound (two exps per row) ⇒ row-parallel map, bit-identical to the sequential
+        // kernel (no fold, no drift).
         let floor = self.hessian_floor();
         let p1 = 1.0 - self.rho; // (1−ρ) < 0
         let p2 = 2.0 - self.rho; // (2−ρ) > 0
-        for (i, (gi, hi, &yi, &fi, &wi)) in
-            izip!(&mut out.g, &mut out.h, y, raw, weight).enumerate()
-        {
-            require_finite("tweedie", "y", i, yi)?;
-            require_finite("tweedie", "raw", i, fi)?;
-            require_weight("tweedie", i, wi)?;
+        fill_grad_hess_parallel("tweedie", out, y, raw, weight, |yi, fi, wi| {
             let a = clamp_exp(p1 * fi); // e^{(1−ρ)F} = μ^{1−ρ}
             let b = clamp_exp(p2 * fi); // e^{(2−ρ)F} = μ^{2−ρ}
             let g = wi * (-yi * a + b);
             // h = w[ −y(1−ρ)e^{(1−ρ)F} + (2−ρ)e^{(2−ρ)F} ] (the §05.3 form; here
             // `-yi * p1` with p1=(1−ρ)<0 is the equivalent y(ρ−1)·a ≥ 0), ≥ 0 for y ≥ 0.
             let h = (wi * (-yi * p1 * a + p2 * b)).max(floor);
-            let (g, h) = ensure_finite_grad_hess("tweedie", i, g, h)?;
-            *gi = g;
-            *hi = h;
-        }
-        Ok(())
+            (g, h)
+        })
     }
 
     fn init_score(
@@ -1614,5 +1620,42 @@ mod tests {
         let base = run_tw(1);
         assert_eq!(base, run_tw(2), "tweedie deviance differs at 2 threads");
         assert_eq!(base, run_tw(8), "tweedie deviance differs at 8 threads");
+    }
+
+    #[test]
+    fn log_link_grad_hess_parallel_path_is_bit_identical_across_thread_counts() {
+        // The log-link grad_hess is a row-parallel MAP (independent per-row writes) ⇒ bit-identical
+        // to the sequential loop regardless of thread count (no fold, no drift). Exercise the
+        // parallel path (n > PAR_DEVIANCE_CHUNK) and pin every g/h cell across 1/2/8 threads.
+        let n = PAR_DEVIANCE_CHUNK * 3 + 53;
+        let raw: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 4) as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| (i % 5) as f32 * 0.5).collect();
+        let y_pos: Vec<f32> = (0..n).map(|i| 0.25 + (i % 5) as f32).collect();
+        let losses: Vec<(&str, Box<dyn Loss>)> = vec![
+            ("logistic", Box::new(Logistic)),
+            ("poisson", Box::new(Poisson)),
+            ("gamma", Box::new(Gamma)),
+            ("tweedie", Box::new(Tweedie::new(1.5).unwrap())),
+        ];
+        for (name, loss) in &losses {
+            let yy: &[f32] = if *name == "gamma" { &y_pos } else { &y };
+            let run = |threads: usize| {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| {
+                    let mut gh = GradHess::default();
+                    loss.grad_hess(yy, &raw, &w, &mut gh).unwrap();
+                    let g: Vec<u32> = gh.g.iter().map(|v| v.to_bits()).collect();
+                    let h: Vec<u32> = gh.h.iter().map(|v| v.to_bits()).collect();
+                    (g, h)
+                })
+            };
+            let base = run(1);
+            assert_eq!(base, run(2), "{name} grad_hess differs at 2 threads");
+            assert_eq!(base, run(8), "{name} grad_hess differs at 8 threads");
+        }
     }
 }
