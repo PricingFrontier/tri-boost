@@ -932,6 +932,18 @@ fn product_u64(extents: &[usize]) -> Result<u64, PbError> {
     Ok(acc)
 }
 
+/// `Π extents` as `u64`, SATURATING to `u64::MAX` on overflow. Used where only the comparison
+/// "does this exceed the enumeration cap?" matters — never an exact count. A joint grid too
+/// large to represent (e.g. a 130-feature model → `2^130` cells) must route to the sampling
+/// branch, not hard-error, so the gate sweep stays bounded on wide models (§08.6/§08.8).
+fn saturating_product_u64(extents: &[usize]) -> u64 {
+    let mut acc = 1u64;
+    for &e in extents {
+        acc = acc.saturating_mul(e as u64);
+    }
+    acc
+}
+
 /// Compute the leaf index a tree assigns to a merged cell-tuple of its support, routing
 /// each split via the SINGLE canonical `low_bit` on the cell's representative model bin.
 fn leaf_index_for_tuple(
@@ -1969,7 +1981,11 @@ fn enumerate_check_points(
     for r in feats {
         extents.push(grids.cells(*r)?);
     }
-    let total = product_u64(&extents)?;
+    // SATURATE, don't error: on a wide model the joint grid (Π cells over all gate features)
+    // can exceed u64 — that simply means it dwarfs the enumeration cap and must be SAMPLED.
+    // (Erroring here was the high-dimensional-categorical decomposition bug, e.g. allstate's
+    // 130 features overflowing u64 before the cap check could route to sampling.)
+    let total = saturating_product_u64(&extents);
 
     let mut emit = |tuple: &[usize]| -> Result<(), PbError> {
         let mut x_cells = vec![0u32; n_features];
@@ -4024,6 +4040,41 @@ mod tests {
             (per_tree - joint).abs() < 1e-9 * (1.0 + joint.abs()),
             "per-tree mass {per_tree} != exhaustive joint mass {joint}"
         );
+    }
+
+    /// REGRESSION (high-dimensional decomposition): a model wide enough that the joint-grid
+    /// cell count `Π(cells)` exceeds `u64` (here 70 binary-cell axes => `2^70`) must SAMPLE the
+    /// gate sweep, not hard-error. This was the allstate (130-feature) `tables()` crash —
+    /// `enumerate_check_points` computed the product as `u64` and overflowed BEFORE the cap
+    /// check could route it to sampling. The fix (`saturating_product_u64`) caps at `u64::MAX`.
+    #[test]
+    fn wide_model_joint_grid_samples_instead_of_overflowing() {
+        let n = 70usize;
+        let per_raw = (0..n)
+            .map(|i| MergedAxis {
+                axis: i,
+                borders: vec![], // cells() = 2 per axis => 2^70 total, overflows u64
+                model_border_index: vec![],
+                model_n_bins: 2,
+            })
+            .collect();
+        let grids = MergedGrids { per_raw };
+        let feats: Vec<FeatureId> = (0..n as u32).map(FeatureId).collect();
+
+        TEST_JOINT_CAP.with(|c| c.set(64));
+        let mut visited = 0usize;
+        let sampled = enumerate_check_points(&grids, &feats, |_x_cells, _rep_bins| {
+            visited += 1;
+            Ok(())
+        });
+        TEST_JOINT_CAP.with(|c| c.set(0));
+
+        let sampled = sampled.expect("a >u64 joint grid must sample, not overflow-error");
+        assert!(
+            sampled,
+            "a 2^70-cell joint grid must take the SAMPLING branch"
+        );
+        assert_eq!(visited, 64, "sampling emits exactly joint_cap points");
     }
 
     /// The integral gates stay correct when the joint grid is SAMPLED (the >JOINT_CAP
