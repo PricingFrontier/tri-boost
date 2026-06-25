@@ -97,5 +97,36 @@ Architect design pass (read the full split/low_bit/explain architecture). Verdic
   G2/G3 loss). Per the architect: neither variant addresses it.
 Decision: skip. Pivot to the safe, biggest-gap, genuine technique → #2/#3 (LightGBM histogram subtraction, G5).
 
+### #2/#3 G5 histogram subtraction (LightGBM) — ❌ REFUTED by profiling (2026-06-25, no code)
+Before building it, profiled where diamonds fit-time (4000 trees) actually goes:
+| config | time | acc |
+|---|---|---|
+| refine=4 + earlystop | 29.9s | 0.08896 |
+| refine=0 + earlystop | 11.1s | 0.09070 |
+| refine=4, no es | 29.1s | 0.08854 |
+| refine=0, no es | 10.4s | 0.09047 |
+| refine=0, n_trees=1000 | 2.5s | 0.09580 |
+**leaf_refine_steps=4 is ~2/3 of fit time** (10.4→29.1s); early-stop eval is ~free (+0.7s); histograms are
+the SMALLER ~10s base. So histogram subtraction (the roadmap's G5 technique, which assumed histograms
+dominate) would yield ~7% overall — not worth 2-3 days. Also: QuantizedI32 is currently SLOWER than
+FullF64 (diamonds 40s vs 34s) with identical accuracy (it dequantizes per-cell before the scan), so even
+the prerequisite needs an integer-scan rewrite first. REFUTED. The real G5 cost is leaf_refine's repeated
+full-row passes (aggregation + backtracking deviance); parallelizing them is blocked by the byte-determinism
+invariant (needs fixed-order folds) and grad_hess is single-threaded (loss.rs) but trivial for squared-error.
+
+## FRONTIER ASSESSMENT (2026-06-25)
+After a rival-technique research workflow + rigorous attempts, tri-boost is at its **G0-constrained frontier**:
+- **G1 (EBM)**: won @order-3 (3/4); @order-1/2 behind — EBM is a mains SPECIALIST (cyclic boosting tried →
+  worse; bagging dataset-dependent). Structural.
+- **G2 (xgb/lgbm d3)**: 4/6. Losses = diamonds (leaf-wise depth-3 strictly more expressive than oblivious —
+  G0-forbidden to match) + amazon (tuple signal needs order>3 — G0-forbidden; combos break the rule + don't generalize).
+- **G3 (cat d3-ctr1)**: 5/6. Loss = amazon (same tuple issue).
+- **G5 (speed)**: coarse config-profiling shows leaf_refine ~2/3 of fit time (hist-subtraction refuted). NEXT:
+  add GRANULAR per-phase timers inside the Rust fit (hist build / split-find / leaf_refine grad_hess /
+  aggregation / backtracking deviance / update / early-stop) to pinpoint the EXACT bottleneck before optimizing.
+Every clean rival technique either (a) reduces to what tri already does (inert), (b) requires breaking G0
+(order>3 / leaf-wise / non-contiguous splits), or (c) is mature-implementation overhead. The real wins tri
+HOLDS (G1@3, G2 4/6, G3 5/6, exact decomposition throughout) are already banked.
+
 ## Implemented techniques (committed wins)
-_(none yet — next: #2/#3 G5 histogram subtraction, engine-only/G0-safe)_
+_(none — the roadmap's techniques were each rejected with measured/analytic evidence; see above)_
