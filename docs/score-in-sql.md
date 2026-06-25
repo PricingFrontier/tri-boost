@@ -167,6 +167,24 @@ For a logit-link model, the probability is:
 If a model was trained with an exposure offset or another serving offset, add the
 same offset to `raw_score` before applying the inverse link.
 
+## Factored High-Order Effects (§08.10)
+
+At competitive tree counts an order-3 effect over fine continuous features can exceed the
+dense cell budget (`max_table_cells`, default 2,000,000 — e.g. ~130³). Such an effect is NOT
+emitted as a dense `tables` entry; it appears in the export's separate `factored` array as a
+sum of per-tree boxes — the same `f_u` the dense table would hold, without materializing the
+cube. (A model with no over-budget triple has an empty `factored` array; the `tables` path
+alone is then complete.)
+
+Each `factored` entry has `feature_set`, `feature_names`, `variance`/`sobol` (display), and
+`boxes`. Each box carries, for the support's three axes: `thresholds[d]` (the split border
+value), `missing_left[d]` (missing routing), and 8 `octants` indexed `s0 | s1<<1 | s2<<2`,
+where `s_d = 1` ⇒ `x_d <= thresholds[d]` (a missing `x_d` takes `missing_left[d]`). The effect
+is `Σ_box octants[side(x)]`, so it scores as a UNION of per-tree `CASE` expressions added into
+`raw_score` — one term per box, the octant chosen by the three side-bits. Reconstruction
+(`f0 + Σ dense tables + Σ factored effects`) is bit-exact to the ensemble; the five I2 gates
+pass on the factored bank.
+
 ## Validation Checklist
 
 Before using the SQL path in production:

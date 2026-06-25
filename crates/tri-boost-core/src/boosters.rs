@@ -745,6 +745,20 @@ pub fn average_banks(members: &[(f32, TableBank)], w: &RefMeasure) -> Result<Tab
             what: format!("member alphas must sum to 1.0, got {alpha_sum}"),
         });
     }
+    // §08.10: a member with factored high-order tables would have its order-3 effect
+    // SILENTLY DROPPED by the tables-only accumulation below. Reject it loudly until
+    // factored-aware averaging exists (Stage 5), mirroring to_rating_export/recompute_under.
+    for (idx, (_, bank)) in members.iter().enumerate() {
+        if !bank.factored.is_empty() {
+            return Err(PbError::InvalidConfig {
+                what: format!(
+                    "average_banks member {idx} carries factored high-order tables; \
+                     factored-aware averaging is not yet implemented (Stage 5) — build members \
+                     with OverflowPolicy::Error or a larger max_table_cells"
+                ),
+            });
+        }
+    }
 
     let n_features = members
         .first()

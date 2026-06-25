@@ -9,7 +9,7 @@
 
 use crate::engine::{ExactnessMode, Model, ModelSchema};
 use crate::error::PbError;
-use crate::explain::{FeatureSet, RefMeasure, TableBank};
+use crate::explain::{FactoredBoxExport, FeatureSet, RefMeasure, TableBank};
 use crate::loss::{Link, ObjectiveTag};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -323,6 +323,26 @@ pub struct RatingExport {
     pub reference_measure: RefMeasure,
     /// Sobol-sorted purified tables.
     pub tables: Vec<RatingTable>,
+    /// Factored over-budget order-3 effects (§08.10); empty for budget-fitting banks.
+    #[serde(default)]
+    pub factored: Vec<RatingFactored>,
+}
+
+/// One exported factored order-3 effect (the over-budget escape hatch, §08.10): a sum of
+/// per-tree boxes kept WITHOUT a dense cube. Score it as `Σ_box octant[side(x)]`, e.g. a
+/// UNION of per-tree CASE expressions in SQL.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RatingFactored {
+    /// Raw feature set (order 3).
+    pub feature_set: FeatureSet,
+    /// Feature names parallel to `feature_set`.
+    pub feature_names: Vec<String>,
+    /// Per-tree boxes (each: per-axis threshold + missing routing + 8 purified octants).
+    pub boxes: Vec<FactoredBoxExport>,
+    /// Cached effect variance `σ²(f_u)`.
+    pub variance: f64,
+    /// Sobol share under the bank's reference measure.
+    pub sobol: f64,
 }
 
 impl TableBank {
@@ -425,6 +445,29 @@ impl TableBank {
                 .total_cmp(&a.sobol)
                 .then_with(|| a.feature_set.cmp(&b.feature_set))
         });
+        // Factored over-budget order-3 effects (§08.10): emit per-tree boxes (not rebased —
+        // the factored residual is already purified) so the export reconstructs F_ens.
+        let mut factored = Vec::with_capacity(self.factored.len());
+        for ft in &self.factored {
+            let mut feature_names = Vec::with_capacity(ft.u.order());
+            for raw in &ft.u.0 {
+                let name = schema
+                    .feature_names
+                    .get(raw.0 as usize)
+                    .ok_or_else(|| PbError::ShapeMismatch {
+                        what: format!("schema missing feature name for raw {}", raw.0),
+                    })?
+                    .clone();
+                feature_names.push(name);
+            }
+            factored.push(RatingFactored {
+                feature_set: ft.u.clone(),
+                feature_names,
+                boxes: ft.export_boxes()?,
+                variance: ft.variance,
+                sobol: *sobol.get(&ft.u).unwrap_or(&0.0),
+            });
+        }
         Ok(RatingExport {
             format_version: FORMAT_VERSION,
             schema_version: SCHEMA_VERSION,
@@ -434,6 +477,7 @@ impl TableBank {
             f0,
             reference_measure: self.w.clone(),
             tables,
+            factored,
         })
     }
 }

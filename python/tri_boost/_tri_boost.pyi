@@ -123,6 +123,7 @@ class _Model:
         ref_measure: str | None = None,
         laplace: float = 1.0,
         cat_x: Sequence[Sequence[str]] | None = None,
+        overflow: str | None = None,
     ) -> _TableBank: ...
 
     def tables(
@@ -132,6 +133,7 @@ class _Model:
         laplace: float = 1.0,
         basis_json: str | None = None,
         cat_x: Sequence[Sequence[str]] | None = None,
+        overflow: str | None = None,
     ) -> str: ...
 
     def to_json(self) -> str: ...

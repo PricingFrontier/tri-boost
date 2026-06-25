@@ -493,6 +493,7 @@ class TriBoostRegressor(RegressorMixin, _BaseTriBoost):  # type: ignore[misc]
         ref_measure: str | None = None,
         laplace: float = 1.0,
         basis_json: str | None = None,
+        overflow: str | None = None,
     ) -> str:
         check_is_fitted(self, "_model")
         x32, cat_x = self._serve_design(X)
@@ -502,6 +503,7 @@ class TriBoostRegressor(RegressorMixin, _BaseTriBoost):  # type: ignore[misc]
             laplace=float(laplace),
             basis_json=basis_json,
             cat_x=cat_x,
+            overflow=overflow,
         )
 
 
@@ -658,6 +660,7 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):  # type: ignore[misc]
         ref_measure: str | None = None,
         laplace: float = 1.0,
         basis_json: str | None = None,
+        overflow: str | None = None,
     ) -> str:
         check_is_fitted(self, "_model")
         x32, cat_x = self._serve_design(X)
@@ -667,6 +670,7 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):  # type: ignore[misc]
             laplace=float(laplace),
             basis_json=basis_json,
             cat_x=cat_x,
+            overflow=overflow,
         )
 
     def _attach_classifier_model(self, model: _Model) -> None:

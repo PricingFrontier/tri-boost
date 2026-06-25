@@ -23,4 +23,6 @@ __pycache__/
 
 # Benchmark rival-result cache (generated; rivals are deterministic per config)
 benchmarks/.bench_cache.json
+benchmarks/.suite_cache.json
+benchmarks/.data_cache/
 speed_accuracy_work.md

@@ -24,7 +24,7 @@ use tri_boost_core::data::{
 };
 use tri_boost_core::engine::{Booster, Config, FitSpec, HistPrecision, Model, Sampling};
 use tri_boost_core::error::{Invariant, PbError};
-use tri_boost_core::explain::{RefMeasure, TableBank};
+use tri_boost_core::explain::{OverflowPolicy, RefMeasure, TableBank, TableBudget};
 use tri_boost_core::loss::{Gamma, Logistic, Loss, Poisson, SquaredError, Tweedie};
 use tri_boost_core::serialize::RatingBasis;
 
@@ -523,7 +523,7 @@ impl PyModel {
         })
     }
 
-    #[pyo3(signature = (x, ref_measure=None, laplace=1.0, cat_x=None))]
+    #[pyo3(signature = (x, ref_measure=None, laplace=1.0, cat_x=None, overflow=None))]
     fn explain(
         &self,
         py: Python<'_>,
@@ -531,20 +531,26 @@ impl PyModel {
         ref_measure: Option<String>,
         laplace: f32,
         cat_x: Option<Vec<Vec<String>>>,
+        overflow: Option<String>,
     ) -> PyResult<PyTableBank> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
         let w = parse_ref_measure(ref_measure, laplace).map_err(py_err)?;
+        let budget = parse_table_budget(overflow.as_deref()).map_err(py_err)?;
         let bank = py
             .detach(move || {
                 let binned = serve_binned_for_model(&model, columns, cat_x)?;
-                model.explain(&tri_boost_core::data::ServeBinnedMatrix(binned), w)
+                model.explain_with_budget(
+                    &tri_boost_core::data::ServeBinnedMatrix(binned),
+                    w,
+                    budget,
+                )
             })
             .map_err(py_err)?;
         Ok(PyTableBank { bank })
     }
 
-    #[pyo3(signature = (x, ref_measure=None, laplace=1.0, basis_json=None, cat_x=None))]
+    #[pyo3(signature = (x, ref_measure=None, laplace=1.0, basis_json=None, cat_x=None, overflow=None))]
     #[allow(clippy::too_many_arguments)]
     fn tables(
         &self,
@@ -554,14 +560,20 @@ impl PyModel {
         laplace: f32,
         basis_json: Option<&str>,
         cat_x: Option<Vec<Vec<String>>>,
+        overflow: Option<String>,
     ) -> PyResult<String> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
         let w = parse_ref_measure(ref_measure, laplace).map_err(py_err)?;
         let basis = parse_rating_basis(basis_json)?;
+        let budget = parse_table_budget(overflow.as_deref()).map_err(py_err)?;
         py.detach(move || {
             let binned = serve_binned_for_model(&model, columns, cat_x)?;
-            let bank = model.explain(&tri_boost_core::data::ServeBinnedMatrix(binned), w)?;
+            let bank = model.explain_with_budget(
+                &tri_boost_core::data::ServeBinnedMatrix(binned),
+                w,
+                budget,
+            )?;
             let export =
                 bank.to_rating_export(model.link, &model.mode, &model.schema, basis.as_ref())?;
             serde_json::to_string_pretty(&export).map_err(|err| {
@@ -929,6 +941,35 @@ fn parse_ref_measure(name: Option<String>, laplace: f32) -> Result<RefMeasure, P
             what: format!("unknown reference measure `{other}`"),
         }),
     }
+}
+
+/// Resolve the table-budget overflow policy for `explain`/`tables` (spec §08.10).
+///
+/// Defaults to `Error` (the loud, fast fail-fast policy): when a converged model's merged
+/// grid pushes an order-3 table over the dense `max_table_cells` budget, the caller gets an
+/// immediate, actionable `PbError::TableBudget` rather than a silent failure. `"sparse"` opts
+/// into the EXACT `SparseFallback` storage — currently a slow path (accumulation still walks
+/// the dense extent), so it is opt-in until the occupancy-driven walk lands. Both policies
+/// are exactness-preserving.
+fn parse_table_budget(overflow: Option<&str>) -> Result<TableBudget, PbError> {
+    let on_overflow = match overflow.map(str::to_ascii_lowercase).as_deref() {
+        // DEFAULT: factor over-budget order-3 effects (exact, §08.10) — the decomposition no
+        // longer hard-fails at competitive tree counts. `error`/`sparse` remain opt-in.
+        None | Some("factored") | Some("factor") => OverflowPolicy::Factored,
+        Some("error") | Some("hard") => OverflowPolicy::Error,
+        Some("sparse") | Some("sparse_fallback") => OverflowPolicy::SparseFallback {
+            density_threshold: 0.05,
+        },
+        Some(other) => {
+            return Err(PbError::InvalidConfig {
+                what: format!("overflow must be 'factored', 'error', or 'sparse', got `{other}`"),
+            })
+        }
+    };
+    Ok(TableBudget {
+        on_overflow,
+        ..TableBudget::default()
+    })
 }
 
 fn parse_rating_basis(value: Option<&str>) -> PyResult<Option<RatingBasis>> {

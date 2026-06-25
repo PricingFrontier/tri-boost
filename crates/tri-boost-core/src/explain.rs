@@ -522,6 +522,11 @@ pub struct TableBank {
     pub merged_grids: Vec<BorderGrid>,
     /// The reference measure stamped on the bank and every export.
     pub w: RefMeasure,
+    /// Over-budget order-3 effects kept in factored (per-tree-box) form — never densified
+    /// (§08.10). Empty for budget-fitting banks; each carries the same `f_u` a dense
+    /// [`EffectTable`] would, for score/shap/sobol and the five I2 gates.
+    #[serde(default)]
+    pub factored: Vec<FactoredTriple>,
 }
 
 /// Tolerances for the I2 checks (spec §13.1). `recon_tol` is the canonical
@@ -573,7 +578,7 @@ impl Default for TableBudget {
         Self {
             max_table_cells: 2_000_000,
             max_bank_cells: 32_000_000,
-            on_overflow: OverflowPolicy::Error,
+            on_overflow: OverflowPolicy::Factored,
         }
     }
 }
@@ -590,6 +595,11 @@ pub enum OverflowPolicy {
         /// Maximum realized nonzero occupancy allowed for sparse storage.
         density_threshold: f64,
     },
+    /// Keep an over-budget order-3 effect in FACTORED per-tree-box form (§08.10) — exact,
+    /// never densified. Only order-3 supports can exceed the cell budget (order-2 ≤ 254²),
+    /// so this is the order-3 escape hatch: the residual stays factored and its order-≤2
+    /// mass is shed into the dense lower tables.
+    Factored,
 }
 
 /// The purification convergence mode (spec §08.3).
@@ -962,7 +972,7 @@ fn accumulate(
     model: &Model,
     grids: &MergedGrids,
     budget: &TableBudget,
-) -> Result<RawBank, PbError> {
+) -> Result<(RawBank, BTreeSet<FeatureSet>), PbError> {
     if let OverflowPolicy::SparseFallback { density_threshold } = budget.on_overflow {
         if !density_threshold.is_finite() || !(0.0..=1.0).contains(&density_threshold) {
             return Err(PbError::InvalidConfig {
@@ -972,9 +982,15 @@ fn accumulate(
     }
     let mut tables: BTreeMap<FeatureSet, RawTable> = BTreeMap::new();
     let mut bank_cells: u64 = 0;
+    // Supports whose dense merged cube exceeds the budget under OverflowPolicy::Factored —
+    // never materialized here; the pipeline sheds them per tree into the lower tables.
+    let mut factored_supports: BTreeSet<FeatureSet> = BTreeSet::new();
 
     for (alpha, tree) in &model.trees {
         let u = tree_support(model, tree)?;
+        if factored_supports.contains(&u) {
+            continue;
+        }
         let u_ids: Vec<FeatureId> = u.0.iter().copied().collect();
         if !tables.contains_key(&u) {
             let mut extents = Vec::with_capacity(u_ids.len());
@@ -993,6 +1009,17 @@ fn accumulate(
                     }
                     OverflowPolicy::SparseFallback { .. } => {
                         Tensor::try_sparse_zeros(extents.clone())?
+                    }
+                    OverflowPolicy::Factored => {
+                        if u.order() != 3 {
+                            return Err(PbError::TableBudget {
+                                what: format!("only order-3 effects can be factored; {u:?}"),
+                                cells: table_cells,
+                                budget: budget.max_table_cells,
+                            });
+                        }
+                        factored_supports.insert(u.clone());
+                        continue;
                     }
                 }
             } else {
@@ -1056,10 +1083,13 @@ fn accumulate(
         }
     }
 
-    Ok(RawBank {
-        f0: f64::from(model.f0),
-        tables,
-    })
+    Ok((
+        RawBank {
+            f0: f64::from(model.f0),
+            tables,
+        },
+        factored_supports,
+    ))
 }
 
 // ===========================================================================
@@ -1304,6 +1334,7 @@ fn purify(
         tables,
         merged_grids: grids.border_grids()?,
         w: w.kind.clone(),
+        factored: Vec::new(),
     })
 }
 
@@ -1331,6 +1362,514 @@ fn table_variance(u: &FeatureSet, values: &Tensor, w: &WeightCache) -> Result<f6
         Ok(())
     })?;
     Ok(m2 - m1 * m1)
+}
+
+// ===========================================================================
+// §08.10 — Factored high-order effects (the over-budget escape hatch).
+// ===========================================================================
+
+/// One depth-3 tree's purified order-3 contribution, stored as its `2×2×2` octant box
+/// plus the per-axis low-side masks over the merged grid — never the dense union cube.
+#[allow(dead_code)] // wired into the over-budget accumulate/purify path in Stage 3.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct TripleBox {
+    /// Purified octant values; index `= s0 | s1<<1 | s2<<2`, `s_d = 1` on the LOW side of
+    /// table axis `d` (matching [`ObliviousTree`] leaf routing). Triple-centered under the
+    /// global per-axis `w`, so it is exactly this tree's order-3 fANOVA component.
+    p: [f64; 8],
+    /// Per-table-axis low-side mask over merged cells (`true` ⇒ cell is on the low side).
+    low: [Vec<bool>; 3],
+}
+
+/// One per-tree box of a factored order-3 effect in EXPORT form: the per-axis split
+/// threshold (merged-grid border value) + missing-left routing, and the 8 purified octant
+/// values (index `s0 | s1<<1 | s2<<2`, `s_d = 1` ⇒ the LOW side `x ≤ threshold`). The effect
+/// is `Σ_box octant[side(x)]`, so a deployment can score it as a UNION of per-tree CASE
+/// expressions without ever materializing the dense merged cube.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FactoredBoxExport {
+    /// Per-axis split threshold (the realized border value on each of the support's 3 axes).
+    pub thresholds: [f32; 3],
+    /// Per-axis learned missing direction (the reserved missing cell routes low when true).
+    pub missing_left: [bool; 3],
+    /// Purified octant values; index `s0 | s1<<1 | s2<<2`, `s_d = 1` ⇒ `x ≤ thresholds[d]`.
+    pub octants: [f64; 8],
+}
+
+/// A factored order-3 effect for support `u`: the sum of per-tree purified boxes
+/// (`f_u = Σ_t p_t`, Lengerich Cor. 2.2 linearity), kept WITHOUT materializing the dense
+/// `Π cells` merged cube. Exact prediction ([`eval`](Self::eval), `O(#trees)`) and exact
+/// `w`-weighted variance ([`variance`](Self::variance), `Σ_{t,s}⟨p_t,p_s⟩_w` via a per-axis
+/// `2×2` weighted-mass contraction) — proven equal to the dense purified table for any
+/// axis-factorized `w` (Uniform / ProductMarginals); only non-product `Joint` would break
+/// the factorization (rejected in v1).
+#[allow(dead_code)] // wired into the over-budget accumulate/purify path in Stage 3.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FactoredTriple {
+    /// The 3-feature support (table-dim order = sorted raw ids).
+    pub u: FeatureSet,
+    /// Merged-grid axes, parallel to the box dims.
+    pub axes: Vec<AxisId>,
+    /// Per-table-axis merged-cell weights (normalized, `Σ = 1`), shared by all boxes.
+    per_axis_w: [Vec<f64>; 3],
+    /// One purified box per support-`u` tree.
+    boxes: Vec<TripleBox>,
+    /// Cached `σ²(f_u)` under the bank's `w` (the proven `Σ_{t,s}⟨p_t,p_s⟩` closed form),
+    /// so [`TableBank::sobol`]/`check_variance_sum` read it like an [`EffectTable`]'s.
+    pub variance: f64,
+}
+
+#[allow(dead_code)] // wired into the over-budget accumulate/purify path in Stage 3.
+impl FactoredTriple {
+    /// Build the factored order-3 effect for support `u` from every tree whose support is
+    /// exactly `u`, purifying each tree's box under the global per-axis weights `w`.
+    fn from_model(
+        model: &Model,
+        u: &FeatureSet,
+        grids: &MergedGrids,
+        w: &WeightCache,
+    ) -> Result<Self, PbError> {
+        if u.order() != 3 {
+            return Err(PbError::Internal {
+                what: "FactoredTriple requires an order-3 support".into(),
+            });
+        }
+        let u_ids: Vec<FeatureId> = u.0.iter().copied().collect();
+        let mut per_axis_w: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (slot, r) in per_axis_w.iter_mut().zip(u_ids.iter()) {
+            *slot = w.axis(*r)?.to_vec();
+        }
+        let axes: Vec<AxisId> = u_ids
+            .iter()
+            .map(|r| grids.axis_id(*r))
+            .collect::<Result<_, _>>()?;
+        let mut boxes = Vec::new();
+        for (alpha, tree) in &model.trees {
+            if &tree_support(model, tree)? != u {
+                continue;
+            }
+            let (mut p, low) = build_tree_box(model, f64::from(*alpha), tree, &u_ids, grids)?;
+            let (wlo, whi) = side_weights(&low, &per_axis_w)?;
+            purify_box(&mut p, wlo, whi)?;
+            boxes.push(TripleBox { p, low });
+        }
+        let mut ft = FactoredTriple {
+            u: u.clone(),
+            axes,
+            per_axis_w,
+            boxes,
+            variance: 0.0,
+        };
+        ft.variance = ft.compute_variance()?;
+        Ok(ft)
+    }
+
+    /// `f_u(x_u)` at a row given its per-raw merged-cell ids — the sum of every box's
+    /// octant value. `O(#trees)`, no dense cube.
+    pub fn eval(&self, x_cells: &[u32]) -> Result<f64, PbError> {
+        let cells: Vec<usize> = self
+            .axes
+            .iter()
+            .map(|a| {
+                x_cells
+                    .get(a.raw.0 as usize)
+                    .copied()
+                    .map(|c| c as usize)
+                    .ok_or_else(|| PbError::ShapeMismatch {
+                        what: format!("x_cells missing raw {} for factored eval", a.raw.0),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let mut acc = 0.0_f64;
+        for b in &self.boxes {
+            let mut idx = 0usize;
+            for (d_bit, (mask, &cell)) in b.low.iter().zip(cells.iter()).enumerate() {
+                let s = *mask.get(cell).ok_or_else(|| PbError::Internal {
+                    what: "factored eval cell escaped low mask".into(),
+                })?;
+                idx |= usize::from(s) << d_bit;
+            }
+            acc += *b.p.get(idx).ok_or_else(|| PbError::Internal {
+                what: "factored eval box index escaped 0..8".into(),
+            })?;
+        }
+        Ok(acc)
+    }
+
+    /// Per-tree boxes in export form (thresholds + octants); see [`FactoredBoxExport`]. Lets
+    /// the rating export / SQL recipe emit this effect without ever densifying the cube.
+    pub fn export_boxes(&self) -> Result<Vec<FactoredBoxExport>, PbError> {
+        let mut out = Vec::with_capacity(self.boxes.len());
+        for b in &self.boxes {
+            let mut thresholds = [0.0_f32; 3];
+            let mut missing_left = [false; 3];
+            for (((thr, miss), mask), axis) in thresholds
+                .iter_mut()
+                .zip(missing_left.iter_mut())
+                .zip(b.low.iter())
+                .zip(self.axes.iter())
+            {
+                // A tree's threshold θ = borders[j] makes finite cells 1..=j+1 low, so the
+                // count of finite low cells is j+1 (always ≥ 1 — the split border is realized).
+                let finite_low = mask.iter().skip(1).filter(|&&l| l).count();
+                let j = finite_low.checked_sub(1).ok_or_else(|| PbError::Internal {
+                    what: "factored box has no low finite cell".into(),
+                })?;
+                *thr = *axis.borders.get(j).ok_or_else(|| PbError::Internal {
+                    what: "factored box threshold escaped borders".into(),
+                })?;
+                *miss = *mask.first().ok_or_else(|| PbError::Internal {
+                    what: "factored box missing cell absent".into(),
+                })?;
+            }
+            out.push(FactoredBoxExport {
+                thresholds,
+                missing_left,
+                octants: b.p,
+            });
+        }
+        Ok(out)
+    }
+
+    /// `σ²(f_u) = ⟨Σ_t p_t, Σ_t p_t⟩_w = Σ_{t,s}⟨p_t,p_s⟩_w`. Each pairwise inner product
+    /// factorizes as a product over axes of `2×2` weighted-mass matrices (the joint
+    /// low/high cell membership of the two trees), so no joint cube is ever built.
+    fn compute_variance(&self) -> Result<f64, PbError> {
+        let mut var = 0.0_f64;
+        for (i, bi) in self.boxes.iter().enumerate() {
+            var += self.inner(bi, bi)?;
+            for bj in self.boxes.iter().skip(i + 1) {
+                var += 2.0 * self.inner(bi, bj)?;
+            }
+        }
+        Ok(var)
+    }
+
+    /// `⟨p_i, p_j⟩_w` via per-axis `2×2` joint weighted-mass matrices.
+    fn inner(&self, bi: &TripleBox, bj: &TripleBox) -> Result<f64, PbError> {
+        // mass[d][a_i][a_j] = Σ_cell w_d[cell] over cells with sides (a_i, a_j); a = 1 ⇒ low.
+        let mut mass: Vec<[[f64; 2]; 2]> = Vec::with_capacity(3);
+        for ((wd, li), lj) in self.per_axis_w.iter().zip(bi.low.iter()).zip(bj.low.iter()) {
+            let mut m = [[0.0_f64; 2]; 2];
+            for ((&wc, &a_i), &a_j) in wd.iter().zip(li.iter()).zip(lj.iter()) {
+                let row = m
+                    .get_mut(usize::from(a_i))
+                    .ok_or_else(|| PbError::Internal {
+                        what: "factored inner row escaped 0..2".into(),
+                    })?;
+                let cell = row
+                    .get_mut(usize::from(a_j))
+                    .ok_or_else(|| PbError::Internal {
+                        what: "factored inner col escaped 0..2".into(),
+                    })?;
+                *cell += wc;
+            }
+            mass.push(m);
+        }
+        let (m0, m1, m2) = match mass.as_slice() {
+            [a, b, c] => (a, b, c),
+            _ => {
+                return Err(PbError::Internal {
+                    what: "factored inner expects exactly 3 axes".into(),
+                })
+            }
+        };
+        let g = |m: &[[f64; 2]; 2], a: usize, b: usize| -> Result<f64, PbError> {
+            m.get(a)
+                .and_then(|r| r.get(b))
+                .copied()
+                .ok_or_else(|| PbError::Internal {
+                    what: "factored mass index escaped 0..2".into(),
+                })
+        };
+        let pat = |bx: &TripleBox, a0: usize, a1: usize, a2: usize| -> Result<f64, PbError> {
+            bx.p.get(a0 | (a1 << 1) | (a2 << 2))
+                .copied()
+                .ok_or_else(|| PbError::Internal {
+                    what: "factored octant index escaped 0..8".into(),
+                })
+        };
+        let mut s = 0.0_f64;
+        for a0i in 0..2 {
+            for a0j in 0..2 {
+                for a1i in 0..2 {
+                    for a1j in 0..2 {
+                        for a2i in 0..2 {
+                            for a2j in 0..2 {
+                                let wgt = g(m0, a0i, a0j)? * g(m1, a1i, a1j)? * g(m2, a2i, a2j)?;
+                                if wgt != 0.0 {
+                                    s += wgt * pat(bi, a0i, a1i, a2i)? * pat(bj, a0j, a1j, a2j)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(s)
+    }
+}
+
+/// Per-axis low/high total `w`-mass for one tree's masks (`whi = 1 − wlo` since `w` sums
+/// to 1 per axis, but both are summed explicitly for numerical symmetry).
+#[allow(dead_code)] // wired into the over-budget accumulate/purify path in Stage 3.
+fn side_weights(
+    low: &[Vec<bool>; 3],
+    per_axis_w: &[Vec<f64>; 3],
+) -> Result<([f64; 3], [f64; 3]), PbError> {
+    let mut wlo = [0.0_f64; 3];
+    let mut whi = [0.0_f64; 3];
+    for (((slot_lo, slot_hi), wd), mask) in wlo
+        .iter_mut()
+        .zip(whi.iter_mut())
+        .zip(per_axis_w.iter())
+        .zip(low.iter())
+    {
+        for (&wc, &is_low) in wd.iter().zip(mask.iter()) {
+            if is_low {
+                *slot_lo += wc;
+            } else {
+                *slot_hi += wc;
+            }
+        }
+    }
+    Ok((wlo, whi))
+}
+
+/// One support-`u` tree's RAW octant box (table-dim side order, `s_d = 1` ⇒ low) plus the
+/// per-axis low-side masks over the merged grid. Shared by the factored builder and shed.
+#[allow(dead_code)] // wired into the over-budget accumulate/purify path in Stage 3.
+fn build_tree_box(
+    model: &Model,
+    alpha: f64,
+    tree: &crate::engine::ObliviousTree,
+    u_ids: &[FeatureId],
+    grids: &MergedGrids,
+) -> Result<([f64; 8], [Vec<bool>; 3]), PbError> {
+    let mut low: [Vec<bool>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut level_of: [usize; 3] = [0; 3];
+    for (level, split) in tree.splits.iter().enumerate() {
+        let prov = model
+            .provenance
+            .get(split.axis as usize)
+            .ok_or_else(|| PbError::Internal {
+                what: "factored split axis absent from provenance".into(),
+            })?;
+        let d = u_ids
+            .iter()
+            .position(|r| *r == prov.raw)
+            .ok_or_else(|| PbError::Internal {
+                what: "factored split raw absent from support".into(),
+            })?;
+        let ma = grids.axis(prov.raw)?;
+        let cells = ma.cells();
+        let mut mask = Vec::with_capacity(cells);
+        for c in 0..cells {
+            let rep_bin = ma.rep_model_bin(c)?;
+            mask.push(low_bit(rep_bin, split.bin_le, split.missing_left));
+        }
+        *low.get_mut(d).ok_or_else(|| PbError::Internal {
+            what: "factored mask slot escaped 0..3".into(),
+        })? = mask;
+        *level_of.get_mut(d).ok_or_else(|| PbError::Internal {
+            what: "factored level slot escaped 0..3".into(),
+        })? = level;
+    }
+    let mut p = [0.0_f64; 8];
+    for s0 in 0..2usize {
+        for s1 in 0..2usize {
+            for s2 in 0..2usize {
+                let leaf_idx = [s0, s1, s2]
+                    .iter()
+                    .zip(level_of.iter())
+                    .fold(0usize, |acc, (&s, &lv)| acc | (s << lv));
+                let leaf = *tree.leaves.get(leaf_idx).ok_or_else(|| PbError::Internal {
+                    what: "factored leaf index escaped 0..8".into(),
+                })?;
+                *p.get_mut(s0 | (s1 << 1) | (s2 << 2))
+                    .ok_or_else(|| PbError::Internal {
+                        what: "factored box index escaped 0..8".into(),
+                    })? = alpha * f64::from(leaf);
+            }
+        }
+    }
+    Ok((p, low))
+}
+
+/// Center a `2×2×2` box along each table axis IN CASCADE ORDER (axis 0, then 1 on the
+/// 0-centered box, then 2), returning the per-axis marginals shed downward: `marg[p]` is the
+/// `2×2` weighted mean over the OTHER two axes (increasing position order) at step `p` —
+/// exactly what the dense [`center_along`] deposits into the order-2 table `u\{p}`. Leaves
+/// `p` as the triple-centered residual (the tree's order-3 fANOVA component).
+#[allow(dead_code)] // wired into the over-budget accumulate/purify path in Stage 3.
+fn center_box_capturing(
+    p: &mut [f64; 8],
+    wlo: [f64; 3],
+    whi: [f64; 3],
+) -> Result<[[[f64; 2]; 2]; 3], PbError> {
+    let mut marg = [[[0.0_f64; 2]; 2]; 3];
+    for (d, ((&wl, &wh), md)) in wlo.iter().zip(whi.iter()).zip(marg.iter_mut()).enumerate() {
+        let others: [usize; 2] = match d {
+            0 => [1, 2],
+            1 => [0, 2],
+            _ => [0, 1],
+        };
+        let o0 = *others.first().ok_or_else(|| PbError::Internal {
+            what: "center axis pair a".into(),
+        })?;
+        let o1 = *others.get(1).ok_or_else(|| PbError::Internal {
+            what: "center axis pair b".into(),
+        })?;
+        for b0 in 0..2usize {
+            for b1 in 0..2usize {
+                let base = (b0 << o0) | (b1 << o1);
+                let i_hi = base; // s_d = 0 (high)
+                let i_lo = base | (1 << d); // s_d = 1 (low)
+                let hi = *p.get(i_hi).ok_or_else(|| PbError::Internal {
+                    what: "center hi index escaped 0..8".into(),
+                })?;
+                let lo = *p.get(i_lo).ok_or_else(|| PbError::Internal {
+                    what: "center lo index escaped 0..8".into(),
+                })?;
+                let mean = wh * hi + wl * lo;
+                let row = md.get_mut(b0).ok_or_else(|| PbError::Internal {
+                    what: "marginal row escaped 0..2".into(),
+                })?;
+                *row.get_mut(b1).ok_or_else(|| PbError::Internal {
+                    what: "marginal col escaped 0..2".into(),
+                })? = mean;
+                *p.get_mut(i_hi).ok_or_else(|| PbError::Internal {
+                    what: "center hi write escaped 0..8".into(),
+                })? -= mean;
+                *p.get_mut(i_lo).ok_or_else(|| PbError::Internal {
+                    what: "center lo write escaped 0..8".into(),
+                })? -= mean;
+            }
+        }
+    }
+    Ok(marg)
+}
+
+/// Triple-center a `2×2×2` octant box (residual only); see [`center_box_capturing`].
+#[allow(dead_code)] // wired into the over-budget accumulate/purify path in Stage 3.
+fn purify_box(p: &mut [f64; 8], wlo: [f64; 3], whi: [f64; 3]) -> Result<(), PbError> {
+    center_box_capturing(p, wlo, whi).map(|_| ())
+}
+
+/// Run the order-3 purification cascade for an over-budget support `u` WITHOUT the dense
+/// cube: per tree, center its box in cascade order and broadcast each axis's marginal into
+/// the dense order-2 raw table `u\{p}` (lazily created) — by linearity (`Σ_t`) this deposits
+/// exactly what the dense `center_along` would, so the subsequent order-2→1 cascade runs on
+/// the augmented lower tables unchanged. Removes `u` from `raw_tables`; returns the
+/// triple-centered residual as a [`FactoredTriple`].
+#[allow(dead_code)] // wired into the over-budget accumulate/purify path in Stage 3.
+fn factored_shed_into_raw(
+    model: &Model,
+    u: &FeatureSet,
+    grids: &MergedGrids,
+    w: &WeightCache,
+    raw_tables: &mut BTreeMap<FeatureSet, RawTable>,
+) -> Result<FactoredTriple, PbError> {
+    if u.order() != 3 {
+        return Err(PbError::Internal {
+            what: "factored_shed_into_raw requires an order-3 support".into(),
+        });
+    }
+    let u_ids: Vec<FeatureId> = u.0.iter().copied().collect();
+    let mut per_axis_w: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (slot, r) in per_axis_w.iter_mut().zip(u_ids.iter()) {
+        *slot = w.axis(*r)?.to_vec();
+    }
+    let axes: Vec<AxisId> = u_ids
+        .iter()
+        .map(|r| grids.axis_id(*r))
+        .collect::<Result<_, _>>()?;
+    let mut boxes = Vec::new();
+    for (alpha, tree) in &model.trees {
+        if &tree_support(model, tree)? != u {
+            continue;
+        }
+        let (mut p, low) = build_tree_box(model, f64::from(*alpha), tree, &u_ids, grids)?;
+        let (wlo, whi) = side_weights(&low, &per_axis_w)?;
+        let marg = center_box_capturing(&mut p, wlo, whi)?;
+        for pos in 0..3usize {
+            let m_pos = marg.get(pos).ok_or_else(|| PbError::Internal {
+                what: "shed marginal axis escaped 0..3".into(),
+            })?;
+            let others: [usize; 2] = match pos {
+                0 => [1, 2],
+                1 => [0, 2],
+                _ => [0, 1],
+            };
+            let o0 = *others.first().ok_or_else(|| PbError::Internal {
+                what: "shed axis pair a".into(),
+            })?;
+            let o1 = *others.get(1).ok_or_else(|| PbError::Internal {
+                what: "shed axis pair b".into(),
+            })?;
+            let sub_u = support_without(u, pos);
+            if !raw_tables.contains_key(&sub_u) {
+                let mut sub_axes = Vec::with_capacity(2);
+                let mut sub_extents = Vec::with_capacity(2);
+                for sr in &sub_u.0 {
+                    sub_axes.push(grids.axis_id(*sr)?);
+                    sub_extents.push(grids.cells(*sr)?);
+                }
+                raw_tables.insert(
+                    sub_u.clone(),
+                    RawTable {
+                        u: sub_u.clone(),
+                        axes: sub_axes,
+                        values: Tensor::try_zeros(sub_extents)?,
+                    },
+                );
+            }
+            let target = raw_tables
+                .get_mut(&sub_u)
+                .ok_or_else(|| PbError::Internal {
+                    what: "factored shed target vanished".into(),
+                })?;
+            let low_a = low.get(o0).ok_or_else(|| PbError::Internal {
+                what: "shed mask a missing".into(),
+            })?;
+            let low_b = low.get(o1).ok_or_else(|| PbError::Internal {
+                what: "shed mask b missing".into(),
+            })?;
+            let extents = target.values.shape();
+            walk_extents(&extents, |coord| {
+                let c0 = *coord.first().ok_or_else(|| PbError::Internal {
+                    what: "shed coord axis 0 missing".into(),
+                })?;
+                let c1 = *coord.get(1).ok_or_else(|| PbError::Internal {
+                    what: "shed coord axis 1 missing".into(),
+                })?;
+                let s0 = usize::from(*low_a.get(c0).ok_or_else(|| PbError::Internal {
+                    what: "shed cell a escaped low mask".into(),
+                })?);
+                let s1 = usize::from(*low_b.get(c1).ok_or_else(|| PbError::Internal {
+                    what: "shed cell b escaped low mask".into(),
+                })?);
+                let row = m_pos.get(s0).ok_or_else(|| PbError::Internal {
+                    what: "shed marginal row escaped 0..2".into(),
+                })?;
+                let delta = *row.get(s1).ok_or_else(|| PbError::Internal {
+                    what: "shed marginal col escaped 0..2".into(),
+                })?;
+                target.values.add(coord, delta)
+            })?;
+        }
+        boxes.push(TripleBox { p, low });
+    }
+    raw_tables.remove(u);
+    let mut ft = FactoredTriple {
+        u: u.clone(),
+        axes,
+        per_axis_w,
+        boxes,
+        variance: 0.0,
+    };
+    ft.variance = ft.compute_variance()?;
+    Ok(ft)
 }
 
 /// Fill each table's per-cell training-row count from `x` (display metadata, §08.7).
@@ -1609,6 +2148,26 @@ pub(crate) fn check_purity(
             }
         }
     }
+    // Factored order-3 effects: each per-tree residual box is triple-centered by
+    // construction, so re-centering it must shed ZERO marginals (every axis-slice already
+    // has w-weighted mean 0). Σ_t of purified boxes is purified, so this certifies the
+    // factored f_u's purity without densifying the merged cube.
+    for ft in &bank.factored {
+        for b in &ft.boxes {
+            let (wlo, whi) = side_weights(&b.low, &ft.per_axis_w)?;
+            let mut p = b.p;
+            let marg = center_box_capturing(&mut p, wlo, whi)?;
+            for plane in &marg {
+                for row in plane {
+                    for &m in row {
+                        if m.abs() > tol {
+                            return Err(PbError::invariant(Invariant::Decomposability));
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1646,7 +2205,8 @@ pub(crate) fn check_variance_sum(
         });
     }
     let var_ens = (m2 / wsum) - (m1 / wsum) * (m1 / wsum);
-    let var_tables: f64 = bank.tables.iter().map(|t| t.variance).sum();
+    let var_tables: f64 = bank.tables.iter().map(|t| t.variance).sum::<f64>()
+        + bank.factored.iter().map(|ft| ft.variance).sum::<f64>();
     // Exact tolerance when exhaustive; a relative band when sampled (the sampled estimator
     // carries Monte-Carlo error, so for >JOINT_CAP-cell models VarianceSum is a STATISTICAL
     // certification, not bit-exact — documented FLAG; MassConservation stays exact).
@@ -1833,10 +2393,23 @@ impl Model {
         }
 
         let grids = MergedGrids::from_model(self)?;
-        let raw = accumulate(self, &grids, &budget)?;
-        verify_raw_accumulation(self, &raw, &grids)?;
+        let (mut raw, factored_supports) = accumulate(self, &grids, &budget)?;
         let weights = build_weights(x, &grids, &w)?;
+        // §08.10: shed each over-budget order-3 support per tree into the dense lower tables,
+        // keeping the residual factored (no dense cube). No-op when none are over budget.
+        let mut factored = Vec::with_capacity(factored_supports.len());
+        for u in &factored_supports {
+            factored.push(factored_shed_into_raw(
+                self,
+                u,
+                &grids,
+                &weights,
+                &mut raw.tables,
+            )?);
+        }
+        verify_raw_accumulation(self, &raw, &factored, &grids)?;
         let mut bank = purify(raw, &weights, &grids, PurifyMode::SinglePass)?;
+        bank.factored = factored;
         fill_support(&mut bank, &grids, x)?;
 
         check_reconstruction(self, &bank)?;
@@ -1855,13 +2428,19 @@ impl Model {
 fn verify_raw_accumulation(
     model: &Model,
     raw: &RawBank,
+    factored: &[FactoredTriple],
     grids: &MergedGrids,
 ) -> Result<(), PbError> {
     let tol = ExactTol::for_model(model).recon_tol;
-    // Reuse the joint enumerator over the raw bank's realized features.
+    // Reuse the joint enumerator over the raw bank's realized features (+ factored supports).
     let mut set: BTreeSet<FeatureId> = model_features(model)?.into_iter().collect();
     for u in raw.tables.keys() {
         for r in &u.0 {
+            set.insert(*r);
+        }
+    }
+    for ft in factored {
+        for r in &ft.u.0 {
             set.insert(*r);
         }
     }
@@ -1882,6 +2461,9 @@ fn verify_raw_accumulation(
             acc += rt.values.at(&coord).ok_or_else(|| PbError::Internal {
                 what: "raw checkpoint coord out of range".into(),
             })?;
+        }
+        for ft in factored {
+            acc += ft.eval(x_cells)?;
         }
         if (ens - acc).abs() > tol {
             return Err(PbError::Internal {
@@ -1905,6 +2487,9 @@ impl TableBank {
         for t in &self.tables {
             acc += t.eval(x_cells)?;
         }
+        for ft in &self.factored {
+            acc += ft.eval(x_cells)?;
+        }
         Ok(acc)
     }
 
@@ -1925,6 +2510,15 @@ impl TableBank {
                 })? += share;
             }
         }
+        for ft in &self.factored {
+            let order = ft.u.order().max(1) as f64;
+            let share = ft.eval(x_cells)? / order;
+            for r in &ft.u.0 {
+                *phi.get_mut(r.0 as usize).ok_or_else(|| PbError::Internal {
+                    what: "shap raw index escaped phi".into(),
+                })? += share;
+            }
+        }
         Ok(phi)
     }
 
@@ -1939,6 +2533,11 @@ impl TableBank {
                 return t.eval(x_cells);
             }
         }
+        for ft in &self.factored {
+            if &ft.u == s {
+                return ft.eval(x_cells);
+            }
+        }
         Ok(0.0)
     }
 
@@ -1946,13 +2545,16 @@ impl TableBank {
     /// §08.5), sorted descending. Under product/uniform `w` they sum to ~1.
     #[must_use]
     pub fn sobol(&self) -> Vec<(FeatureSet, f64)> {
-        let total: f64 = self.tables.iter().map(|t| t.variance).sum();
+        let total: f64 = self.tables.iter().map(|t| t.variance).sum::<f64>()
+            + self.factored.iter().map(|ft| ft.variance).sum::<f64>();
         let mut out: Vec<(FeatureSet, f64)> = self
             .tables
             .iter()
-            .map(|t| {
-                let s = if total > 0.0 { t.variance / total } else { 0.0 };
-                (t.u.clone(), s)
+            .map(|t| (t.u.clone(), t.variance))
+            .chain(self.factored.iter().map(|ft| (ft.u.clone(), ft.variance)))
+            .map(|(u, v)| {
+                let s = if total > 0.0 { v / total } else { 0.0 };
+                (u, s)
             })
             .collect();
         // Sobol-descending with the feature set as an explicit secondary key, so the
@@ -1981,6 +2583,13 @@ impl TableBank {
     /// [`PbError::InvalidConfig`] for the v1-unsupported `Joint` measure; plus propagated
     /// grid/purify errors.
     pub fn recompute_under(&self, w: RefMeasure) -> Result<TableBank, PbError> {
+        if !self.factored.is_empty() {
+            return Err(PbError::InvalidConfig {
+                what:
+                    "recompute_under is unsupported for banks with factored high-order tables (v1)"
+                        .into(),
+            });
+        }
         let grids = MergedGrids::from_border_grids(&self.merged_grids);
         let weights = build_weights_from_support(self, &w)?;
         // Seed a RawBank from the current (already-purified) tables: they sum to F_ens,
@@ -2584,6 +3193,533 @@ mod tests {
                 ..exact_cfg(40)
             },
         )
+    }
+
+    /// Stage 1 (§08.10): the FACTORED order-3 effect reproduces the dense purified table's
+    /// variance AND per-cell values bit-for-bit, under BOTH Uniform and the default
+    /// ProductMarginals measure — without ever building the dense union cube.
+    #[test]
+    fn factored_triple_matches_dense_table() {
+        // 3 features with a strong 3-way interaction so the booster realizes {0,1,2} trees.
+        let n = 240usize;
+        let cols: Vec<Vec<f32>> = (0..3)
+            .map(|f| (0..n).map(|i| ((i * (f + 2)) % 6) as f32).collect())
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| cols[0][i] * cols[1][i] * cols[2][i] + cols[0][i] - cols[1][i])
+            .collect();
+        let (model, x) = fit(
+            &cols,
+            &y,
+            Config {
+                n_trees: 80,
+                learning_rate: 0.3,
+                lambda: 1.0,
+                ..exact_cfg(80)
+            },
+        );
+        let grids = MergedGrids::from_model(&model).unwrap();
+        let n_features = model.provenance.len();
+        for w_kind in [RefMeasure::Uniform, RefMeasure::default()] {
+            let weights = build_weights(&x, &grids, &w_kind).unwrap();
+            let bank = model.explain(&x, w_kind.clone()).unwrap();
+            let t3 = bank
+                .tables
+                .iter()
+                .find(|t| t.u.order() == 3)
+                .expect("model should realize an order-3 table");
+            let ft = FactoredTriple::from_model(&model, &t3.u, &grids, &weights).unwrap();
+            let vf = ft.variance;
+            assert!(
+                (vf - t3.variance).abs() <= 1e-9 * (1.0 + t3.variance.abs()),
+                "{w_kind:?}: factored var {vf} != dense var {}",
+                t3.variance
+            );
+            // per-cell values over the full 3-way merged grid
+            let cn: Vec<usize> = t3.u.0.iter().map(|r| grids.cells(*r).unwrap()).collect();
+            let mut x_cells = vec![0u32; n_features];
+            let mut max_abs = 0.0_f64;
+            for c0 in 0..cn[0] {
+                for c1 in 0..cn[1] {
+                    for c2 in 0..cn[2] {
+                        x_cells[t3.u.0[0].0 as usize] = c0 as u32;
+                        x_cells[t3.u.0[1].0 as usize] = c1 as u32;
+                        x_cells[t3.u.0[2].0 as usize] = c2 as u32;
+                        let fe = ft.eval(&x_cells).unwrap();
+                        let de = t3.eval(&x_cells).unwrap();
+                        max_abs = max_abs.max((fe - de).abs());
+                    }
+                }
+            }
+            assert!(
+                max_abs <= 1e-9,
+                "{w_kind:?}: factored eval max abs diff {max_abs}"
+            );
+        }
+    }
+
+    /// Stage 2 (§08.10): shedding the over-budget 3-way per tree into the RAW lower tables,
+    /// then running the normal order-2->1 cascade, reproduces the dense bank EXACTLY — every
+    /// lower table cell-for-cell, f0, and the 3-way residual (variance + per-cell eval).
+    #[test]
+    fn factored_shed_reproduces_dense_bank() {
+        let n = 240usize;
+        let cols: Vec<Vec<f32>> = (0..3)
+            .map(|f| (0..n).map(|i| ((i * (f + 2)) % 6) as f32).collect())
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| cols[0][i] * cols[1][i] * cols[2][i] + cols[0][i] - cols[1][i])
+            .collect();
+        let (model, x) = fit(
+            &cols,
+            &y,
+            Config {
+                n_trees: 80,
+                learning_rate: 0.3,
+                lambda: 1.0,
+                ..exact_cfg(80)
+            },
+        );
+        let grids = MergedGrids::from_model(&model).unwrap();
+        for w_kind in [RefMeasure::Uniform, RefMeasure::default()] {
+            let weights = build_weights(&x, &grids, &w_kind).unwrap();
+            let bank_dense = model.explain(&x, w_kind.clone()).unwrap();
+            let u3 = bank_dense
+                .tables
+                .iter()
+                .find(|t| t.u.order() == 3)
+                .expect("order-3 table")
+                .u
+                .clone();
+            // The 3-way must be fed by >1 tree so the variance cross-terms Σ_{t≠s}⟨p_t,p_s⟩
+            // and the multi-tree shed are actually exercised (not an incidental single box).
+            let n_u3_trees = model
+                .trees
+                .iter()
+                .filter(|(_, t)| tree_support(&model, t).is_ok_and(|s| s == u3))
+                .count();
+            assert!(
+                n_u3_trees > 1,
+                "{w_kind:?}: need >1 tree feeding the 3-way support"
+            );
+
+            // Factored path: accumulate raw, shed the 3-way per tree into the raw lower
+            // tables, drop the 3-way raw table, then run the standard order-2->1 cascade.
+            let (raw, _) = accumulate(&model, &grids, &TableBudget::default()).unwrap();
+            let RawBank { f0, mut tables } = raw;
+            let ft = factored_shed_into_raw(&model, &u3, &grids, &weights, &mut tables).unwrap();
+            assert!(!tables.contains_key(&u3), "3-way raw table must be removed");
+            let bank_fac = purify(
+                RawBank { f0, tables },
+                &weights,
+                &grids,
+                PurifyMode::SinglePass,
+            )
+            .unwrap();
+
+            assert!(
+                (bank_fac.f0 - bank_dense.f0).abs() <= 1e-9 * (1.0 + bank_dense.f0.abs()),
+                "{w_kind:?}: f0 {} != {}",
+                bank_fac.f0,
+                bank_dense.f0
+            );
+            assert_eq!(
+                bank_fac.tables.len(),
+                bank_dense.tables.len() - 1,
+                "{w_kind:?}: factored bank should hold every dense table except the 3-way"
+            );
+            for td in &bank_dense.tables {
+                if td.u == u3 {
+                    let vf = ft.variance;
+                    assert!(
+                        (vf - td.variance).abs() <= 1e-9 * (1.0 + td.variance.abs()),
+                        "{w_kind:?}: factored 3-way var {vf} != dense {}",
+                        td.variance
+                    );
+                    let cn: Vec<usize> = td.u.0.iter().map(|r| grids.cells(*r).unwrap()).collect();
+                    let mut x_cells = vec![0u32; model.provenance.len()];
+                    let mut max_abs = 0.0_f64;
+                    for c0 in 0..cn[0] {
+                        for c1 in 0..cn[1] {
+                            for c2 in 0..cn[2] {
+                                x_cells[td.u.0[0].0 as usize] = c0 as u32;
+                                x_cells[td.u.0[1].0 as usize] = c1 as u32;
+                                x_cells[td.u.0[2].0 as usize] = c2 as u32;
+                                let d =
+                                    (ft.eval(&x_cells).unwrap() - td.eval(&x_cells).unwrap()).abs();
+                                max_abs = max_abs.max(d);
+                            }
+                        }
+                    }
+                    assert!(
+                        max_abs <= 1e-9,
+                        "{w_kind:?}: factored 3-way eval diff {max_abs}"
+                    );
+                    continue;
+                }
+                let tf = bank_fac
+                    .tables
+                    .iter()
+                    .find(|t| t.u == td.u)
+                    .unwrap_or_else(|| panic!("{w_kind:?}: factored bank missing {:?}", td.u));
+                assert!(
+                    (tf.variance - td.variance).abs() <= 1e-9 * (1.0 + td.variance.abs()),
+                    "{w_kind:?}: table {:?} var {} != {}",
+                    td.u,
+                    tf.variance,
+                    td.variance
+                );
+                let vf = tf.values.values();
+                let vd = td.values.values();
+                assert_eq!(
+                    vf.len(),
+                    vd.len(),
+                    "{w_kind:?}: table {:?} cell count",
+                    td.u
+                );
+                let mut max_abs = 0.0_f64;
+                for (a, b) in vf.iter().zip(vd.iter()) {
+                    max_abs = max_abs.max((a - b).abs());
+                }
+                assert!(
+                    max_abs <= 1e-9,
+                    "{w_kind:?}: table {:?} cell diff {max_abs}",
+                    td.u
+                );
+            }
+        }
+    }
+
+    /// Stage 3 (§08.10) END-TO-END: a model whose 3-way table exceeds the cell budget now
+    /// produces a VALID bank via the factored path instead of `PbError::TableBudget`. The
+    /// `Ok(_)` itself means all five I2 gates passed on the factored bank; we also check it
+    /// equals the dense bank (score everywhere + total variance) and is structurally factored.
+    #[test]
+    fn explain_factors_over_budget_three_way_and_passes_all_gates() {
+        let n = 240usize;
+        let cols: Vec<Vec<f32>> = (0..3)
+            .map(|f| (0..n).map(|i| ((i * (f + 2)) % 6) as f32).collect())
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| cols[0][i] * cols[1][i] * cols[2][i] + cols[0][i] - cols[1][i])
+            .collect();
+        let (model, x) = fit(
+            &cols,
+            &y,
+            Config {
+                n_trees: 80,
+                learning_rate: 0.3,
+                lambda: 1.0,
+                ..exact_cfg(80)
+            },
+        );
+        let grids = MergedGrids::from_model(&model).unwrap();
+        let n_features = model.provenance.len();
+
+        // Dense reference (huge budget, hard-error policy — the old behavior).
+        let dense_budget = TableBudget {
+            max_table_cells: 2_000_000,
+            max_bank_cells: 32_000_000,
+            on_overflow: OverflowPolicy::Error,
+        };
+        let bank_dense = model
+            .explain_with_budget(&x, RefMeasure::default(), dense_budget)
+            .unwrap();
+        let u3 = bank_dense
+            .tables
+            .iter()
+            .find(|t| t.u.order() == 3)
+            .expect("order-3 table")
+            .u
+            .clone();
+
+        // Budget that forces ONLY the 3-way over: just above the largest order-2 table.
+        let max_2way = bank_dense
+            .tables
+            .iter()
+            .filter(|t| t.u.order() == 2)
+            .map(|t| t.values.values().len())
+            .max()
+            .unwrap_or(1);
+        let cells3: usize = u3.0.iter().map(|r| grids.cells(*r).unwrap()).product();
+        assert!(
+            cells3 > max_2way + 1,
+            "3-way ({cells3}) must exceed the budget ({max_2way})"
+        );
+        let budget = TableBudget {
+            max_table_cells: (max_2way + 1) as u64,
+            max_bank_cells: 32_000_000,
+            on_overflow: OverflowPolicy::Factored,
+        };
+
+        // The Ok here means accumulate -> shed -> purify -> ALL FIVE I2 GATES succeeded.
+        let bank_fac = model
+            .explain_with_budget(&x, RefMeasure::default(), budget)
+            .expect("factored explain must pass all five exactness gates");
+
+        // Structurally factored, not dense.
+        assert_eq!(
+            bank_fac.factored.len(),
+            1,
+            "exactly the one 3-way is factored"
+        );
+        assert_eq!(bank_fac.factored[0].u, u3);
+        assert!(
+            bank_fac.tables.iter().all(|t| t.u.order() < 3),
+            "no dense order-3 table should remain"
+        );
+
+        // Score equals the dense bank at every merged cell of the 3 features.
+        let cells_per: Vec<usize> = (0..n_features)
+            .map(|r| grids.cells(FeatureId(r as u32)).unwrap())
+            .collect();
+        let mut x_cells = vec![0u32; n_features];
+        let mut max_score_diff = 0.0_f64;
+        for c0 in 0..cells_per[0] {
+            for c1 in 0..cells_per[1] {
+                for c2 in 0..cells_per[2] {
+                    x_cells[0] = c0 as u32;
+                    x_cells[1] = c1 as u32;
+                    x_cells[2] = c2 as u32;
+                    let d = (bank_fac.score(&x_cells).unwrap()
+                        - bank_dense.score(&x_cells).unwrap())
+                    .abs();
+                    max_score_diff = max_score_diff.max(d);
+                }
+            }
+        }
+        assert!(
+            max_score_diff <= 1e-9,
+            "factored score diverges from dense by {max_score_diff}"
+        );
+
+        // Total variance (dense tables + factored) matches the dense bank.
+        let var_fac: f64 = bank_fac.tables.iter().map(|t| t.variance).sum::<f64>()
+            + bank_fac.factored.iter().map(|f| f.variance).sum::<f64>();
+        let var_dense: f64 = bank_dense.tables.iter().map(|t| t.variance).sum();
+        assert!(
+            (var_fac - var_dense).abs() <= 1e-9 * (1.0 + var_dense.abs()),
+            "factored total variance {var_fac} != dense {var_dense}"
+        );
+    }
+
+    /// Stage 3 (§08.10): MULTIPLE over-budget triples sharing a pair. A non-separable
+    /// `x0·x1·x2 − x0·x1·x3` signal forces both {0,1,2} and {0,1,3}, so the shared {0,1}
+    /// table receives sheds from BOTH — the case a single-triple test cannot exercise.
+    /// All five gates still pass and the bank stays dense-equivalent.
+    #[test]
+    fn explain_factors_multiple_over_budget_three_ways_sharing_a_pair() {
+        let n = 6usize.pow(4);
+        let cols: Vec<Vec<f32>> = (0..4)
+            .map(|f| {
+                (0..n)
+                    .map(|i| ((i / 6usize.pow(f as u32)) % 6) as f32)
+                    .collect()
+            })
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| cols[0][i] * cols[1][i] * cols[2][i] - cols[0][i] * cols[1][i] * cols[3][i])
+            .collect();
+        let (model, x) = fit(
+            &cols,
+            &y,
+            Config {
+                n_trees: 120,
+                learning_rate: 0.3,
+                lambda: 1.0,
+                ..exact_cfg(120)
+            },
+        );
+        let grids = MergedGrids::from_model(&model).unwrap();
+        let n_features = model.provenance.len();
+
+        let dense_budget = TableBudget {
+            max_table_cells: 2_000_000,
+            max_bank_cells: 32_000_000,
+            on_overflow: OverflowPolicy::Error,
+        };
+        let bank_dense = model
+            .explain_with_budget(&x, RefMeasure::default(), dense_budget)
+            .unwrap();
+        let n_triples = bank_dense
+            .tables
+            .iter()
+            .filter(|t| t.u.order() == 3)
+            .count();
+        assert!(
+            n_triples >= 2,
+            "need >=2 realized 3-way supports, got {n_triples}"
+        );
+        let shares_a_pair = {
+            let triples: Vec<&FeatureSet> = bank_dense
+                .tables
+                .iter()
+                .filter(|t| t.u.order() == 3)
+                .map(|t| &t.u)
+                .collect();
+            triples.iter().enumerate().any(|(i, a)| {
+                triples
+                    .iter()
+                    .skip(i + 1)
+                    .any(|b| a.0.iter().filter(|r| b.0.contains(r)).count() == 2)
+            })
+        };
+        assert!(shares_a_pair, "expected two triples sharing a pair");
+
+        let max_2way = bank_dense
+            .tables
+            .iter()
+            .filter(|t| t.u.order() == 2)
+            .map(|t| t.values.values().len())
+            .max()
+            .unwrap_or(1);
+        let budget = TableBudget {
+            max_table_cells: (max_2way + 1) as u64,
+            max_bank_cells: 32_000_000,
+            on_overflow: OverflowPolicy::Factored,
+        };
+        let bank_fac = model
+            .explain_with_budget(&x, RefMeasure::default(), budget)
+            .expect("multi-triple factored explain must pass all five gates");
+        assert_eq!(
+            bank_fac.factored.len(),
+            n_triples,
+            "every triple should be factored"
+        );
+        assert!(bank_fac.tables.iter().all(|t| t.u.order() < 3));
+
+        let cn: Vec<usize> = (0..n_features)
+            .map(|r| grids.cells(FeatureId(r as u32)).unwrap())
+            .collect();
+        let mut x_cells = vec![0u32; n_features];
+        let mut maxd = 0.0_f64;
+        for c0 in 0..cn[0] {
+            for c1 in 0..cn[1] {
+                for c2 in 0..cn[2] {
+                    for c3 in 0..cn[3] {
+                        x_cells[0] = c0 as u32;
+                        x_cells[1] = c1 as u32;
+                        x_cells[2] = c2 as u32;
+                        x_cells[3] = c3 as u32;
+                        let d = (bank_fac.score(&x_cells).unwrap()
+                            - bank_dense.score(&x_cells).unwrap())
+                        .abs();
+                        maxd = maxd.max(d);
+                    }
+                }
+            }
+        }
+        assert!(
+            maxd <= 1e-9,
+            "multi-triple factored score diverges by {maxd}"
+        );
+    }
+
+    /// Stage 5 (§08.10): the rating export emits factored effects as per-tree boxes, and
+    /// evaluating those PUBLISHED boxes (threshold routing, the deployment/SQL form) exactly
+    /// reproduces the in-bank factored eval — i.e. the export is a complete, lossless artifact.
+    #[test]
+    fn factored_rating_export_roundtrips_to_bank_eval() {
+        let n = 240usize;
+        let cols: Vec<Vec<f32>> = (0..3)
+            .map(|f| (0..n).map(|i| ((i * (f + 2)) % 6) as f32).collect())
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| cols[0][i] * cols[1][i] * cols[2][i] + cols[0][i] - cols[1][i])
+            .collect();
+        let (model, x) = fit(
+            &cols,
+            &y,
+            Config {
+                n_trees: 80,
+                learning_rate: 0.3,
+                lambda: 1.0,
+                ..exact_cfg(80)
+            },
+        );
+        let grids = MergedGrids::from_model(&model).unwrap();
+        let dense = model
+            .explain_with_budget(
+                &x,
+                RefMeasure::default(),
+                TableBudget {
+                    max_table_cells: 2_000_000,
+                    max_bank_cells: 32_000_000,
+                    on_overflow: OverflowPolicy::Error,
+                },
+            )
+            .unwrap();
+        let max_2way = dense
+            .tables
+            .iter()
+            .filter(|t| t.u.order() == 2)
+            .map(|t| t.values.values().len())
+            .max()
+            .unwrap_or(1);
+        let bank = model
+            .explain_with_budget(
+                &x,
+                RefMeasure::default(),
+                TableBudget {
+                    max_table_cells: (max_2way + 1) as u64,
+                    max_bank_cells: 32_000_000,
+                    on_overflow: OverflowPolicy::Factored,
+                },
+            )
+            .unwrap();
+        assert!(!bank.factored.is_empty());
+
+        let export = bank
+            .to_rating_export(model.link, &model.mode, &model.schema, None)
+            .unwrap();
+        assert_eq!(export.factored.len(), bank.factored.len());
+        assert!(
+            export.tables.iter().all(|t| t.feature_set.order() < 3),
+            "no dense order-3 table should be exported"
+        );
+
+        // Evaluate each EXPORTED factored effect (threshold routing in cell space) and confirm
+        // it matches the in-bank eval at every merged cell of its support.
+        for (ft, rf) in bank.factored.iter().zip(export.factored.iter()) {
+            assert_eq!(rf.feature_set, ft.u);
+            let cn: Vec<usize> = ft.u.0.iter().map(|r| grids.cells(*r).unwrap()).collect();
+            let mut x_cells = vec![0u32; model.provenance.len()];
+            for c0 in 0..cn[0] {
+                for c1 in 0..cn[1] {
+                    for c2 in 0..cn[2] {
+                        let cells = [c0, c1, c2];
+                        x_cells[ft.u.0[0].0 as usize] = c0 as u32;
+                        x_cells[ft.u.0[1].0 as usize] = c1 as u32;
+                        x_cells[ft.u.0[2].0 as usize] = c2 as u32;
+                        let mut from_export = 0.0_f64;
+                        for bx in &rf.boxes {
+                            let mut idx = 0usize;
+                            for (d, ((&cell, axis), (&thr, &miss))) in cells
+                                .iter()
+                                .zip(ft.axes.iter())
+                                .zip(bx.thresholds.iter().zip(bx.missing_left.iter()))
+                                .enumerate()
+                            {
+                                let low = if cell == 0 {
+                                    miss
+                                } else {
+                                    // finite cell is low iff cell <= j+1, where borders[j] == thr
+                                    let j = axis.borders.iter().position(|&b| b == thr).unwrap();
+                                    cell <= j + 1
+                                };
+                                idx |= usize::from(low) << d;
+                            }
+                            from_export += bx.octants[idx];
+                        }
+                        let from_bank = ft.eval(&x_cells).unwrap();
+                        assert!(
+                            (from_export - from_bank).abs() <= 1e-12,
+                            "exported box eval {from_export} != bank eval {from_bank}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// MassConservation fix: `ensemble_w_mean` (the new exact per-tree integral) equals
@@ -3232,9 +4368,9 @@ mod tests {
                 density_threshold: 1.0,
             },
         };
-        let raw = accumulate(&model, &grids, &budget).unwrap();
+        let (raw, _) = accumulate(&model, &grids, &budget).unwrap();
         assert!(raw.tables.values().any(|table| table.values.is_sparse()));
-        verify_raw_accumulation(&model, &raw, &grids).unwrap();
+        verify_raw_accumulation(&model, &raw, &[], &grids).unwrap();
 
         let weights = build_weights(&x, &grids, &RefMeasure::Uniform).unwrap();
         let mut bank = purify(raw, &weights, &grids, PurifyMode::SinglePass).unwrap();
