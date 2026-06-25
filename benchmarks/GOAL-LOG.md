@@ -178,3 +178,30 @@ Leaf-refine walked the tree TWICE per tree: once for `tree_memberships_for_rows`
 (reuse `apply_membership_leaves`). Removed the second walk; `raw_with_tree_leaves` is now `#[cfg(test)]` (the
 equality test's reference). BYTE-IDENTICAL (diamonds 0.08896). Diamonds wall 24.7s → **23.9s**. Generalizes
 to every leaf_refine>0 fit. Cumulative with WIN #1: **29.6s → 23.9s (~19%)** on diamonds.
+
+### ❌ `deviance_at_rows` direct-index fold — REFUTED, not committed (2026-06-25)
+Hypothesis: `deviance_for_rows` (the leaf-refine backtrack + early-stop deviance) wastes 3 allocations + 3
+gather-copies per call; fold deviance DIRECTLY over `y[rows[i]]`/`raw[rows[i]]`/`weight[rows[i]]` (new
+`Loss::deviance_at_rows`, monomorphic per loss) to skip them. Built it across all 5 losses + a bit-identity
+proptest (✓ byte-identical). **But measured SLOWER**: diamonds `refine.backtrack_eval` 2.585s → **4.560s
+(+76%)**, kick 13.485s → **22.118s (+64%)** (fixed config n=2000, refine=4, no-es; scores byte-identical
+0.09022 / 0.76975). Cause: the old gather-then-`deviance` folds over CONTIGUOUS slices → autovectorized
+(SIMD); the direct-index fold reads scattered indices with per-element bounds checks → scalar. The removed
+allocations were cheap (allocator reuses the same freed blocks); the vectorization I broke was not. Lesson:
+**don't trade a contiguous SIMD fold for a scattered scalar one to save a cheap allocation.** Reverted whole.
+
+### ✅ WIN #3 — Hoist trial-invariant gathers out of the leaf-refine line search [G5]
+Salvaged the right win from the refuted attempt. The backtrack re-gathered `y`/`weight`/`raw` at `rows`
+EVERY trial (scatter + alloc), then folded `deviance` over the contiguous result. But `y[rows]`,
+`weight[rows]` and `base_raw[rows]` are CONSTANT across all steps + backtracks of a tree — only the 8 leaf
+VALUES change. Gather those three into dense per-tree buffers ONCE (`gather_rows`); per trial just fill the
+dense subset-raw from `base_sub + leaves[membership]` (`fill_leaf_raw_contiguous`) and run the SAME
+vectorized `deviance` over contiguous `(y_sub, raw_sub, w_sub)`. Per-trial cost: one contiguous fill + the
+SIMD fold — no scatter-gather, no allocation; the full raw is reconstructed (for the next grad_hess) only on
+ACCEPT. Keeps the contiguous fold the refuted attempt lost. BYTE-IDENTICAL (`fill_leaf_raw_contiguous` ==
+`apply_membership_leaves` gathered over `rows`, locked bit-for-bit in
+`membership_leaf_fill_matches_tree_walk_bit_for_bit`; end-to-end scores unchanged 0.09022 / 0.76975).
+- **Measured (fixed config n=2000, refine=4, no-es, 4 threads):** diamonds `refine.backtrack_eval` 2.585s →
+  **1.530s (−41%)**, wall 12.5s → 11.9s; kick 13.485s → **12.107s (−10%)**, wall 43.2s → 41.9s. (Diamonds
+  wins bigger: SE deviance is cheap so gather/alloc was a larger share; kick's logistic deviance is
+  compute-bound, so the kept SIMD fold dominates.) Generalizes to every leaf_refine>0 fit.

@@ -2302,17 +2302,26 @@ fn refine_tree_leaves_after_grow(
     }
     let columns = tree_split_columns(tree, &x.data)?;
     let n_leaves = 1usize << usize::from(tree.depth);
-    let eval_rows: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
     let memberships = tree_memberships_for_rows(tree, &columns, rows, n_leaves)?;
-    // Derive the initial raw from the memberships just computed — no SECOND tree walk. `rows` get
-    // base + leaf; entries outside `rows` keep base_raw (never read: deviance/grad aggregate on `rows`).
+    // The line search reads y/weight and the base score ONLY at `rows`, and only the 8 leaf
+    // VALUES change per trial. Gather those three into DENSE per-tree buffers ONCE (constant
+    // across every step + backtrack), so each trial is a single contiguous fill + the
+    // vectorized `deviance` over contiguous slices — no per-trial scatter-gather, no
+    // allocation. `base_sub[i] == base_raw[rows[i]]`.
+    let y_sub = gather_rows(y, rows)?;
+    let w_sub = gather_rows(weight, rows)?;
+    let base_sub = gather_rows(base_raw, rows)?;
+    // Full raw kept valid at `rows` for the per-step grad_hess pass (grad_hess reads the whole
+    // slice; entries outside `rows` keep base_raw and their g/h are never aggregated). Derived
+    // from the memberships just computed — no SECOND tree walk.
     let mut raw = base_raw.to_vec();
     apply_membership_leaves(&mut raw, base_raw, rows, &memberships, &tree.leaves)?;
-    let mut best_deviance = deviance_for_rows(loss, y, &raw, weight, &eval_rows)?;
+    // Reused dense subset-raw scratch (no per-trial alloc). Bit-identical to gathering
+    // `apply_membership_leaves`'s output over `rows`, so `deviance` matches the old path exactly.
+    let mut trial_raw_sub = base_sub.clone();
+    fill_leaf_raw_contiguous(&mut trial_raw_sub, &base_sub, &memberships, &tree.leaves)?;
+    let mut best_deviance = f64::from(loss.deviance(&y_sub, &trial_raw_sub, &w_sub)?);
     let mut gh = GradHess::default();
-    // Reused scratch for the per-trial raw (membership-filled, no tree re-walk). Cloned once so
-    // entries outside `rows` stay finite (they are never read by the deviance, which uses `rows`).
-    let mut trial_raw = raw.clone();
 
     for _ in 0..config.leaf_refine_steps {
         prof::timed("refine.grad_hess", || {
@@ -2385,20 +2394,22 @@ fn refine_tree_leaves_after_grow(
                 monotone,
             )?;
             let deviance = prof::timed("refine.backtrack_eval", || -> Result<f64, PbError> {
-                apply_membership_leaves(
-                    &mut trial_raw,
-                    base_raw,
-                    rows,
+                // Fill the dense subset raw from the fixed base + the 8 trial leaf values, then
+                // the vectorized `deviance` over contiguous (y_sub, trial_raw_sub, w_sub) — the
+                // same value the old `apply_membership_leaves` + gather-`deviance` produced.
+                fill_leaf_raw_contiguous(
+                    &mut trial_raw_sub,
+                    &base_sub,
                     &memberships,
                     &trial_leaves,
                 )?;
-                deviance_for_rows(loss, y, &trial_raw, weight, &eval_rows)
+                Ok(f64::from(loss.deviance(&y_sub, &trial_raw_sub, &w_sub)?))
             })?;
             if deviance < best_deviance {
                 tree.leaves = trial_leaves;
-                // `trial_raw` is the accepted full raw on `rows`; swap it in (no realloc), keeping the
-                // old buffer as the next trial's scratch.
-                std::mem::swap(&mut raw, &mut trial_raw);
+                // Reflect the accepted leaves into the full raw at `rows` for the next step's
+                // grad_hess (its only consumer); a scatter only on accept, not per trial.
+                apply_membership_leaves(&mut raw, base_raw, rows, &memberships, &tree.leaves)?;
                 best_deviance = deviance;
                 accepted = true;
                 break;
@@ -2528,6 +2539,58 @@ fn apply_membership_leaves(
     Ok(())
 }
 
+/// Gather `src[rows[i]]` into a fresh DENSE buffer (subset in `rows` order), bounds-checked
+/// and `try_reserve`d. Used once per tree by the leaf-refine line search to lift the
+/// trial-invariant slices (y, weight, base raw) out of the per-trial deviance.
+fn gather_rows(src: &[f32], rows: &[u32]) -> Result<Vec<f32>, PbError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(rows.len())
+        .map_err(|_| PbError::Internal {
+            what: "leaf refinement subset gather allocation failed".into(),
+        })?;
+    for &r in rows {
+        out.push(*src.get(r as usize).ok_or_else(|| PbError::Internal {
+            what: "leaf refinement subset gather row escaped".into(),
+        })?);
+    }
+    Ok(out)
+}
+
+/// Dense (contiguous) twin of [`apply_membership_leaves`]: write
+/// `out_sub[i] = base_sub[i] + leaves[memberships[i]]` over a packed subset buffer (no
+/// scatter), with the SAME `f64` add + finite/representable check. When
+/// `base_sub[i] == base_raw[rows[i]]` the result is **bit-identical** to gathering
+/// `apply_membership_leaves`'s output over `rows`, so feeding it to `deviance` reproduces
+/// the former `apply_membership_leaves` + `deviance_for_rows` value exactly — while keeping
+/// the deviance fold over contiguous slices (vectorizable), unlike a scattered direct-index fold.
+fn fill_leaf_raw_contiguous(
+    out_sub: &mut [f32],
+    base_sub: &[f32],
+    memberships: &[u8],
+    leaves: &[f32; 8],
+) -> Result<(), PbError> {
+    if out_sub.len() != base_sub.len() || out_sub.len() != memberships.len() {
+        return Err(PbError::Internal {
+            what: "leaf refinement contiguous fill length mismatch".into(),
+        });
+    }
+    for ((slot, &base), &leaf) in out_sub.iter_mut().zip(base_sub).zip(memberships) {
+        let lv = *leaves
+            .get(usize::from(leaf))
+            .ok_or_else(|| PbError::Internal {
+                what: "leaf refinement membership leaf escaped".into(),
+            })?;
+        let value = f64::from(base) + f64::from(lv);
+        if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+            return Err(PbError::InvalidInput {
+                what: "leaf refinement raw is not finite/representable".into(),
+            });
+        }
+        *slot = value as f32;
+    }
+    Ok(())
+}
+
 /// Add a freshly-grown tree's contribution to every row's raw score (spec §06.6
 /// sample→leaf update). Scores ALL rows (not just the round's subsample) so the next
 /// round's gradients are correct everywhere. Panic-free; uses the canonical low bit.
@@ -2628,6 +2691,35 @@ mod tests {
                 "row {r}: tree-walk {} != membership-fill {}",
                 walk[r],
                 fill[r]
+            );
+        }
+
+        // The dense (contiguous) leaf-refine fill must equal the scattered
+        // `apply_membership_leaves` output gathered over a SUBSET of rows, bit-for-bit — the
+        // invariant the leaf-refine line search relies on for byte-stable predictions. Use a
+        // reordered subset with repeats and altered leaf values (a refinement trial).
+        let sub_rows: Vec<u32> = vec![5, 0, 123, 123, 239, 17, 88, 0, 200, 9];
+        let sub_members = tree_memberships_for_rows(tree, &columns, &sub_rows, n_leaves).unwrap();
+        let base_sub = gather_rows(&base_raw, &sub_rows).unwrap();
+        let trial_leaves = {
+            let mut l = tree.leaves;
+            for (k, v) in l.iter_mut().enumerate() {
+                *v = *v + 0.013 * (k as f32) - 0.05;
+            }
+            l
+        };
+        let mut full = base_raw.clone();
+        apply_membership_leaves(&mut full, &base_raw, &sub_rows, &sub_members, &trial_leaves)
+            .unwrap();
+        let mut dense = base_sub.clone();
+        fill_leaf_raw_contiguous(&mut dense, &base_sub, &sub_members, &trial_leaves).unwrap();
+        for (i, &r) in sub_rows.iter().enumerate() {
+            assert_eq!(
+                full[r as usize].to_bits(),
+                dense[i].to_bits(),
+                "subset row {r}: scatter {} != dense {}",
+                full[r as usize],
+                dense[i]
             );
         }
     }
