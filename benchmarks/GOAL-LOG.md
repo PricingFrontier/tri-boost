@@ -281,3 +281,21 @@ they are unaffected — drift only perturbs split SELECTION at exact near-ties.
   o3 config (n=2000, refine=4): diamonds `hist_build` ~3.90s → 3.55s (−9%); kick ~14.4s → **11.6s (−19%)**,
   wall ~40s → 36.8s. Generalizes to every FullF64 depth-≥2 fit. Level 1 subtraction deferred (would compound
   drift a second generation; same machinery if the win justifies it later).
+
+### ✅ WIN #6 — Chunked-parallel log-link deviance fold [G5] — accuracy-neutral
+With byte-identity relaxed, profiled the o3 bottleneck: kick `refine.backtrack_eval` (the leaf-refine
+line-search deviance) was the single biggest sub-phase at 11.74s. The log-link deviance is COMPUTE-bound
+(sigmoid + two `ln` per row ≈ 100+ cycles) — unlike grad_hess (sigmoid only, memory-bound, parallelization
+was net-neutral / reverted). New `parallel_deviance_fold`: fixed-size row chunks each fold sequentially, then
+combine the chunk partials in CHUNK ORDER ⇒ thread-count-INDEPENDENT (the §05.9 #7 gate holds, pinned by
+`log_link_deviance_parallel_path_is_thread_count_independent` over 1/2/8 threads at n>chunk), differing from
+a single linear fold only by ~1e-11 (chunked summation) — accuracy-neutral, only perturbs the line search at
+an exact near-tie. Applied to Logistic/Poisson/Gamma/Tweedie `deviance`; **SquaredError stays sequential**
+(cheap memory-bound term). Below the chunk size (8192) the sequential fold runs.
+- **Byte-identity within tolerance:** real-data scores match the prior baseline EXACTLY (no flip): kick
+  0.76975; diamonds 0.09022 (SE — unaffected, backtrack_eval 1.62s unchanged). 230 core + 20 py green.
+- **Measured (o3, n=2000, refine=4, 4 threads):** kick `refine.backtrack_eval` 11.74s → **6.38s (−46%)**,
+  wall 37.1s → **29.6s (−20%)**. Diamonds unchanged (SE sequential). Helps every log-link fit (kick, amazon,
+  and Poisson/Gamma/Tweedie); the SE regression datasets keep their fast sequential fold. (NB: this is the
+  reverse of the grad_hess lesson — there the per-row term was too cheap to beat memory bandwidth; the
+  deviance's two logs make it genuinely compute-bound.)

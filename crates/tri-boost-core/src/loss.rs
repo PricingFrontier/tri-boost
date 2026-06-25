@@ -26,6 +26,7 @@
 
 use crate::error::PbError;
 use itertools::izip;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Link-argument floor for `init_score` (§05.3): a valid-but-extreme weighted mean is
@@ -99,6 +100,59 @@ fn finish_deviance(obj: &str, acc: f64) -> Result<f32, PbError> {
             "{obj} deviance is not finite/representable as f32: {acc}"
         )))
     }
+}
+
+/// Row chunk size for the chunked-parallel deviance fold of compute-bound (log-link) objectives.
+const PAR_DEVIANCE_CHUNK: usize = 8_192;
+
+/// Chunked-parallel `(Σw, acc)` deviance fold for COMPUTE-bound (log-link) objectives. The rows are
+/// split into FIXED-size chunks; each chunk folds sequentially into a local `(Σw, acc)`, and the
+/// chunk partials are then combined in CHUNK ORDER. So the result is **thread-count-independent**
+/// (the §05.9 #7 determinism gate holds — chunk boundaries and combination order do not depend on
+/// the thread count), differing from a single linear fold only by ~1e-11 (chunked-summation
+/// non-associativity). `term(i, y, raw, weight)` returns the per-row `(w_contrib, dev_contrib)`
+/// after running the objective's domain guards. Below the chunk size a sequential fold runs (no
+/// rayon overhead). Squared-error keeps its own sequential fold — its per-row term is a single
+/// multiply (memory-bandwidth bound) where parallelism does not pay (cf. the reverted grad_hess
+/// parallelization); the log-link `exp`/`ln` IS compute-bound, so it overlaps across cores. Like
+/// the histogram-subtraction path this trades exact bit-reproducibility for speed at the ~1e-11
+/// level — accuracy-neutral (it only perturbs the leaf-refine line search at an exact near-tie).
+fn parallel_deviance_fold<F>(
+    y: &[f32],
+    raw: &[f32],
+    weight: &[f32],
+    term: F,
+) -> Result<(f64, f64), PbError>
+where
+    F: Fn(usize, f32, f32, f32) -> Result<(f64, f64), PbError> + Sync,
+{
+    let fold_chunk =
+        |base: usize, yc: &[f32], rc: &[f32], wc: &[f32]| -> Result<(f64, f64), PbError> {
+            let (mut sw, mut acc) = (0.0_f64, 0.0_f64);
+            for (k, ((&yi, &fi), &wi)) in yc.iter().zip(rc).zip(wc).enumerate() {
+                let (w, d) = term(base + k, yi, fi, wi)?;
+                sw += w;
+                acc += d;
+            }
+            Ok((sw, acc))
+        };
+    if y.len() < PAR_DEVIANCE_CHUNK {
+        return fold_chunk(0, y, raw, weight);
+    }
+    let partials: Result<Vec<(f64, f64)>, PbError> = y
+        .par_chunks(PAR_DEVIANCE_CHUNK)
+        .zip(raw.par_chunks(PAR_DEVIANCE_CHUNK))
+        .zip(weight.par_chunks(PAR_DEVIANCE_CHUNK))
+        .enumerate()
+        .map(|(ci, ((yc, rc), wc))| fold_chunk(ci * PAR_DEVIANCE_CHUNK, yc, rc, wc))
+        .collect();
+    // Combine partials in CHUNK ORDER (sequential over the order-preserving collected Vec).
+    let (mut sum_w, mut acc) = (0.0_f64, 0.0_f64);
+    for (csw, ca) in partials? {
+        sum_w += csw;
+        acc += ca;
+    }
+    Ok((sum_w, acc))
 }
 
 /// Shared entry length-guard for the three slice methods (§05.2): the one in-method
@@ -539,9 +593,9 @@ impl Loss for Logistic {
             n,
             &[("raw", raw.len()), ("weight", weight.len())],
         )?;
-        // Binomial unit deviance: 2 Σ w [ y ln(y/p) + (1−y) ln((1−y)/(1−p)) ].
-        let (mut sum_w, mut acc) = (0.0_f64, 0.0_f64);
-        for (i, ((&yi, &fi), &wi)) in y.iter().zip(raw).zip(weight).enumerate() {
+        // Binomial unit deviance: 2 Σ w [ y ln(y/p) + (1−y) ln((1−y)/(1−p)) ]. Compute-bound
+        // (sigmoid + two logs per row) ⇒ chunked-parallel fold (thread-count-independent).
+        let (sum_w, acc) = parallel_deviance_fold(y, raw, weight, |i, yi, fi, wi| {
             require_finite("logistic", "y", i, yi)?;
             require_finite("logistic", "raw", i, fi)?;
             require_weight("logistic", i, wi)?;
@@ -559,9 +613,8 @@ impl Loss for Logistic {
             } else {
                 0.0
             };
-            sum_w += f64::from(wi);
-            acc += f64::from(wi) * 2.0 * (t1 + t2);
-        }
+            Ok((f64::from(wi), f64::from(wi) * 2.0 * (t1 + t2)))
+        })?;
         if sum_w <= 0.0 {
             return Err(invalid_input("logistic deviance: all-zero weights".into()));
         }
@@ -657,8 +710,8 @@ impl Loss for Poisson {
             &[("raw", raw.len()), ("weight", weight.len())],
         )?;
         // Poisson unit deviance: 2 Σ w [ y ln(y/μ) − (y − μ) ]  (y ln(y/μ) → 0 at y=0).
-        let (mut sum_w, mut acc) = (0.0_f64, 0.0_f64);
-        for (i, ((&yi, &fi), &wi)) in y.iter().zip(raw).zip(weight).enumerate() {
+        // Compute-bound (exp + log per row) ⇒ chunked-parallel fold (thread-count-independent).
+        let (sum_w, acc) = parallel_deviance_fold(y, raw, weight, |i, yi, fi, wi| {
             require_finite("poisson", "y", i, yi)?;
             require_finite("poisson", "raw", i, fi)?;
             require_weight("poisson", i, wi)?;
@@ -670,9 +723,8 @@ impl Loss for Poisson {
             let mu = f64::from(clamp_exp(fi));
             let yy = f64::from(yi);
             let term = if yy > 0.0 { yy * (yy / mu).ln() } else { 0.0 };
-            sum_w += f64::from(wi);
-            acc += f64::from(wi) * 2.0 * (term - (yy - mu));
-        }
+            Ok((f64::from(wi), f64::from(wi) * 2.0 * (term - (yy - mu))))
+        })?;
         if sum_w <= 0.0 {
             return Err(invalid_input("poisson deviance: all-zero weights".into()));
         }
@@ -772,8 +824,8 @@ impl Loss for Gamma {
             &[("raw", raw.len()), ("weight", weight.len())],
         )?;
         // Gamma unit deviance: 2 Σ w [ (y−μ)/μ − ln(y/μ) ] = 2 Σ w [ r − 1 − ln r ], r=y/μ.
-        let (mut sum_w, mut acc) = (0.0_f64, 0.0_f64);
-        for (i, ((&yi, &fi), &wi)) in y.iter().zip(raw).zip(weight).enumerate() {
+        // Compute-bound (exp + log per row) ⇒ chunked-parallel fold (thread-count-independent).
+        let (sum_w, acc) = parallel_deviance_fold(y, raw, weight, |i, yi, fi, wi| {
             require_finite("gamma", "y", i, yi)?;
             require_finite("gamma", "raw", i, fi)?;
             require_weight("gamma", i, wi)?;
@@ -784,9 +836,8 @@ impl Loss for Gamma {
             }
             let mu = f64::from(clamp_exp(fi));
             let r = f64::from(yi) / mu;
-            sum_w += f64::from(wi);
-            acc += f64::from(wi) * 2.0 * (r - 1.0 - r.ln());
-        }
+            Ok((f64::from(wi), f64::from(wi) * 2.0 * (r - 1.0 - r.ln())))
+        })?;
         if sum_w <= 0.0 {
             return Err(invalid_input("gamma deviance: all-zero weights".into()));
         }
@@ -923,8 +974,8 @@ impl Loss for Tweedie {
         let p2 = 2.0 - f64::from(self.rho);
         let p1f = 1.0 - self.rho;
         let p2f = 2.0 - self.rho;
-        let (mut sum_w, mut acc) = (0.0_f64, 0.0_f64);
-        for (i, ((&yi, &fi), &wi)) in y.iter().zip(raw).zip(weight).enumerate() {
+        // Compute-bound (two exps + a log per row) ⇒ chunked-parallel fold (thread-independent).
+        let (sum_w, acc) = parallel_deviance_fold(y, raw, weight, |i, yi, fi, wi| {
             require_finite("tweedie", "y", i, yi)?;
             require_finite("tweedie", "raw", i, fi)?;
             require_weight("tweedie", i, wi)?;
@@ -939,9 +990,8 @@ impl Loss for Tweedie {
             let mu_p1 = f64::from(clamp_exp(p1f * fi)); // μ^{1−ρ}
             let mu_p2 = f64::from(clamp_exp(p2f * fi)); // μ^{2−ρ}
             let d = y_term / (p1 * p2) - yy * mu_p1 / p1 + mu_p2 / p2;
-            sum_w += f64::from(wi);
-            acc += f64::from(wi) * 2.0 * d;
-        }
+            Ok((f64::from(wi), f64::from(wi) * 2.0 * d))
+        })?;
         if sum_w <= 0.0 {
             return Err(invalid_input("tweedie deviance: all-zero weights".into()));
         }
@@ -1523,5 +1573,46 @@ mod tests {
         let a = run(1);
         assert_eq!(a, run(2));
         assert_eq!(a, run(8));
+    }
+
+    #[test]
+    fn log_link_deviance_parallel_path_is_thread_count_independent() {
+        // The log-link deviance is now a CHUNKED-parallel fold (fixed chunk boundaries combined in
+        // chunk order). Exercise the PARALLEL path (n > PAR_DEVIANCE_CHUNK) and pin the f32 result
+        // bit-for-bit across 1/2/8 threads — the §05.9 #7 gate the leaf-refine line search relies on.
+        let n = PAR_DEVIANCE_CHUNK * 3 + 91;
+        let raw: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 4) as f32).collect();
+        let y_count: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect(); // >= 0
+        let y_pos: Vec<f32> = (0..n).map(|i| 0.25 + (i % 5) as f32).collect(); // > 0
+        let y_bin: Vec<f32> = (0..n).map(|i| (i % 2) as f32).collect(); // {0,1}
+        let cases: Vec<(&str, &dyn Loss, &[f32])> = vec![
+            ("logistic", &Logistic, &y_bin),
+            ("poisson", &Poisson, &y_count),
+            ("gamma", &Gamma, &y_pos),
+        ];
+        for (name, loss, yy) in cases {
+            let run = |threads: usize| {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| loss.deviance(yy, &raw, &w).unwrap().to_bits())
+            };
+            let base = run(1);
+            assert_eq!(base, run(2), "{name} deviance differs at 2 threads");
+            assert_eq!(base, run(8), "{name} deviance differs at 8 threads");
+        }
+        let tw = Tweedie::new(1.5).unwrap();
+        let run_tw = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| tw.deviance(&y_count, &raw, &w).unwrap().to_bits())
+        };
+        let base = run_tw(1);
+        assert_eq!(base, run_tw(2), "tweedie deviance differs at 2 threads");
+        assert_eq!(base, run_tw(8), "tweedie deviance differs at 8 threads");
     }
 }
