@@ -414,6 +414,9 @@ fn fit_single(
         // set `wsum = count` instead of summing 1.0 per row (bit-exact). Provided weights
         // (even if all 1.0) keep the full Σw path — conservative and always correct.
         unit_weight: spec.weight.is_none(),
+        // Level-2 histogram subtraction on by default (FullF64); ~half the level-2 row visits,
+        // accuracy moves only at ~1e-11. A kill-switch if a near-tie split ever proves sensitive.
+        hist_subtraction: true,
     };
 
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();

@@ -657,6 +657,119 @@ pub(crate) fn subtract(parent: &Hist, left: &Hist) -> Result<Hist, PbError> {
     Ok(out)
 }
 
+/// Fill each LARGER sibling-child leaf of a level-`L` histogram by subtracting the already-built
+/// SMALLER child from its level-`(L-1)` parent leaf — the histogram-subtraction trick wired to the
+/// oblivious grower. `child` has `2·parent.n_leaves` leaves (each parent leaf split into a smaller +
+/// larger child); `pairing[i] = (parent_leaf, smaller_child_leaf, larger_child_leaf)`; `axis_map[a2]`
+/// is the column position in `parent` of `child`'s axis `a2` (the parent's axis set is a superset, so
+/// every child axis maps). On entry the smaller-child leaves are populated and the larger are zero;
+/// on return `child[larger] = parent[p] − child[smaller]` cellwise (g/h/wsum plain f64, count
+/// `checked_sub`). Because the SMALLER child is the subtrahend, `larger` is the bigger remainder, so
+/// the f64 subtraction is NOT catastrophic cancellation (drift stays ~1e-11 for well-conditioned
+/// gradients); `count` is integer-exact and, under unit weights, `wsum == count` stays exact. Used
+/// only on the FullF64 path; bin range `0..child.n_bins ≤ parent.n_bins` (a dropped axis may have
+/// held the max stride), and every access goes through [`Hist::offset`] so strides are honored.
+pub(crate) fn subtract_sibling_into(
+    child: &mut Hist,
+    parent: &Hist,
+    pairing: &[(usize, usize, usize)],
+    axis_map: &[usize],
+) -> Result<(), PbError> {
+    if child.n_leaves != 2 * parent.n_leaves {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "subtract_sibling_into: child n_leaves {} != 2·parent {}",
+                child.n_leaves, parent.n_leaves
+            ),
+        });
+    }
+    if child.n_axes != axis_map.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "subtract_sibling_into: child n_axes {} != axis_map len {}",
+                child.n_axes,
+                axis_map.len()
+            ),
+        });
+    }
+    if child.n_bins > parent.n_bins {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "subtract_sibling_into: child n_bins {} > parent n_bins {}",
+                child.n_bins, parent.n_bins
+            ),
+        });
+    }
+    for &(p, sm, lg) in pairing {
+        for (a2, &a1) in axis_map.iter().enumerate() {
+            for b in 0..child.n_bins {
+                let po = parent
+                    .offset(p, a1, b)
+                    .ok_or_else(oob("subtract_sibling parent offset"))?;
+                let so = child
+                    .offset(sm, a2, b)
+                    .ok_or_else(oob("subtract_sibling smaller offset"))?;
+                let lo = child
+                    .offset(lg, a2, b)
+                    .ok_or_else(oob("subtract_sibling larger offset"))?;
+                // Read parent (p) and smaller (sm) first, then write larger (lg) — lg differs
+                // from sm so there is no aliasing; copies keep the borrows sequential.
+                let pg = *parent
+                    .g
+                    .get(po)
+                    .ok_or_else(oob("subtract_sibling parent g"))?;
+                let ph = *parent
+                    .h
+                    .get(po)
+                    .ok_or_else(oob("subtract_sibling parent h"))?;
+                let pw = *parent
+                    .wsum
+                    .get(po)
+                    .ok_or_else(oob("subtract_sibling parent wsum"))?;
+                let pc = *parent
+                    .count
+                    .get(po)
+                    .ok_or_else(oob("subtract_sibling parent count"))?;
+                let sg = *child
+                    .g
+                    .get(so)
+                    .ok_or_else(oob("subtract_sibling small g"))?;
+                let sh = *child
+                    .h
+                    .get(so)
+                    .ok_or_else(oob("subtract_sibling small h"))?;
+                let sw = *child
+                    .wsum
+                    .get(so)
+                    .ok_or_else(oob("subtract_sibling small wsum"))?;
+                let sc = *child
+                    .count
+                    .get(so)
+                    .ok_or_else(oob("subtract_sibling small count"))?;
+                *child
+                    .g
+                    .get_mut(lo)
+                    .ok_or_else(oob("subtract_sibling g cell"))? = pg - sg;
+                *child
+                    .h
+                    .get_mut(lo)
+                    .ok_or_else(oob("subtract_sibling h cell"))? = ph - sh;
+                *child
+                    .wsum
+                    .get_mut(lo)
+                    .ok_or_else(oob("subtract_sibling wsum cell"))? = pw - sw;
+                *child
+                    .count
+                    .get_mut(lo)
+                    .ok_or_else(oob("subtract_sibling count cell"))? = pc
+                    .checked_sub(sc)
+                    .ok_or_else(oob("subtract_sibling count underflow"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1008,6 +1121,88 @@ mod tests {
         assert!(matches!(
             subtract(&parent, &left),
             Err(PbError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn subtract_sibling_into_matches_hand_computed_larger_child() {
+        // parent: 2 leaves × 2 axes × 3 bins; child: 4 leaves × 1 axis (axis_map=[1], so the
+        // child's only axis is the parent's axis 1 — a NON-identity remap, the A_2⊂A_1 case)
+        // × 3 bins. Smaller children (leaves 0,1) are populated; the larger (2,3) are derived.
+        let mut parent = Hist::try_zeros(2, 2, 3).unwrap();
+        let mut child = Hist::try_zeros(4, 1, 3).unwrap();
+        let set = |hh: &mut Hist, leaf: usize, axis: usize, bin: usize, g: f64, c: u32| {
+            let o = hh.offset(leaf, axis, bin).unwrap();
+            hh.g[o] = g;
+            hh.h[o] = g * 0.1;
+            hh.wsum[o] = f64::from(c);
+            hh.count[o] = c;
+        };
+        // parent axis 1 (axis 0 left zero — unused by the map): leaf 0 then leaf 1.
+        set(&mut parent, 0, 1, 0, 10.0, 10);
+        set(&mut parent, 0, 1, 1, 20.0, 20);
+        set(&mut parent, 0, 1, 2, 30.0, 30);
+        set(&mut parent, 1, 1, 0, 5.0, 5);
+        set(&mut parent, 1, 1, 1, 15.0, 15);
+        set(&mut parent, 1, 1, 2, 25.0, 25);
+        // smaller children on child axis 0: leaf 0 (smaller of parent 0), leaf 1 (of parent 1).
+        set(&mut child, 0, 0, 0, 3.0, 3);
+        set(&mut child, 0, 0, 1, 8.0, 8);
+        set(&mut child, 0, 0, 2, 12.0, 12);
+        set(&mut child, 1, 0, 0, 2.0, 2);
+        set(&mut child, 1, 0, 1, 5.0, 5);
+        set(&mut child, 1, 0, 2, 10.0, 10);
+        // parent p → (smaller, larger): 0 → (0, 2); 1 → (1, 3).
+        subtract_sibling_into(&mut child, &parent, &[(0, 0, 2), (1, 1, 3)], &[1]).unwrap();
+        let chk = |leaf: usize, bin: usize, g: f64, c: u32| {
+            let o = child.offset(leaf, 0, bin).unwrap();
+            assert!((child.g[o] - g).abs() < 1e-12, "g leaf {leaf} bin {bin}");
+            assert!(
+                (child.wsum[o] - f64::from(c)).abs() < 1e-12,
+                "wsum leaf {leaf} bin {bin}"
+            );
+            assert_eq!(child.count[o], c, "count leaf {leaf} bin {bin}");
+        };
+        // larger children = parent − smaller.
+        chk(2, 0, 7.0, 7);
+        chk(2, 1, 12.0, 12);
+        chk(2, 2, 18.0, 18);
+        chk(3, 0, 3.0, 3);
+        chk(3, 1, 10.0, 10);
+        chk(3, 2, 15.0, 15);
+        // smaller children untouched.
+        chk(0, 0, 3.0, 3);
+        chk(1, 2, 10.0, 10);
+    }
+
+    #[test]
+    fn subtract_sibling_into_count_underflow_is_internal() {
+        let mut parent = Hist::try_zeros(1, 1, 1).unwrap();
+        parent.count[0] = 2;
+        let mut child = Hist::try_zeros(2, 1, 1).unwrap();
+        let o = child.offset(0, 0, 0).unwrap();
+        child.count[o] = 5; // smaller (5) > parent leaf (2) ⇒ underflow on the larger child
+        assert!(matches!(
+            subtract_sibling_into(&mut child, &parent, &[(0, 0, 1)], &[0]),
+            Err(PbError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn subtract_sibling_into_shape_mismatch_errors() {
+        // child.n_leaves must be 2× parent.
+        let parent = Hist::try_zeros(2, 1, 1).unwrap();
+        let mut child = Hist::try_zeros(2, 1, 1).unwrap();
+        assert!(matches!(
+            subtract_sibling_into(&mut child, &parent, &[(0, 0, 1)], &[0]),
+            Err(PbError::ShapeMismatch { .. })
+        ));
+        // axis_map.len() must equal child.n_axes.
+        let parent2 = Hist::try_zeros(2, 2, 1).unwrap();
+        let mut child2 = Hist::try_zeros(4, 2, 1).unwrap();
+        assert!(matches!(
+            subtract_sibling_into(&mut child2, &parent2, &[(0, 0, 2)], &[0]),
+            Err(PbError::ShapeMismatch { .. })
         ));
     }
 

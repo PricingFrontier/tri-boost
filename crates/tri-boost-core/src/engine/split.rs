@@ -17,7 +17,9 @@
 use crate::backend::{pb_seed, Stage};
 use crate::constraints::{CredibilityFloor, MonoSign};
 use crate::data::BinnedMatrix;
-use crate::engine::hist::{build_histogram, build_quantized_histogram, QuantizeContext};
+use crate::engine::hist::{
+    build_histogram, build_quantized_histogram, subtract_sibling_into, QuantizeContext,
+};
 use crate::engine::{low_bit, Hist, HistPrecision, ObliviousTree, Split};
 use crate::error::PbError;
 use crate::explain::FeatureSet;
@@ -71,6 +73,11 @@ pub(crate) struct GrowConfig<'a> {
     /// is bit-exact for unit weights: summing `1.0` `k<2^53` times is exact). Conservative:
     /// `false` whenever weights were provided, even if they happen to all be `1.0`.
     pub unit_weight: bool,
+    /// Enable the level-2 FullF64 histogram-subtraction fast path (build the smaller sibling
+    /// child, derive the larger from the level-1 parent). `true` in production; a kill-switch
+    /// and the A/B reference for the equivalence tests (subtraction reproduces the full-build
+    /// tree, with g/h differing only at ~1e-11). Inert unless FullF64 and depth reaches 2.
+    pub hist_subtraction: bool,
 }
 
 /// A candidate level split with its summed Newton gain.
@@ -855,6 +862,108 @@ pub(crate) fn refit_tree_leaves(
     Ok(())
 }
 
+/// Build a level-`L` (`L >= 1`) FullF64 histogram via the **subtraction trick** instead of a full
+/// build: accumulate only the SMALLER of each parent leaf's two children, then derive the larger by
+/// subtracting from the retained level-`(L-1)` parent histogram (`prev_hist`, columns = `prev_admissible`
+/// = A_{L-1}). It visits only ~half the rows. Every row's level-`L` leaf is already fixed in
+/// `leaf_of_row` (bits `0..L-1`, values in `[0, 2^L)`) by the committed earlier splits, so the sibling
+/// pairing — parent `p` in `[0, 2^(L-1))`, children `{p, p + 2^(L-1)}` — is known BEFORE this level's
+/// split (no circular dependency). Accuracy moves only at ~1e-11 (g/h drift; count exact; wsum exact
+/// under unit weights); determinism is preserved because `small_rows` is filtered in fixed row order
+/// before the (chunk-deterministic) build. FullF64 only — the quantized path keeps full builds.
+#[allow(clippy::too_many_arguments)]
+fn build_subtracted_level(
+    x: &BinnedMatrix,
+    gh: &GradHess,
+    rows: &[u32],
+    leaf_of_row: &[u8],
+    level: usize,
+    admissible: &[u32],
+    weight: &[f32],
+    unit_weight: bool,
+    prev_hist: &Hist,
+    prev_admissible: &[u32],
+) -> Result<Hist, PbError> {
+    let half = 1usize << (level - 1);
+    let n_leaves = 1usize << level;
+    // Step A — per-(level-L)-leaf row counts via one fixed-order pass (deterministic).
+    let mut child_count = vec![0u64; n_leaves];
+    for &r in rows {
+        let leaf = usize::from(
+            *leaf_of_row
+                .get(r as usize)
+                .ok_or_else(internal("subtraction leaf_of_row row"))?,
+        );
+        let c = child_count
+            .get_mut(leaf)
+            .ok_or_else(internal("subtraction child_count leaf"))?;
+        *c = c
+            .checked_add(1)
+            .ok_or_else(internal("subtraction count overflow"))?;
+    }
+    // Pairing: parent p split into children {p, p+half}; SMALLER = fewer rows (tie -> lower index).
+    let mut pairing: Vec<(usize, usize, usize)> = Vec::with_capacity(half);
+    let mut is_smaller = vec![false; n_leaves];
+    for p in 0..half {
+        let c0 = p;
+        let c1 = p + half;
+        let cnt0 = *child_count
+            .get(c0)
+            .ok_or_else(internal("subtraction cnt0"))?;
+        let cnt1 = *child_count
+            .get(c1)
+            .ok_or_else(internal("subtraction cnt1"))?;
+        let (sm, lg) = if cnt1 < cnt0 { (c1, c0) } else { (c0, c1) };
+        pairing.push((p, sm, lg));
+        *is_smaller
+            .get_mut(sm)
+            .ok_or_else(internal("subtraction is_smaller set"))? = true;
+    }
+    // Step B — build ONLY the smaller children, filtering `rows` in fixed order (chunk boundaries,
+    // and therefore the fixed-order chunk reduction, stay intact ⇒ thread-count independent).
+    let mut small_rows: Vec<u32> = Vec::new();
+    small_rows
+        .try_reserve(rows.len())
+        .map_err(|_| PbError::Internal {
+            what: "subtraction small_rows allocation failed".into(),
+        })?;
+    for &r in rows {
+        let leaf = usize::from(
+            *leaf_of_row
+                .get(r as usize)
+                .ok_or_else(internal("subtraction small leaf"))?,
+        );
+        if *is_smaller
+            .get(leaf)
+            .ok_or_else(internal("subtraction is_smaller read"))?
+        {
+            small_rows.push(r);
+        }
+    }
+    let mut hist = build_histogram(
+        x,
+        gh,
+        &small_rows,
+        leaf_of_row,
+        n_leaves,
+        admissible,
+        weight,
+        unit_weight,
+    )?;
+    // Step C — axis-position map A_L -> A_{L-1} (total: A_L ⊆ A_{L-1}, append-only `used_raws`).
+    let mut axis_map: Vec<usize> = Vec::with_capacity(admissible.len());
+    for &a in admissible {
+        let pos = prev_admissible
+            .iter()
+            .position(|&pa| pa == a)
+            .ok_or_else(internal("subtraction axis absent from parent admissible"))?;
+        axis_map.push(pos);
+    }
+    // Step D — fill the larger children by subtracting the smaller from the parent leaf.
+    subtract_sibling_into(&mut hist, prev_hist, &pairing, &axis_map)?;
+    Ok(hist)
+}
+
 /// Grow one depth-`1..=3` oblivious tree (spec §06.2/§06.6) over `rows`, scanning the
 /// candidate `axes` (already column-sampled by the caller). Returns `None` when no
 /// admissible candidate clears `min_split_gain` at the first level (a degenerate
@@ -881,6 +990,10 @@ pub(crate) fn grow_oblivious_tree(
     let mut used_raws: smallvec::SmallVec<[u32; 3]> = smallvec::SmallVec::new();
     let mut used_axes: smallvec::SmallVec<[u32; 3]> = smallvec::SmallVec::new();
     let order_cap = usize::from(cfg.max_order).min(3);
+    // Retained level-1 (FullF64) histogram + its axis ids, so level 2 can build by subtraction
+    // (the histogram-subtraction trick) instead of a full pass. Captured only on the FullF64 path.
+    let mut prev_hist: Option<Hist> = None;
+    let mut prev_admissible: Option<Vec<u32>> = None;
 
     for level in 0..3usize {
         if used_raws.len() >= order_cap {
@@ -915,30 +1028,54 @@ pub(crate) fn grow_oblivious_tree(
 
         let n_leaves = 1usize << level;
         let hist =
-            crate::engine::boost::prof::timed("grow.hist_build", || match cfg.hist_precision {
-                HistPrecision::FullF64 => build_histogram(
-                    x,
-                    gh,
-                    rows,
-                    &leaf_of_row,
-                    n_leaves,
-                    &admissible,
-                    weight,
-                    cfg.unit_weight,
-                ),
-                HistPrecision::QuantizedI32 => build_quantized_histogram(
-                    x,
-                    gh,
-                    rows,
-                    &leaf_of_row,
-                    n_leaves,
-                    &admissible,
-                    QuantizeContext {
-                        seed: cfg.quant_seed,
-                        round: cfg.round,
-                    },
-                    weight,
-                ),
+            crate::engine::boost::prof::timed("grow.hist_build", || -> Result<Hist, PbError> {
+                // Histogram-subtraction fast path: level 2, FullF64, with the level-1 parent retained.
+                // Builds the larger sibling-children by subtraction (visits ~half the rows). Gated to
+                // level 2 only (single drift generation) and FullF64 (quantized keeps full builds).
+                if cfg.hist_subtraction
+                    && level == 2
+                    && matches!(cfg.hist_precision, HistPrecision::FullF64)
+                {
+                    if let (Some(ph), Some(pa)) = (prev_hist.as_ref(), prev_admissible.as_ref()) {
+                        return build_subtracted_level(
+                            x,
+                            gh,
+                            rows,
+                            &leaf_of_row,
+                            level,
+                            &admissible,
+                            weight,
+                            cfg.unit_weight,
+                            ph,
+                            pa,
+                        );
+                    }
+                }
+                match cfg.hist_precision {
+                    HistPrecision::FullF64 => build_histogram(
+                        x,
+                        gh,
+                        rows,
+                        &leaf_of_row,
+                        n_leaves,
+                        &admissible,
+                        weight,
+                        cfg.unit_weight,
+                    ),
+                    HistPrecision::QuantizedI32 => build_quantized_histogram(
+                        x,
+                        gh,
+                        rows,
+                        &leaf_of_row,
+                        n_leaves,
+                        &admissible,
+                        QuantizeContext {
+                            seed: cfg.quant_seed,
+                            round: cfg.round,
+                        },
+                        weight,
+                    ),
+                }
             })?;
         let candidate_axis_signs: Vec<Option<MonoSign>> = match cfg.monotone {
             Some(signs) => admissible
@@ -1004,6 +1141,13 @@ pub(crate) fn grow_oblivious_tree(
             let bin = *col.get(ru).ok_or_else(internal("split bin"))?;
             let bit = u8::from(low_bit(bin, cand.bin_le, cand.missing_left)) << level;
             *leaf_of_row.get_mut(ru).ok_or_else(internal("leaf set"))? |= bit;
+        }
+
+        // Retain the level-1 FullF64 histogram + its axis ids so level 2 can build by subtraction.
+        // (Quantized stays on full builds; level 2 is last so it is never itself retained.)
+        if level == 1 && matches!(cfg.hist_precision, HistPrecision::FullF64) {
+            prev_admissible = Some(admissible.clone());
+            prev_hist = Some(hist);
         }
     }
 
@@ -1495,6 +1639,9 @@ mod tests {
             // Slow Σw path in grow tests (always correct for any weights); the dedicated
             // `unit_weight_*` hist tests pin the fast path's bit-identity directly.
             unit_weight: false,
+            // Subtraction ON by default in grow tests too (matches production); the
+            // equivalence tests flip it off to get the full-build reference.
+            hist_subtraction: true,
         }
     }
 
@@ -1951,6 +2098,120 @@ mod tests {
         raws.sort_unstable();
         raws.dedup();
         assert_eq!(raws, vec![0, 1, 2]); // each level a distinct raw feature (I1)
+    }
+
+    /// A non-trivial depth-3 fixture for the histogram-subtraction tests: the 8-cell
+    /// 3-binary-feature design replicated with deterministic per-row gradient noise (so the
+    /// level-2 histograms carry real, varied mass), plus a weak 4th feature. The grower uses
+    /// features 0,1,2 (coeffs 4,2,1), so at level 2 A_2 = {2,3} ⊂ A_1 = {1,2,3} with SHIFTED
+    /// positions — exercising the axis-position remap.
+    fn subtraction_fixture() -> (BinnedMatrix, GradHess, Vec<u32>) {
+        let base0 = [1u8, 1, 1, 1, 2, 2, 2, 2];
+        let base1 = [1u8, 1, 2, 2, 1, 1, 2, 2];
+        let base2 = [1u8, 2, 1, 2, 1, 2, 1, 2];
+        let reps = 80usize;
+        let (mut c0, mut c1, mut c2, mut c3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for r in 0..reps {
+            for k in 0..8usize {
+                c0.push(base0[k]);
+                c1.push(base1[k]);
+                c2.push(base2[k]);
+                c3.push(1 + ((r * 8 + k) * 7 + 3) as u8 % 3); // weak 4-bin decoy in [1,3]
+            }
+        }
+        let x = matrix(vec![c0.clone(), c1.clone(), c2.clone(), c3], &[3, 3, 3, 4]);
+        let n = c0.len();
+        let g: Vec<f32> = (0..n)
+            .map(|i| {
+                let b0 = f32::from(c0[i] - 1);
+                let b1 = f32::from(c1[i] - 1);
+                let b2 = f32::from(c2[i] - 1);
+                4.0 * b0 + 2.0 * b1 + b2 - 3.5 + 0.05 * (((i * 13 + 7) % 11) as f32 - 5.0)
+            })
+            .collect();
+        let gh = gradhess(&g, &vec![1.0_f32; n]);
+        (x, gh, (0..n as u32).collect())
+    }
+
+    #[test]
+    fn level2_subtraction_reproduces_full_build_tree() {
+        // THE de-risking gate: grow the SAME data with the level-2 histogram-subtraction path
+        // ON (default) and OFF (full build), assert the trees are byte-identical (splits, leaf
+        // bits, depth). Subtraction perturbs g/h only at ~1e-11 — far below any non-tie split
+        // gap — so the selected splits, and the gh-derived leaves, match exactly.
+        let (x, gh, rows) = subtraction_fixture();
+        let w = ones(x.n_rows as usize);
+        let axes = [0u32, 1, 2, 3];
+        let on = cfg(0.0, 0.1, 0.0, 3); // hist_subtraction = true
+        let off = GrowConfig {
+            hist_subtraction: false,
+            ..cfg(0.0, 0.1, 0.0, 3)
+        };
+        let t_on = grow_oblivious_tree(&x, &gh, &rows, &axes, &on, &w)
+            .unwrap()
+            .expect("tree");
+        let t_off = grow_oblivious_tree(&x, &gh, &rows, &axes, &off, &w)
+            .unwrap()
+            .expect("tree");
+        assert!(
+            t_on.depth >= 2,
+            "fixture must reach depth 2 so the level-2 subtraction path engages (got {})",
+            t_on.depth
+        );
+        assert_eq!(
+            t_on, t_off,
+            "level-2 subtraction must reproduce the full-build tree byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn level2_subtraction_is_thread_count_independent() {
+        // Subtraction must keep the §1 determinism GATE: same tree across 1/2/8 threads.
+        let (x, gh, rows) = subtraction_fixture();
+        let w = ones(x.n_rows as usize);
+        let axes = [0u32, 1, 2, 3];
+        let grow = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                grow_oblivious_tree(&x, &gh, &rows, &axes, &cfg(0.0, 0.1, 0.0, 3), &w)
+                    .unwrap()
+                    .expect("tree")
+            })
+        };
+        let base = grow(1);
+        assert_eq!(base, grow(2), "subtraction tree differs at 2 threads");
+        assert_eq!(base, grow(8), "subtraction tree differs at 8 threads");
+    }
+
+    #[test]
+    fn level2_subtraction_flag_off_matches_full_build_and_quantized_unaffected() {
+        // The flag is inert for QuantizedI32 (always full build): a quantized grow is identical
+        // whether the subtraction flag is on or off.
+        let (x, gh, rows) = subtraction_fixture();
+        let w = ones(x.n_rows as usize);
+        let axes = [0u32, 1, 2, 3];
+        let q_on = GrowConfig {
+            hist_precision: HistPrecision::QuantizedI32,
+            hist_subtraction: true,
+            ..cfg(0.0, 0.1, 0.0, 3)
+        };
+        let q_off = GrowConfig {
+            hist_subtraction: false,
+            ..q_on.clone()
+        };
+        let t_on = grow_oblivious_tree(&x, &gh, &rows, &axes, &q_on, &w)
+            .unwrap()
+            .expect("tree");
+        let t_off = grow_oblivious_tree(&x, &gh, &rows, &axes, &q_off, &w)
+            .unwrap()
+            .expect("tree");
+        assert_eq!(
+            t_on, t_off,
+            "subtraction flag must be inert on the quantized path"
+        );
     }
 
     #[test]

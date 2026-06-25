@@ -255,3 +255,29 @@ outputs), leaf-wise growth (needs fewer trees — G0 requires oblivious), no lea
 lever). So tri stays ~1.9-3.5× slower than LGBM on the suite config (refine=0, hist-bound) and ~13× on the o3
 accuracy config — a STRUCTURAL gap under strict byte-identity, not an implementation one. Closing it further
 requires relaxing byte-identity (adopt subtraction/QHIST, accepting ~rounding-level output shifts) or G0.
+
+### ✅ WIN #5 — Level-2 histogram subtraction (FullF64) [G5] — accuracy-neutral (byte-identity relaxed)
+User authorized relaxing strict byte-identity for accuracy-NEUTRAL speedups. Wired the histogram-subtraction
+trick into the oblivious grower: at level 2 (FullF64), build only the SMALLER of each parent leaf's two
+children by accumulation (~half the rows) and derive the LARGER by subtracting from the retained level-1
+parent (`subtract_sibling_into` + `build_subtracted_level`, gated by `GrowConfig.hist_subtraction`, default on,
+kill-switch + A/B reference). Building the smaller and subtracting to get the larger remainder avoids
+catastrophic cancellation, so g/h drift stays ~1e-11; `count` is integer-exact and, under unit weights (the
+default + whole benchmark), `wsum == count` stays EXACT. Scoped to level 2 only (single drift generation) per
+a design-critique workflow (3 expert critiques → synthesis); leaf values are recomputed from gh directly so
+they are unaffected — drift only perturbs split SELECTION at exact near-ties.
+- **Design + verification via Workflow** (ultracode): a design-critique workflow caught the axis-position
+  remap (A_2 ⊊ A_1 positions shift), the `subtract()` shape-mismatch (needs a custom sibling-subtract), and
+  the build-smaller-derive-larger cancellation-avoidance; an adversarial-verification workflow (3 attackers +
+  triage) returned **ship, zero confirmed bugs** — the only flagged items were the accepted near-tie
+  flip and a non-unit-weight credibility-boundary flip (absent under unit weights).
+- **Byte-identity within tolerance:** equivalence test `level2_subtraction_reproduces_full_build_tree`
+  (subtracted tree == full-build tree, well-separated fixture); determinism test (1/2/8 threads identical);
+  primitive tests for `subtract_sibling_into` (hand-computed, underflow, shape); quantized-inert test.
+  End-to-end real-data scores match the prior baseline **EXACTLY** (no near-tie flips occurred): diamonds
+  0.11376 / 0.09022, kick 0.77228 / 0.76975. 229 core + 20 py tests green; clippy + fmt clean.
+- **Measured (4 threads):** suite config (n=400, refine=0): diamonds `hist_build` 0.877s → **0.696s (−21%)**,
+  wall 1.42s → **1.13s (−20%)**; kick `hist_build` 2.72s → **2.24s (−18%)**, wall 4.26s → **3.62s (−15%)**.
+  o3 config (n=2000, refine=4): diamonds `hist_build` ~3.90s → 3.55s (−9%); kick ~14.4s → **11.6s (−19%)**,
+  wall ~40s → 36.8s. Generalizes to every FullF64 depth-≥2 fit. Level 1 subtraction deferred (would compound
+  drift a second generation; same machinery if the win justifies it later).
