@@ -136,14 +136,12 @@ pub(crate) fn build_histogram(
                     max_bins,
                     "histogram assembly offset overflow",
                 )?;
-                *hist.g.get_mut(dst).ok_or_else(oob("assemble g"))? =
-                    *sub.g.get(src).ok_or_else(oob("sub g"))?;
-                *hist.h.get_mut(dst).ok_or_else(oob("assemble h"))? =
-                    *sub.h.get(src).ok_or_else(oob("sub h"))?;
+                let cell = sub.ghc.get(src).ok_or_else(oob("sub ghc"))?;
+                *hist.g.get_mut(dst).ok_or_else(oob("assemble g"))? = cell.g;
+                *hist.h.get_mut(dst).ok_or_else(oob("assemble h"))? = cell.h;
                 *hist.wsum.get_mut(dst).ok_or_else(oob("assemble wsum"))? =
                     *sub.wsum.get(src).ok_or_else(oob("sub wsum"))?;
-                *hist.count.get_mut(dst).ok_or_else(oob("assemble count"))? =
-                    *sub.count.get(src).ok_or_else(oob("sub count"))?;
+                *hist.count.get_mut(dst).ok_or_else(oob("assemble count"))? = cell.count;
             }
         }
     }
@@ -322,12 +320,21 @@ pub(crate) fn build_quantized_histogram(
     Ok(hist)
 }
 
-/// One axis's `[leaf][bin]` sub-histogram (stride `max_bins`).
+/// One `[leaf][bin]` cell's gradient/hessian/count, packed so the per-row scatter touches a
+/// single cache line and needs one bounds check instead of three (the hot accumulation path).
+#[derive(Clone, Copy, Default)]
+struct GhcCell {
+    g: f64,
+    h: f64,
+    count: u32,
+}
+
+/// One axis's `[leaf][bin]` sub-histogram (stride `max_bins`). `g`/`h`/`count` are packed into
+/// one [`GhcCell`] per cell (array-of-structs) so each accumulated row is a single bounds-checked
+/// write to one cache line; `wsum` stays a separate array, touched only for non-unit weights.
 struct AxisHist {
-    g: Vec<f64>,
-    h: Vec<f64>,
+    ghc: Vec<GhcCell>,
     wsum: Vec<f64>,
-    count: Vec<u32>,
 }
 
 struct AxisQHist {
@@ -355,15 +362,12 @@ impl AxisHist {
     fn try_zeros(n_leaves: usize, max_bins: usize) -> Result<Self, PbError> {
         let size = Hist::checked_cell_count(n_leaves, 1, max_bins)?;
         Ok(Self {
-            g: Hist::try_zeroed_vec(size, "axis histogram g")?,
-            h: Hist::try_zeroed_vec(size, "axis histogram h")?,
+            ghc: Hist::try_zeroed_vec(size, "axis histogram ghc")?,
             wsum: Hist::try_zeroed_vec(size, "axis histogram wsum")?,
-            count: Hist::try_zeroed_vec(size, "axis histogram count")?,
         })
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn accumulate_axis(
     x: &BinnedMatrix,
@@ -445,52 +449,47 @@ fn accumulate_axis_sequential(
             });
         }
         let idx = offset2(leaf, bin, max_bins, "axis histogram row offset overflow")?;
-        *out.g.get_mut(idx).ok_or_else(oob("g cell"))? +=
-            f64::from(*gh.g.get(ru).ok_or_else(oob("gh.g"))?);
-        *out.h.get_mut(idx).ok_or_else(oob("h cell"))? +=
-            f64::from(*gh.h.get(ru).ok_or_else(oob("gh.h"))?);
+        // One bounds-checked write to the packed g/h/count cell (one cache line).
+        let cell = out.ghc.get_mut(idx).ok_or_else(oob("ghc cell"))?;
+        cell.g += f64::from(*gh.g.get(ru).ok_or_else(oob("gh.g"))?);
+        cell.h += f64::from(*gh.h.get(ru).ok_or_else(oob("gh.h"))?);
+        // count <= rows.len() <= n_rows <= u32::MAX, so this never actually overflows;
+        // checked_add keeps it panic-free under overflow-checks regardless.
+        cell.count = cell
+            .count
+            .checked_add(1)
+            .ok_or_else(oob("bin count overflow"))?;
         if !unit_weight {
             *out.wsum.get_mut(idx).ok_or_else(oob("wsum cell"))? +=
                 f64::from(*weight.get(ru).ok_or_else(oob("weight"))?);
         }
-        let c = out.count.get_mut(idx).ok_or_else(oob("count cell"))?;
-        // count <= rows.len() <= n_rows <= u32::MAX, so this never actually overflows;
-        // checked_add keeps it panic-free under overflow-checks regardless.
-        *c = c.checked_add(1).ok_or_else(oob("bin count overflow"))?;
     }
     if unit_weight {
         // wsum == count for unit weights (Σ 1.0 == count, exact in f64). Per-chunk this gives
         // each chunk's count; `add_axis_hist` then sums them, matching the per-row Σw exactly.
-        for (w, &c) in out.wsum.iter_mut().zip(&out.count) {
-            *w = f64::from(c);
+        for (w, c) in out.wsum.iter_mut().zip(&out.ghc) {
+            *w = f64::from(c.count);
         }
     }
     Ok(out)
 }
 
 fn add_axis_hist(dst: &mut AxisHist, src: &AxisHist) -> Result<(), PbError> {
-    if dst.g.len() != src.g.len()
-        || dst.h.len() != src.h.len()
-        || dst.wsum.len() != src.wsum.len()
-        || dst.count.len() != src.count.len()
-    {
+    if dst.ghc.len() != src.ghc.len() || dst.wsum.len() != src.wsum.len() {
         return Err(PbError::Internal {
             what: "axis histogram chunk shape mismatch".into(),
         });
     }
-    for (d, s) in dst.g.iter_mut().zip(&src.g) {
-        *d += *s;
-    }
-    for (d, s) in dst.h.iter_mut().zip(&src.h) {
-        *d += *s;
+    for (d, s) in dst.ghc.iter_mut().zip(&src.ghc) {
+        d.g += s.g;
+        d.h += s.h;
+        d.count = d
+            .count
+            .checked_add(s.count)
+            .ok_or_else(oob("axis histogram chunk count overflow"))?;
     }
     for (d, s) in dst.wsum.iter_mut().zip(&src.wsum) {
         *d += *s;
-    }
-    for (d, s) in dst.count.iter_mut().zip(&src.count) {
-        *d = d
-            .checked_add(*s)
-            .ok_or_else(oob("axis histogram chunk count overflow"))?;
     }
     Ok(())
 }

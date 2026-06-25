@@ -310,6 +310,20 @@ New `fill_grad_hess_parallel` applied to Logistic/Poisson/Gamma/Tweedie; **Squar
   (no main-grad_hess regression this time), wall → ~26.2s; diamonds unchanged (SE sequential). Helps every
   log-link fit. Cumulative kick o3 this session: 37.1s → **~26.2s (−29%)**.
 
+### ✅ WIN #8 — Array-of-structs histogram accumulator [G5] — BYTE-IDENTICAL
+Profiling vs LightGBM (apples-to-apples suite config, refine=0): the gap is entirely in FIT (kick tri 2.88s
+vs LGBM 0.91s; predict is fine), and `hist_build` is the dominant phase. The hot accumulation loop scattered
+each row into 4 SEPARATE arrays (`g`,`h`,`wsum`,`count`) — 3 bounds-checked cell writes hitting 3 cache lines
+per row (unit-weight skips wsum). Packed `g`/`h`/`count` into ONE `GhcCell` (array-of-structs) so each row is
+a SINGLE bounds-checked write to ONE cache line; `wsum` stays a separate array (touched only for non-unit
+weights). Same f64 arithmetic in the same fixed order ⇒ **byte-identical** (count/g/h/wsum per cell
+unchanged); the existing hist + grow tests and exact real-data scores confirm it. Contained to `hist.rs`
+(`AxisHist`, accumulate, `add_axis_hist`, assembly); the quantized path is untouched.
+- **Byte-identical:** scores exactly unchanged (kick 0.77228, diamonds 0.11376). 231 core + 20 py green.
+- **Measured (suite config, n=400, refine=0, 4 threads):** kick `hist_build` 1.88s → **1.45s (−23%)**, wall
+  3.16s → **~2.77s** (vs LGBM 1.19s: gap **3.5× → 2.3×**); diamonds `hist_build` 0.77s → **0.58s (−18%)**,
+  wall 1.14s → ~1.01s. Generalizes to every fit. Cumulative suite-config kick this session: 4.26s → ~2.77s (−35%).
+
 ### ✅ WIN #6 — Chunked-parallel log-link deviance fold [G5] — accuracy-neutral
 With byte-identity relaxed, profiled the o3 bottleneck: kick `refine.backtrack_eval` (the leaf-refine
 line-search deviance) was the single biggest sub-phase at 11.74s. The log-link deviance is COMPUTE-bound
