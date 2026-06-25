@@ -324,6 +324,19 @@ unchanged); the existing hist + grow tests and exact real-data scores confirm it
   3.16s → **~2.77s** (vs LGBM 1.19s: gap **3.5× → 2.3×**); diamonds `hist_build` 0.77s → **0.58s (−18%)**,
   wall 1.14s → ~1.01s. Generalizes to every fit. Cumulative suite-config kick this session: 4.26s → ~2.77s (−35%).
 
+### ✅ WIN #9 — Parallelize per-feature binning / categorical TS encoders [G5] — BYTE-IDENTICAL
+Profiling the fit-vs-binning split (fit at n_trees=1 ≈ binning): kick's binning was a FIXED **~0.58s** — 64%
+of LightGBM's ENTIRE fit — almost all of it the high-cardinality categorical target-statistics (KFold OOF)
+encoders, run SEQUENTIALLY one feature at a time in `bin_train_columns`. Each feature's grid/encoder is
+independent and deterministic in its own seed stream, so encode numeric grids and categorical TS encoders
+with `par_iter` + order-preserving collects — **byte-identical** to the serial build (the categorical
+(raw,id) uniqueness check is hoisted up front to keep first-duplicate-wins semantics). Contained to
+`data/bin.rs`.
+- **Byte-identical:** scores exactly unchanged (kick 0.77228, diamonds 0.11376). 231 core + 20 py green.
+- **Measured (4 threads):** kick binning 0.58s → **0.30s (−48%)**, fit (n=400) 2.98s → **2.42s (−19%)**;
+  diamonds binning 0.044s (numeric-only, already small). Helps every categorical-heavy fit (kick, amazon,
+  allstate, …). Cumulative kick suite fit this session: ~3.9s → **2.42s (−38%)**.
+
 ### ✅ WIN #6 — Chunked-parallel log-link deviance fold [G5] — accuracy-neutral
 With byte-identity relaxed, profiled the o3 bottleneck: kick `refine.backtrack_eval` (the leaf-refine
 line-search deviance) was the single biggest sub-phase at 11.74s. The log-link deviance is COMPUTE-bound

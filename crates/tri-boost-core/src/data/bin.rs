@@ -186,30 +186,32 @@ pub fn bin_train_columns(
     let mut grids = Vec::with_capacity(numeric.len() + categorical.len());
     let mut provenance = Vec::with_capacity(numeric.len() + categorical.len());
 
-    for col in numeric {
-        if col.values.len() != y.len() {
-            return Err(PbError::ShapeMismatch {
-                what: format!(
-                    "numeric raw {:?} len {} != n_rows {}",
-                    col.raw,
-                    col.values.len(),
-                    y.len()
-                ),
-            });
-        }
-        let grid = build_grid(col.values, weight, cfg, seed, col.raw)?;
-        let binned = bin_values(col.values, &grid)?;
-        train_data.push(binned.clone());
-        serve_data.push(binned);
-        grids.push(grid);
-        provenance.push(AxisProvenance {
-            raw: col.raw,
-            kind: AxisKind::Numeric,
-        });
-    }
+    // Per-feature fit+bin is independent, so build numeric grids and the (dominant, on
+    // high-cardinality data) categorical TS encoders in parallel. Order-preserving collects ⇒
+    // byte-identical to the serial build (each encoder is deterministic in its own seed stream).
+    let numeric_out: Result<Vec<(BorderGrid, Vec<u8>)>, PbError> = numeric
+        .par_iter()
+        .map(|col| {
+            if col.values.len() != y.len() {
+                return Err(PbError::ShapeMismatch {
+                    what: format!(
+                        "numeric raw {:?} len {} != n_rows {}",
+                        col.raw,
+                        col.values.len(),
+                        y.len()
+                    ),
+                });
+            }
+            let grid = build_grid(col.values, weight, cfg, seed, col.raw)?;
+            let binned = bin_values(col.values, &grid)?;
+            Ok((grid, binned))
+        })
+        .collect();
+    let numeric_out = numeric_out?;
 
-    let mut encoders = Vec::with_capacity(categorical.len());
-    for col in categorical {
+    // Categorical shape + (raw, id) uniqueness are checked up front (a parallel encode cannot
+    // do the incremental "already seen" check); same first-duplicate-wins semantics as before.
+    for (i, col) in categorical.iter().enumerate() {
         if col.levels.len() != y.len() {
             return Err(PbError::ShapeMismatch {
                 what: format!(
@@ -220,9 +222,10 @@ pub fn bin_train_columns(
                 ),
             });
         }
-        if encoders
+        if categorical
             .iter()
-            .any(|enc: &crate::cat::CatEncoder| enc.raw == col.raw && enc.id == col.id)
+            .take(i)
+            .any(|prev| prev.raw == col.raw && prev.id == col.id)
         {
             return Err(PbError::InvalidConfig {
                 what: format!(
@@ -231,26 +234,48 @@ pub fn bin_train_columns(
                 ),
             });
         }
-        let (encoder, train_encoded) = fit_cat_encoder(
-            col.levels,
-            y,
-            CatFitSpec {
-                raw: col.raw,
-                id: col.id,
-                weight,
-                exposure,
-                config: col.config,
-                seed,
-            },
-        )?;
-        let grid = encoder.border_grid()?;
-        let train_bins = bin_values(&train_encoded, &grid)?;
-        let serve_encoded: Vec<f32> = col
-            .levels
-            .iter()
-            .map(|level| encoder.encode_label(level))
-            .collect();
-        let serve_bins = bin_values(&serve_encoded, &grid)?;
+    }
+    type CatOut = (crate::cat::CatEncoder, BorderGrid, Vec<u8>, Vec<u8>);
+    let cat_out: Result<Vec<CatOut>, PbError> = categorical
+        .par_iter()
+        .map(|col| {
+            let (encoder, train_encoded) = fit_cat_encoder(
+                col.levels,
+                y,
+                CatFitSpec {
+                    raw: col.raw,
+                    id: col.id,
+                    weight,
+                    exposure,
+                    config: col.config,
+                    seed,
+                },
+            )?;
+            let grid = encoder.border_grid()?;
+            let train_bins = bin_values(&train_encoded, &grid)?;
+            let serve_encoded: Vec<f32> = col
+                .levels
+                .iter()
+                .map(|level| encoder.encode_label(level))
+                .collect();
+            let serve_bins = bin_values(&serve_encoded, &grid)?;
+            Ok((encoder, grid, train_bins, serve_bins))
+        })
+        .collect();
+    let cat_out = cat_out?;
+
+    // Assemble in axis order: numeric features first, then categorical (matches the serial build).
+    let mut encoders = Vec::with_capacity(categorical.len());
+    for (col, (grid, binned)) in numeric.iter().zip(numeric_out) {
+        train_data.push(binned.clone());
+        serve_data.push(binned);
+        grids.push(grid);
+        provenance.push(AxisProvenance {
+            raw: col.raw,
+            kind: AxisKind::Numeric,
+        });
+    }
+    for (col, (encoder, grid, train_bins, serve_bins)) in categorical.iter().zip(cat_out) {
         train_data.push(train_bins);
         serve_data.push(serve_bins);
         grids.push(grid);
