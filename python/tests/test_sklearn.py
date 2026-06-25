@@ -162,6 +162,31 @@ def test_nesterov_is_rejected_as_unstable() -> None:
         small_regressor(nesterov=True).fit(x.astype(np.float32), y)
 
 
+def test_all_categorical_input_stays_exact_and_predicts() -> None:
+    # No numeric features at all — the model is built entirely from native categoricals.
+    rng = np.random.default_rng(0)
+    n = 1500
+    a = rng.integers(0, 5, n)
+    b = rng.integers(0, 4, n)
+    x = np.array([[f"A{ai}", f"B{bi}"] for ai, bi in zip(a, b)], dtype=object)
+    y = (a + 2.0 * b).astype(np.float32)
+    m = TriBoostRegressor(
+        objective="squared_error", n_trees=80, learning_rate=0.1, seed=0,
+        categorical_features=[0, 1],
+    ).fit(x, y)
+    pred = np.asarray(m.predict(x))
+    assert pred.shape == (n,) and np.isfinite(pred).all()
+    exp = json.loads(m.tables(x[:128]))
+    assert exp["mode"] == "Exact"
+
+
+def test_empty_feature_matrix_is_rejected() -> None:
+    with pytest.raises(Exception, match="at least one feature"):
+        TriBoostRegressor(n_trees=5, seed=0).fit(
+            np.empty((50, 0), dtype=np.float32), np.zeros(50, dtype=np.float32)
+        )
+
+
 def test_booster_knobs_round_trip_and_stay_exact() -> None:
     # The §06/§09/§07 levers (ensemble, sampling, hist precision, refit, interaction order)
     # are now reachable from Python; they survive get_params/clone and stay exactly

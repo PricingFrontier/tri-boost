@@ -283,9 +283,6 @@ class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped 
         n_features = _n_columns(X)
         cat_set = set(cat_idx)
         numeric_idx = [i for i in range(n_features) if i not in cat_set]
-        if not numeric_idx:
-            raise ValueError("tri-boost native categoricals require at least one numeric feature")
-
         numeric_x = self._as_float32_2d_once(_numeric_subset(X, numeric_idx))
         cat_x = [_column_as_str_list(X, j) for j in cat_idx]
         for pos, col in zip(cat_idx, cat_x):

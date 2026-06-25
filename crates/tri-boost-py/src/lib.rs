@@ -388,6 +388,11 @@ impl PyBooster {
         cat_x: Option<Vec<Vec<String>>>,
     ) -> PyResult<PyModel> {
         let columns = raw_columns_from_array(x)?;
+        if columns.len() + cat_x.as_ref().map_or(0, Vec::len) == 0 {
+            return Err(py_err(PbError::InvalidInput {
+                what: "x must contain at least one feature (numeric or categorical)".into(),
+            }));
+        }
         let y = array1_to_vec(y, "y")?;
         let weight = weight.map(|w| array1_to_vec(w, "weight")).transpose()?;
         let exposure = exposure.map(|e| array1_to_vec(e, "exposure")).transpose()?;
@@ -787,10 +792,10 @@ fn raw_columns_from_array(x: PyReadonlyArray2<'_, f32>) -> PyResult<Vec<Vec<f32>
     let n_features = *shape.get(1).ok_or_else(|| {
         PyTypeError::new_err("x must be a two-dimensional C-contiguous float32 array")
     })?;
+    // 0 numeric columns is legal when native categorical columns are supplied (all-categorical
+    // input); the total-feature (numeric + categorical) check lives in the core fit/serve.
     if n_features == 0 {
-        return Err(py_err(PbError::InvalidInput {
-            what: "x must contain at least one feature".into(),
-        }));
+        return Ok(Vec::new());
     }
     let slice = x.as_slice().map_err(|_| {
         PyTypeError::new_err("x must be a C-contiguous numpy.ndarray with dtype float32")
