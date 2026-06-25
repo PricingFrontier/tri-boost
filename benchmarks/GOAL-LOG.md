@@ -128,5 +128,25 @@ Every clean rival technique either (a) reduces to what tri already does (inert),
 (order>3 / leaf-wise / non-contiguous splits), or (c) is mature-implementation overhead. The real wins tri
 HOLDS (G1@3, G2 4/6, G3 5/6, exact decomposition throughout) are already banked.
 
+### Granular fit profiler (TRIBOOST_PROFILE env, zero-cost when off) — committed dev infra
+Instrumented the Rust fit loop with per-phase wall-timers (boost.rs `prof` module). Diamonds o3
+(refine=4, 4000 trees, wall 29.6s) EXACT breakdown — top-level phases sum to wall; nested `.` are subsets:
+| phase | s | %wall |
+|---|---|---|
+| **leaf_refine** | 17.1 | 58% |
+| ↳ refine.backtrack_eval | 8.9 | (30% of wall) |
+| ↳ refine.grad_hess | 3.4 | |
+| ↳ refine.aggregate | 0.9 | |
+| **grow_tree** | 9.4 | 32% |
+| ↳ grow.hist_build | 7.9 | (27% of wall) |
+| ↳ grow.split_find | 0.4 | |
+| update_raw | 1.1 | 4% |
+| grad_hess | 0.8 | 3% |
+| earlystop_eval | 0.1 | 0.2% |
+**EXACT bottlenecks** (not the histograms the roadmap assumed): #1 `refine.backtrack_eval` (8.9s) — the
+line-search re-walks the tree + does a separate deviance pass every trial, but memberships are FIXED and
+only 8 leaf values change → fusable to one membership pass, O(8) exact for squared-error. #2 `grow.hist_build`
+(7.9s) — where subtraction would help (~3s). Both exactness-preserving. backtrack_eval is the bigger, safer first win.
+
 ## Implemented techniques (committed wins)
-_(none — the roadmap's techniques were each rejected with measured/analytic evidence; see above)_
+_(none yet — next: fuse refine.backtrack_eval, the profiled #1 bottleneck)_

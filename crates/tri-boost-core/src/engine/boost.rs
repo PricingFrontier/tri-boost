@@ -253,6 +253,76 @@ pub(crate) fn fit(
     }
 }
 
+/// Dev-only fit profiler (gated by the `TRIBOOST_PROFILE` env var; a no-op otherwise so it never
+/// affects production timing or determinism). Accumulates wall-time per named fit phase on the
+/// calling (main) thread — parallel work inside a phase is captured at its main-thread call site —
+/// and prints a breakdown to stderr at the end of `fit_single`. Pure measurement: no model effect.
+pub(crate) mod prof {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static ENABLED: bool = std::env::var_os("TRIBOOST_PROFILE").is_some();
+        static SPANS: RefCell<Vec<(&'static str, Duration)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn enabled() -> bool {
+        ENABLED.with(|e| *e)
+    }
+    fn add(name: &'static str, d: Duration) {
+        SPANS.with(|s| {
+            let mut v = s.borrow_mut();
+            if let Some(e) = v.iter_mut().find(|(n, _)| *n == name) {
+                e.1 += d;
+            } else {
+                v.push((name, d));
+            }
+        });
+    }
+    /// Time `f`, accumulating its wall-time under `name` (only when enabled). Returns `f`'s value.
+    #[inline]
+    pub(crate) fn timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let t = Instant::now();
+        let r = f();
+        add(name, t.elapsed());
+        r
+    }
+    pub(crate) fn reset() {
+        SPANS.with(|s| s.borrow_mut().clear());
+    }
+    pub(crate) fn report() {
+        if !enabled() {
+            return;
+        }
+        SPANS.with(|s| {
+            let v = s.borrow();
+            // Top-level spans (no '.') sum to wall-time; nested 'parent.child' spans are subsets.
+            let top: f64 = v
+                .iter()
+                .filter(|(n, _)| !n.contains('.'))
+                .map(|(_, d)| d.as_secs_f64())
+                .sum();
+            eprintln!(
+                "[tri-boost fit profile] top-level phases {top:.2}s (nested '.' spans are subsets):"
+            );
+            let mut rows: Vec<_> = v.iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            for (n, d) in rows {
+                let sec = d.as_secs_f64();
+                let pct = if n.contains('.') {
+                    String::new()
+                } else {
+                    format!("{:5.1}%", 100.0 * sec / top.max(1e-9))
+                };
+                eprintln!("  {n:24} {sec:8.3}s  {pct}");
+            }
+        });
+    }
+}
+
 fn fit_single(
     config: &Config,
     x: &BinnedMatrix,
@@ -351,6 +421,7 @@ fn fit_single(
         None => None,
     };
     let mut best_validation_tree_count = 0usize;
+    prof::reset();
     for t in 0..config.n_trees {
         // Per-round deterministic re-seed — the seam for MVS/subsampling (M5-QHIST,
         // v1.5).
@@ -381,30 +452,37 @@ fn fit_single(
         if dart_drops.iter().any(|dropped| *dropped) {
             fit_raw = raw_minus_dropped(&raw, x, &trees, &dart_drops)?;
         }
-        spec.loss.grad_hess(y, &fit_raw, weight, &mut gh)?;
+        prof::timed("grad_hess", || {
+            spec.loss.grad_hess(y, &fit_raw, weight, &mut gh)
+        })?;
         let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &train_rows)?;
         let round_axes = sample_axes(&axes, config.colsample_bytree, spec.seed, t)?;
         let mut round_grow_cfg = grow_cfg.clone();
         round_grow_cfg.round = t;
         round_grow_cfg.lr =
             learning_rate_for_round(config.learning_rate, config.learning_rate_decay, t);
-        match grow_oblivious_tree(x, &gh, &sampled_rows, &round_axes, &round_grow_cfg, weight)? {
+        let grown = prof::timed("grow_tree", || {
+            grow_oblivious_tree(x, &gh, &sampled_rows, &round_axes, &round_grow_cfg, weight)
+        })?;
+        match grown {
             Some(mut tree) => {
                 if sampled_rows.len() != train_rows.len() {
                     refit_tree_leaves(x, &gh, &train_rows, &mut tree, &round_grow_cfg)?;
                 }
-                refine_tree_leaves_after_grow(
-                    config,
-                    spec.loss,
-                    y,
-                    weight,
-                    &fit_raw,
-                    x,
-                    &train_rows,
-                    monotone_ref,
-                    &mut tree,
-                    &round_grow_cfg,
-                )?;
+                prof::timed("leaf_refine", || {
+                    refine_tree_leaves_after_grow(
+                        config,
+                        spec.loss,
+                        y,
+                        weight,
+                        &fit_raw,
+                        x,
+                        &train_rows,
+                        monotone_ref,
+                        &mut tree,
+                        &round_grow_cfg,
+                    )
+                })?;
                 if let Some(dart) = dart_cfg {
                     let new_alpha = apply_dart_normalization(&mut trees, &dart_drops, dart)?;
                     trees.push((new_alpha, tree));
@@ -412,7 +490,7 @@ fn fit_single(
                 } else {
                     prev_alphas = current_alphas;
                     raw = fit_raw;
-                    update_raw(&mut raw, x, &tree)?;
+                    prof::timed("update_raw", || update_raw(&mut raw, x, &tree))?;
                     trees.push((1.0, tree));
                 }
                 if should_refit_after_round(&config.boosters.refit_leaves, trees.len())? {
@@ -501,7 +579,9 @@ fn fit_single(
                     }
                 }
                 if let Some(val_rows) = validation_rows.as_deref() {
-                    let deviance = deviance_for_rows(spec.loss, y, &raw, weight, val_rows)?;
+                    let deviance = prof::timed("earlystop_eval", || {
+                        deviance_for_rows(spec.loss, y, &raw, weight, val_rows)
+                    })?;
                     let improved = match best_validation_deviance {
                         Some(best) => deviance < best,
                         None => true,
@@ -566,6 +646,7 @@ fn fit_single(
         f0_f32
     };
 
+    prof::report();
     let schema = ModelSchema {
         feature_names: (0..n_features).map(|i| format!("f{i}")).collect(),
         feature_kinds: x.provenance.iter().map(|p| p.kind).collect(),
@@ -2228,23 +2309,28 @@ fn refine_tree_leaves_after_grow(
     let mut gh = GradHess::default();
 
     for _ in 0..config.leaf_refine_steps {
-        loss.grad_hess(y, &raw, weight, &mut gh)?;
+        prof::timed("refine.grad_hess", || {
+            loss.grad_hess(y, &raw, weight, &mut gh)
+        })?;
         let mut g = [0.0_f64; 8];
         let mut h = [0.0_f64; 8];
-        for (&row, &leaf_u8) in rows.iter().zip(&memberships) {
-            let ru = row as usize;
-            let leaf = usize::from(leaf_u8);
-            *g.get_mut(leaf).ok_or_else(|| PbError::Internal {
-                what: "leaf refinement g leaf escaped".into(),
-            })? += f64::from(*gh.g.get(ru).ok_or_else(|| PbError::Internal {
-                what: "leaf refinement gradient row escaped".into(),
-            })?);
-            *h.get_mut(leaf).ok_or_else(|| PbError::Internal {
-                what: "leaf refinement h leaf escaped".into(),
-            })? += f64::from(*gh.h.get(ru).ok_or_else(|| PbError::Internal {
-                what: "leaf refinement hessian row escaped".into(),
-            })?);
-        }
+        prof::timed("refine.aggregate", || -> Result<(), PbError> {
+            for (&row, &leaf_u8) in rows.iter().zip(&memberships) {
+                let ru = row as usize;
+                let leaf = usize::from(leaf_u8);
+                *g.get_mut(leaf).ok_or_else(|| PbError::Internal {
+                    what: "leaf refinement g leaf escaped".into(),
+                })? += f64::from(*gh.g.get(ru).ok_or_else(|| PbError::Internal {
+                    what: "leaf refinement gradient row escaped".into(),
+                })?);
+                *h.get_mut(leaf).ok_or_else(|| PbError::Internal {
+                    what: "leaf refinement h leaf escaped".into(),
+                })? += f64::from(*gh.h.get(ru).ok_or_else(|| PbError::Internal {
+                    what: "leaf refinement hessian row escaped".into(),
+                })?);
+            }
+            Ok(())
+        })?;
 
         let mut delta = [0.0_f32; 8];
         let mut any_delta = false;
@@ -2292,8 +2378,14 @@ fn refine_tree_leaves_after_grow(
                 usize::from(tree.depth),
                 monotone,
             )?;
-            let trial_raw = raw_with_tree_leaves(base_raw, tree, &columns, &trial_leaves)?;
-            let deviance = deviance_for_rows(loss, y, &trial_raw, weight, &eval_rows)?;
+            let (trial_raw, deviance) = prof::timed(
+                "refine.backtrack_eval",
+                || -> Result<(Vec<f32>, f64), PbError> {
+                    let tr = raw_with_tree_leaves(base_raw, tree, &columns, &trial_leaves)?;
+                    let dv = deviance_for_rows(loss, y, &tr, weight, &eval_rows)?;
+                    Ok((tr, dv))
+                },
+            )?;
             if deviance < best_deviance {
                 tree.leaves = trial_leaves;
                 raw = trial_raw;

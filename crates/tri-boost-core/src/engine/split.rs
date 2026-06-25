@@ -908,24 +908,25 @@ pub(crate) fn grow_oblivious_tree(
         };
 
         let n_leaves = 1usize << level;
-        let hist = match cfg.hist_precision {
-            HistPrecision::FullF64 => {
-                build_histogram(x, gh, rows, &leaf_of_row, n_leaves, &admissible, weight)?
-            }
-            HistPrecision::QuantizedI32 => build_quantized_histogram(
-                x,
-                gh,
-                rows,
-                &leaf_of_row,
-                n_leaves,
-                &admissible,
-                QuantizeContext {
-                    seed: cfg.quant_seed,
-                    round: cfg.round,
-                },
-                weight,
-            )?,
-        };
+        let hist =
+            crate::engine::boost::prof::timed("grow.hist_build", || match cfg.hist_precision {
+                HistPrecision::FullF64 => {
+                    build_histogram(x, gh, rows, &leaf_of_row, n_leaves, &admissible, weight)
+                }
+                HistPrecision::QuantizedI32 => build_quantized_histogram(
+                    x,
+                    gh,
+                    rows,
+                    &leaf_of_row,
+                    n_leaves,
+                    &admissible,
+                    QuantizeContext {
+                        seed: cfg.quant_seed,
+                        round: cfg.round,
+                    },
+                    weight,
+                ),
+            })?;
         let candidate_axis_signs: Vec<Option<MonoSign>> = match cfg.monotone {
             Some(signs) => admissible
                 .iter()
@@ -941,21 +942,23 @@ pub(crate) fn grow_oblivious_tree(
             l1_leaf: cfg.l1_leaf,
             max_delta_step: cfg.max_delta_step,
         });
-        let cand = match best_level_split(
-            &hist,
-            &admissible,
-            &n_data_bins,
-            cfg.lambda,
-            cfg.l1_leaf,
-            cfg.max_delta_step,
-            cfg.min_split_gain,
-            RankingContext {
-                monotone: monotone_scan,
-                noise: SplitNoise::new(cfg.quant_seed, cfg.round, level, cfg.random_strength),
-                table_penalties: ranking_penalties.as_deref(),
-            },
-            &cfg.credibility,
-        )? {
+        let cand = match crate::engine::boost::prof::timed("grow.split_find", || {
+            best_level_split(
+                &hist,
+                &admissible,
+                &n_data_bins,
+                cfg.lambda,
+                cfg.l1_leaf,
+                cfg.max_delta_step,
+                cfg.min_split_gain,
+                RankingContext {
+                    monotone: monotone_scan,
+                    noise: SplitNoise::new(cfg.quant_seed, cfg.round, level, cfg.random_strength),
+                    table_penalties: ranking_penalties.as_deref(),
+                },
+                &cfg.credibility,
+            )
+        })? {
             Some(c) => c,
             None => break, // graceful early-termination (depth < 3)
         };
