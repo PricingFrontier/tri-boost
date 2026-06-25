@@ -162,3 +162,12 @@ value; locked by test `membership_leaf_fill_matches_tree_walk_bit_for_bit`).
   dominated there, so backtrack is a smaller fraction). 221 core + 20 py + stubtest green; profiler confirms
   the saving internally (not wall noise). Generalizes: helps any leaf_refine>0 fit, hurts none.
 NEXT G5 target (now #1 by profile): `grow.hist_build` (7.6s) — histogram subtraction on the quantized path.
+
+### ❌ grad_hess row-parallelization — REVERTED (measured regression on SE)
+Added a shared row-parallel `fill_grad_hess` (rayon `try_for_each`, threshold 8192) across all 5 losses.
+Byte-identical across thread counts (✓ determinism), accuracy unchanged (✓), but **SLOWER**: diamonds
+`refine.grad_hess` 3.36s → 4.88s, wall 24.7 → 26.4s. Squared-error grad_hess (g=raw−y) is MEMORY-BANDWIDTH
+bound, not compute-bound — 4 threads can't beat one memory bus, and rayon coordination + closure-call
+indirection add net overhead. Would help compute-bound losses (logistic/poisson `exp`/`sigmoid`) on huge
+data, but regresses the common SE case and the benchmark can't validate the log-link gain. Reverted.
+Lesson: only parallelize COMPUTE-bound per-row work, not memory-bound.
