@@ -3722,6 +3722,84 @@ mod tests {
         }
     }
 
+    /// F4 (§08.10 + §09.5): an OuterBag model (a tree-soup of all bagged members) whose 3-way
+    /// support exceeds the cell budget still produces a VALID factored bank — bagging composes
+    /// with the factored path, so the user-facing bagging at competitive fidelity stays
+    /// exactly decomposable. (average_banks/recompute_under are internal, not on this path.)
+    #[test]
+    fn outer_bag_over_budget_three_way_stays_factored_and_exact() {
+        use crate::boosters::{BoosterConfig, EnsembleSpec};
+        let n = 240usize;
+        let cols: Vec<Vec<f32>> = (0..3)
+            .map(|f| (0..n).map(|i| ((i * (f + 2)) % 6) as f32).collect())
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| cols[0][i] * cols[1][i] * cols[2][i] + cols[0][i] - cols[1][i])
+            .collect();
+        let (model, x) = fit(
+            &cols,
+            &y,
+            Config {
+                n_trees: 80,
+                learning_rate: 0.3,
+                lambda: 1.0,
+                boosters: BoosterConfig {
+                    ensemble: EnsembleSpec::OuterBag { n_bags: 2 },
+                    ..Default::default()
+                },
+                ..exact_cfg(80)
+            },
+        );
+        let grids = MergedGrids::from_model(&model).unwrap();
+        let dense = model
+            .explain_with_budget(
+                &x,
+                RefMeasure::default(),
+                TableBudget {
+                    max_table_cells: 2_000_000,
+                    max_bank_cells: 32_000_000,
+                    on_overflow: OverflowPolicy::Error,
+                },
+            )
+            .unwrap();
+        let u3 = dense
+            .tables
+            .iter()
+            .find(|t| t.u.order() == 3)
+            .expect("bagged soup should realize a 3-way")
+            .u
+            .clone();
+        let max_2way = dense
+            .tables
+            .iter()
+            .filter(|t| t.u.order() == 2)
+            .map(|t| t.values.values().len())
+            .max()
+            .unwrap_or(1);
+        let cells3: usize = u3.0.iter().map(|r| grids.cells(*r).unwrap()).product();
+        assert!(
+            cells3 > max_2way + 1,
+            "3-way ({cells3}) must exceed the budget"
+        );
+        // The Ok here = all five I2 gates passed on the BAGGED soup's factored bank.
+        let bank = model
+            .explain_with_budget(
+                &x,
+                RefMeasure::default(),
+                TableBudget {
+                    max_table_cells: (max_2way + 1) as u64,
+                    max_bank_cells: 32_000_000,
+                    on_overflow: OverflowPolicy::Factored,
+                },
+            )
+            .expect("OuterBag + factored must pass all five exactness gates");
+        assert!(
+            !bank.factored.is_empty(),
+            "the over-budget 3-way should be factored"
+        );
+        assert!(bank.tables.iter().all(|t| t.u.order() < 3));
+    }
+
     /// MassConservation fix: `ensemble_w_mean` (the new exact per-tree integral) equals
     /// the exhaustive joint-grid `Σ w·F_ens` — so mass is exact with NO joint enumeration.
     #[test]
