@@ -229,3 +229,29 @@ end-to-end scores unchanged (diamonds 0.09022, kick 0.76975) across 3 reps each.
 - **Measured (fixed config n=2000, refine=4, no-es, 4 threads; means of 3 reps):** diamonds
   `grow.hist_build` ~4.20s → **~3.90s (−7%)**; kick ~16.0s → **~14.4s (−10%)**. Wall diamonds ~12.5→~11.8s,
   kick ~41.9→~40.0s. Generalizes to every unweighted fit (the default), all objectives.
+
+### ❌ Log-link grad_hess row-parallelization (retry, log-link only) — NET NEUTRAL, not committed (2026-06-25)
+The prior `grad_hess` parallel revert (ea08b04) only tested squared-error (memory-bound). Hypothesis: the
+LOG-LINK losses (Logistic/Poisson/Gamma/Tweedie) are compute-bound (exp/sigmoid per row, ~60-80 cycles), so a
+row-parallel MAP (independent writes ⇒ bit-identical to sequential, no fold; SE left sequential) should help
+kick/amazon. Built it (shared `fill_grad_hess` helper, threshold 8192, all 4 log-link losses) + a
+1/2/8-thread bit-identity gate (✓ byte-identical). But measured NET NEUTRAL on kick: `refine.grad_hess`
+3.73→3.13s LOOKED like a win, but the main `grad_hess` phase rose 0.22→0.79s (rayon pool warmup attribution)
+— TOTAL grad_hess 3.95→3.92s unchanged; wall ~40.3→~39.0s (within noise). Cause: even with the sigmoid
+compute, each call moves ~935KB (g/h write-out + y/raw/weight read) ⇒ memory-bandwidth bound on the write,
+same as SE — the compute isn't heavy enough to overcome it. The prior SE lesson GENERALIZES to log-link.
+Reverted. (Would only pay off if grad_hess were fused with more per-row compute, or on far wider data.)
+
+### FRONTIER ASSESSMENT — byte-identical speed floor (2026-06-25, post WIN #3/#4)
+After WIN #3/#4 and the refuted attempts above, the byte-identical + G0 speed frontier is reached for the
+major phases. `grow.hist_build` (33-38% of wall, the largest shared phase) is **byte-locked**: its f64 fold
+order (sequential-within-chunk + chunk-order reduction at the 32768-row threshold), f64 precision, and the
+absence of subtraction are all baked into the committed bit-pattern — changing any of them changes outputs.
+The leaf-refine line search (≈50% of o3 wall) is the accuracy lever LightGBM has no equivalent of; its memory/
+alloc overhead is removed (WIN #1/#2/#3) and its compute (deviance fold, serial f64) is byte-locked. grad_hess
+parallel is net-neutral (memory-bound) for ALL objectives. **Every remaining LightGBM speed technique violates
+a hard constraint**: histogram subtraction (f64 drift ⇒ not byte-identical), quantized int histograms (changes
+outputs), leaf-wise growth (needs fewer trees — G0 requires oblivious), no leaf-refine (drops the accuracy
+lever). So tri stays ~1.9-3.5× slower than LGBM on the suite config (refine=0, hist-bound) and ~13× on the o3
+accuracy config — a STRUCTURAL gap under strict byte-identity, not an implementation one. Closing it further
+requires relaxing byte-identity (adopt subtraction/QHIST, accepting ~rounding-level output shifts) or G0.
