@@ -687,11 +687,20 @@ fn fit_owned(
                 .into(),
         });
     }
-    if cat_x.is_some() && state.config.validation_fraction.is_some() {
+    // Internal early-stopping needs the validation fold's categorical encodings to exclude
+    // each val row's own target. KFold cross-fit (the default) produces exactly that — OOF
+    // per-row training encodings (cat.rs `kfold_training_encodings` excludes the row's whole
+    // fold) — and the val fold is carved by index from that already-encoded matrix, so it is
+    // leakage-free. Ordered/LeaveOneOut have subtler profiles (the LOO target-encoding
+    // pathology), so keep them gated with internal early stopping for now.
+    if cat_x.is_some()
+        && state.config.validation_fraction.is_some()
+        && !matches!(state.cat_config.leakage, LeakageScheme::KFold { .. })
+    {
         return Err(PbError::InvalidConfig {
-            what: "validation_fraction with native categorical target statistics is not \
-                   leakage-free yet; use an external validation split or disable native \
-                   categoricals for internal early stopping"
+            what: "validation_fraction with native categoricals is only leakage-free under \
+                   cat_leakage='kfold' (the default); 'ordered'/'loo' are not yet supported \
+                   with internal early stopping — use 'kfold' or an external validation split"
                 .into(),
         });
     }

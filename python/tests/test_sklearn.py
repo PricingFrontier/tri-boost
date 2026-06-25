@@ -290,11 +290,20 @@ def test_regressor_native_categorical_object_array_stays_exact_and_cloneable() -
     np.testing.assert_array_equal(loaded_pred, pred)
 
 
-def test_regressor_native_categorical_validation_guard() -> None:
+def test_native_categorical_early_stopping_kfold_allowed_ordered_gated() -> None:
+    # KFold cross-fit (the default) gives OOF per-row encodings, so the carved validation
+    # fold excludes each row's own target → internal early-stopping is leakage-free + allowed.
     x, y = mixed_categorical_fixture()
-    est = small_regressor(categorical_features=[1], validation_fraction=0.2)
+    est = small_regressor(
+        categorical_features=[1], validation_fraction=0.2, cat_leakage="kfold"
+    )
+    est.fit(x, y)  # must NOT raise
+    assert np.isfinite(np.asarray(est.predict(x))).all()
+    # ordered/loo keep the guard (subtler leakage profiles with internal early stopping).
     with pytest.raises(Exception, match="validation_fraction"):
-        est.fit(x, y)
+        small_regressor(
+            categorical_features=[1], validation_fraction=0.2, cat_leakage="ordered"
+        ).fit(x, y)
 
 
 def test_regressor_native_categorical_dataframe_names_and_monotone_guard() -> None:
