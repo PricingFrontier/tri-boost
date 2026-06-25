@@ -1029,11 +1029,13 @@ pub(crate) fn grow_oblivious_tree(
         let n_leaves = 1usize << level;
         let hist =
             crate::engine::boost::prof::timed("grow.hist_build", || -> Result<Hist, PbError> {
-                // Histogram-subtraction fast path: level 2, FullF64, with the level-1 parent retained.
-                // Builds the larger sibling-children by subtraction (visits ~half the rows). Gated to
-                // level 2 only (single drift generation) and FullF64 (quantized keeps full builds).
+                // Histogram-subtraction fast path: levels 1 and 2, FullF64, with the previous level's
+                // histogram retained as the parent. Builds the larger sibling-children by subtraction
+                // (visits ~half the rows). FullF64 only (quantized keeps full builds). Level 2's parent
+                // is itself a subtracted hist, so g/h drift compounds to ~2e-11 — still accuracy-neutral
+                // (the equivalence test grows the same tree as the full build).
                 if cfg.hist_subtraction
-                    && level == 2
+                    && level >= 1
                     && matches!(cfg.hist_precision, HistPrecision::FullF64)
                 {
                     if let (Some(ph), Some(pa)) = (prev_hist.as_ref(), prev_admissible.as_ref()) {
@@ -1143,9 +1145,10 @@ pub(crate) fn grow_oblivious_tree(
             *leaf_of_row.get_mut(ru).ok_or_else(internal("leaf set"))? |= bit;
         }
 
-        // Retain the level-1 FullF64 histogram + its axis ids so level 2 can build by subtraction.
-        // (Quantized stays on full builds; level 2 is last so it is never itself retained.)
-        if level == 1 && matches!(cfg.hist_precision, HistPrecision::FullF64) {
+        // Retain this level's FullF64 histogram + axis ids as the parent for the NEXT level's
+        // subtraction (level 0 → parent for level 1; level 1 → parent for level 2). Level 2 is the
+        // last level, so its histogram is never retained. (Quantized stays on full builds.)
+        if level < 2 && matches!(cfg.hist_precision, HistPrecision::FullF64) {
             prev_admissible = Some(admissible.clone());
             prev_hist = Some(hist);
         }

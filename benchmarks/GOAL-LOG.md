@@ -279,8 +279,21 @@ they are unaffected — drift only perturbs split SELECTION at exact near-ties.
 - **Measured (4 threads):** suite config (n=400, refine=0): diamonds `hist_build` 0.877s → **0.696s (−21%)**,
   wall 1.42s → **1.13s (−20%)**; kick `hist_build` 2.72s → **2.24s (−18%)**, wall 4.26s → **3.62s (−15%)**.
   o3 config (n=2000, refine=4): diamonds `hist_build` ~3.90s → 3.55s (−9%); kick ~14.4s → **11.6s (−19%)**,
-  wall ~40s → 36.8s. Generalizes to every FullF64 depth-≥2 fit. Level 1 subtraction deferred (would compound
-  drift a second generation; same machinery if the win justifies it later).
+  wall ~40s → 36.8s. Generalizes to every FullF64 depth-≥2 fit.
+
+### ✅ WIN #5b — Extend subtraction to LEVEL 1 (parent = level-0 root) [G5] — accuracy-neutral
+After the level-2 path was validated (equivalence + adversarial-verification workflows + exact real-data
+scores), extended the SAME generic `build_subtracted_level` to level 1 (gate `level >= 1`; retain each
+FullF64 level's hist as the next level's parent). Level 1 is the BIGGER win — it has the most admissible axes
+(|A_1| = |A_0|−1, vs the shrunk |A_2|) over the full n rows, so subtracting it saves more row-visits than
+level 2. Level 2's parent is now itself a subtracted hist ⇒ g/h drift compounds to ~2e-11, still
+accuracy-neutral (the equivalence test grows the SAME tree as the full build for both levels; determinism
+test green; real-data scores unchanged: diamonds 0.11376/0.09022, kick 0.77228/0.76975 EXACT). 230 core +
+20 py green.
+- **Measured (4 threads, cumulative subtraction total vs no-subtraction baseline):** suite (n=400, refine=0)
+  kick `hist_build` 2.72s → **1.68s (−38%)**, wall 4.26s → **3.16s (−26%)** (vs LGBM 1.19s: 3.5× → 2.7×);
+  diamonds `hist_build` 0.877 → **0.682s (−22%)**, wall 1.42 → 1.14s. o3 (n=2000, refine=4): kick `hist_build`
+  ~16s → **8.66s (−46%)**, wall → 28.3s; diamonds ~4.2 → 3.26s. Generalizes to every FullF64 depth-≥2 fit.
 
 ### ✅ WIN #6 — Chunked-parallel log-link deviance fold [G5] — accuracy-neutral
 With byte-identity relaxed, profiled the o3 bottleneck: kick `refine.backtrack_eval` (the leaf-refine
