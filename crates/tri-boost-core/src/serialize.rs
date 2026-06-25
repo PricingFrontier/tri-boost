@@ -362,6 +362,37 @@ impl TableBank {
         if let ExactnessMode::Approximate { reason } = mode {
             return Err(PbError::ExactnessFirewall(reason.clone()));
         }
+        // Validate rating-basis references up front: rebasing only shifts a DENSE table <-> f0,
+        // so every reference must name a realized dense support. Referencing a factored
+        // high-order effect or an unknown support is an error, not a silent no-op.
+        if let Some(b) = basis {
+            for entry in &b.reference {
+                let same = |u: &FeatureSet| {
+                    entry.feature_set.len() == u.0.len()
+                        && entry
+                            .feature_set
+                            .iter()
+                            .zip(u.0.iter())
+                            .all(|(&f, raw)| f == raw.0)
+                };
+                if self.factored.iter().any(|ft| same(&ft.u)) {
+                    return Err(PbError::InvalidConfig {
+                        what: format!(
+                            "rating basis cannot rebase factored high-order effect {:?}",
+                            entry.feature_set
+                        ),
+                    });
+                }
+                if !self.tables.iter().any(|t| same(&t.u)) {
+                    return Err(PbError::InvalidConfig {
+                        what: format!(
+                            "rating basis references support {:?} not present in the bank",
+                            entry.feature_set
+                        ),
+                    });
+                }
+            }
+        }
         let sobol: BTreeMap<FeatureSet, f64> = self.sobol().into_iter().collect();
         let mut f0 = self.f0;
         let mut tables = Vec::with_capacity(self.tables.len());
@@ -659,6 +690,41 @@ mod tests {
         assert!(matches!(
             bank.to_rating_export(model.link, &mode, &model.schema, None),
             Err(PbError::ExactnessFirewall(_))
+        ));
+    }
+
+    /// A rating basis may only rebase a DENSE support that the bank actually realized.
+    /// Naming a support the bank never produced is a deployer typo and must error loudly,
+    /// not be silently ignored (which would ship an un-rebased table under a basis label).
+    #[test]
+    fn rating_basis_rejects_unknown_support() {
+        let model = crate::explain::fixture_model();
+        let x = fixture_serve();
+        let bank = model.explain(&x, RefMeasure::Uniform).unwrap();
+
+        // A reference to a realized dense support rebases successfully.
+        let present: Vec<u32> = bank.tables[0].u.0.iter().map(|f| f.0).collect();
+        let order = bank.tables[0].u.order();
+        let ok = RatingBasis {
+            reference: vec![RatingReference {
+                feature_set: present,
+                coord: vec![0_u32; order],
+            }],
+        };
+        bank.to_rating_export(model.link, &model.mode, &model.schema, Some(&ok))
+            .unwrap();
+
+        // A reference to a support absent from the bank is a hard error, not a silent no-op.
+        let absent = (model.schema.feature_names.len() as u32) + 7;
+        let bad = RatingBasis {
+            reference: vec![RatingReference {
+                feature_set: vec![absent],
+                coord: vec![0],
+            }],
+        };
+        assert!(matches!(
+            bank.to_rating_export(model.link, &model.mode, &model.schema, Some(&bad)),
+            Err(PbError::InvalidConfig { .. })
         ));
     }
 }

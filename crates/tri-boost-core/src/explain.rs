@@ -3503,6 +3503,86 @@ mod tests {
         );
     }
 
+    /// A factored high-order effect is a SUM of per-tree purified boxes, not a dense table,
+    /// so the rebase-a-cell-into-f0 operation is undefined for it. A rating basis that names
+    /// a factored support must error loudly (a deployer trying to "anchor" a 3-way), while a
+    /// basis naming a still-dense order-2 support in the same factored bank rebases normally.
+    #[test]
+    fn rating_basis_refuses_to_rebase_factored_effect() {
+        use crate::serialize::{RatingBasis, RatingReference};
+
+        let n = 240usize;
+        let cols: Vec<Vec<f32>> = (0..3)
+            .map(|f| (0..n).map(|i| ((i * (f + 2)) % 6) as f32).collect())
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| cols[0][i] * cols[1][i] * cols[2][i] + cols[0][i] - cols[1][i])
+            .collect();
+        let (model, x) = fit(
+            &cols,
+            &y,
+            Config {
+                n_trees: 80,
+                learning_rate: 0.3,
+                lambda: 1.0,
+                ..exact_cfg(80)
+            },
+        );
+        // Budget just above the largest order-2 table forces ONLY the 3-way to factor.
+        let bank_dense = model
+            .explain_with_budget(&x, RefMeasure::default(), TableBudget::default())
+            .unwrap();
+        let max_2way = bank_dense
+            .tables
+            .iter()
+            .filter(|t| t.u.order() == 2)
+            .map(|t| t.values.values().len())
+            .max()
+            .unwrap();
+        let bank = model
+            .explain_with_budget(
+                &x,
+                RefMeasure::default(),
+                TableBudget {
+                    max_table_cells: (max_2way + 1) as u64,
+                    max_bank_cells: 32_000_000,
+                    on_overflow: OverflowPolicy::Factored,
+                },
+            )
+            .unwrap();
+        assert_eq!(bank.factored.len(), 1, "exactly one 3-way is factored");
+
+        // A basis naming the factored 3-way support is rejected.
+        let factored_set: Vec<u32> = bank.factored[0].u.0.iter().map(|f| f.0).collect();
+        let bad = RatingBasis {
+            reference: vec![RatingReference {
+                feature_set: factored_set,
+                coord: vec![0, 0, 0],
+            }],
+        };
+        assert!(matches!(
+            bank.to_rating_export(model.link, &model.mode, &model.schema, Some(&bad)),
+            Err(PbError::InvalidConfig { .. })
+        ));
+
+        // A basis naming a still-dense order-2 support in the SAME bank rebases fine.
+        let pair = bank
+            .tables
+            .iter()
+            .find(|t| t.u.order() == 2)
+            .expect("a dense order-2 table survives")
+            .u
+            .clone();
+        let ok = RatingBasis {
+            reference: vec![RatingReference {
+                feature_set: pair.0.iter().map(|f| f.0).collect(),
+                coord: vec![0, 0],
+            }],
+        };
+        bank.to_rating_export(model.link, &model.mode, &model.schema, Some(&ok))
+            .unwrap();
+    }
+
     /// Stage 3 (§08.10): MULTIPLE over-budget triples sharing a pair. A non-separable
     /// `x0·x1·x2 − x0·x1·x3` signal forces both {0,1,2} and {0,1,3}, so the shared {0,1}
     /// table receives sheds from BOTH — the case a single-triple test cannot exercise.
@@ -3720,6 +3800,129 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// F5 (§08.10 deployment): the COMPLETE rating export — intercept + every dense table +
+    /// every factored effect together — is a self-sufficient scoring artifact. A scorer that
+    /// reads ONLY the export (no bank, no model) reproduces `bank.score` at every cell, and the
+    /// reconstruction gate already equates `bank.score` to the ensemble. This closes the chain
+    /// the per-component tests only cover in pieces: dense values are copied verbatim and the
+    /// factored boxes are checked alone, but their COMPOSITION (f0 + dense + factored summed at
+    /// one input) is exercised here. The factored boxes ship raw-value thresholds only, so the
+    /// standalone scorer recovers each feature's borders from the dense tables that name it —
+    /// proving the export is closed under scoring without re-consulting the model.
+    #[test]
+    fn rating_export_is_a_complete_standalone_scorer() {
+        use std::collections::HashMap;
+        let n = 240usize;
+        let cols: Vec<Vec<f32>> = (0..3)
+            .map(|f| (0..n).map(|i| ((i * (f + 2)) % 6) as f32).collect())
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| cols[0][i] * cols[1][i] * cols[2][i] + cols[0][i] - cols[1][i])
+            .collect();
+        let (model, x) = fit(
+            &cols,
+            &y,
+            Config {
+                n_trees: 80,
+                learning_rate: 0.3,
+                lambda: 1.0,
+                ..exact_cfg(80)
+            },
+        );
+        let grids = MergedGrids::from_model(&model).unwrap();
+        let n_features = model.provenance.len();
+
+        let dense = model
+            .explain_with_budget(&x, RefMeasure::default(), TableBudget::default())
+            .unwrap();
+        let max_2way = dense
+            .tables
+            .iter()
+            .filter(|t| t.u.order() == 2)
+            .map(|t| t.values.values().len())
+            .max()
+            .unwrap();
+        let bank = model
+            .explain_with_budget(
+                &x,
+                RefMeasure::default(),
+                TableBudget {
+                    max_table_cells: (max_2way + 1) as u64,
+                    max_bank_cells: 32_000_000,
+                    on_overflow: OverflowPolicy::Factored,
+                },
+            )
+            .unwrap();
+        assert!(
+            !bank.factored.is_empty(),
+            "the 3-way must factor so composition includes a factored term"
+        );
+
+        let export = bank
+            .to_rating_export(model.link, &model.mode, &model.schema, None)
+            .unwrap();
+
+        // Recover per-feature borders from the dense tables (factored boxes carry only
+        // raw-value thresholds). Every feature appears in at least its main-effect table.
+        let mut borders_of: HashMap<u32, Vec<f32>> = HashMap::new();
+        for t in &export.tables {
+            for a in &t.axes {
+                borders_of.entry(a.raw).or_insert_with(|| a.borders.clone());
+            }
+        }
+
+        // A scorer that consults ONLY `export` (+ the borders gathered from it).
+        let score_from_export = |x_cells: &[u32]| -> f64 {
+            let mut s = export.f0;
+            for t in &export.tables {
+                let mut idx = 0usize;
+                for (d, a) in t.axes.iter().enumerate() {
+                    idx = idx * t.shape[d] as usize + x_cells[a.raw as usize] as usize;
+                }
+                s += t.values[idx];
+            }
+            for rf in &export.factored {
+                for bx in &rf.boxes {
+                    let mut oct = 0usize;
+                    for (d, raw) in rf.feature_set.0.iter().enumerate() {
+                        let cell = x_cells[raw.0 as usize] as usize;
+                        let low = if cell == 0 {
+                            bx.missing_left[d]
+                        } else {
+                            let bs = &borders_of[&raw.0];
+                            let j = bs.iter().position(|&b| b == bx.thresholds[d]).unwrap();
+                            cell <= j + 1
+                        };
+                        oct |= usize::from(low) << d;
+                    }
+                    s += bx.octants[oct];
+                }
+            }
+            s
+        };
+
+        let cells_per: Vec<usize> = (0..n_features)
+            .map(|r| grids.cells(FeatureId(r as u32)).unwrap())
+            .collect();
+        let mut x_cells = vec![0u32; n_features];
+        let mut max_diff = 0.0_f64;
+        for c0 in 0..cells_per[0] {
+            for c1 in 0..cells_per[1] {
+                for c2 in 0..cells_per[2] {
+                    x_cells[0] = c0 as u32;
+                    x_cells[1] = c1 as u32;
+                    x_cells[2] = c2 as u32;
+                    let d = (score_from_export(&x_cells) - bank.score(&x_cells).unwrap()).abs();
+                    max_diff = max_diff.max(d);
+                }
+            }
+        }
+        assert!(
+            max_diff <= 1e-12,
+            "standalone export scorer diverges from bank by {max_diff}"
+        );
     }
 
     /// F4 (§08.10 + §09.5): an OuterBag model (a tree-soup of all bagged members) whose 3-way
