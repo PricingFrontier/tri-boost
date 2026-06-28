@@ -975,14 +975,14 @@ fn build_subtracted_level(
 /// [`PbError::Internal`] on an index/shape bug; [`Invariant::FeatureBudget`] if the
 /// assembled tree violates I1 (cannot happen given the guard, but checked at
 /// construction).
-pub(crate) fn grow_oblivious_tree(
+pub(crate) fn grow_oblivious_tree_with_leaf_map(
     x: &BinnedMatrix,
     gh: &GradHess,
     rows: &[u32],
     axes: &[u32],
     cfg: &GrowConfig<'_>,
     weight: &[f32],
-) -> Result<Option<ObliviousTree>, PbError> {
+) -> Result<Option<(ObliviousTree, Vec<u8>)>, PbError> {
     let n_rows = x.n_rows as usize;
     let mut leaf_of_row: Vec<u8> = Hist::try_zeroed_vec(n_rows, "leaf assignment")?;
     let mut splits: Vec<Split> = Vec::new();
@@ -1189,7 +1189,26 @@ pub(crate) fn grow_oblivious_tree(
         )?;
         clamp_monotone(&mut leaves, &splits, depth, cfg.monotone)?;
     }
-    Ok(Some(ObliviousTree::try_new(splits, leaves, &x.provenance)?))
+    // `leaf_of_row[r]` (set for every r in `rows` via the SAME canonical `low_bit` used by the
+    // tree walk) is the per-row leaf partition the leaf-refine line search needs — returned so it
+    // can be reused instead of re-walking the tree (byte-identical, cf. `gather_memberships`).
+    let tree = ObliviousTree::try_new(splits, leaves, &x.provenance)?;
+    Ok(Some((tree, leaf_of_row)))
+}
+
+/// Test-only thin wrapper returning just the grown tree. Production calls
+/// [`grow_oblivious_tree_with_leaf_map`] and reuses the per-row leaf map to skip the
+/// leaf-refinement tree re-walk; unit tests that only assert on tree structure use this.
+#[cfg(test)]
+pub(crate) fn grow_oblivious_tree(
+    x: &BinnedMatrix,
+    gh: &GradHess,
+    rows: &[u32],
+    axes: &[u32],
+    cfg: &GrowConfig<'_>,
+    weight: &[f32],
+) -> Result<Option<ObliviousTree>, PbError> {
+    Ok(grow_oblivious_tree_with_leaf_map(x, gh, rows, axes, cfg, weight)?.map(|(tree, _)| tree))
 }
 
 fn axis_is_admissible(

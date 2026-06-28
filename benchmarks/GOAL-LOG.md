@@ -354,3 +354,33 @@ an exact near-tie. Applied to Logistic/Poisson/Gamma/Tweedie `deviance`; **Squar
   and Poisson/Gamma/Tweedie); the SE regression datasets keep their fast sequential fold. (NB: this is the
   reverse of the grad_hess lesson — there the per-row term was too cheap to beat memory bandwidth; the
   deviance's two logs make it genuinely compute-bound.)
+
+### Re-baseline (2026-06-29, this machine, post WIN #9) — the next-target measurement
+Re-measured both configs on the local box (faster than the cloud session — absolute seconds differ, phase
+RATIOS guide the target). Build confirmed at HEAD: suite scores reproduce diamonds 0.11376 / kick 0.77228,
+o3 scores diamonds 0.09022 / kick 0.76975 EXACTLY. o3 (n=2000, refine=4, 4 threads): kick wall 18.1s —
+leaf_refine 9.81s (backtrack_eval 4.45 [parallelized], grad_hess 2.11 [parallelized], **init_dev 1.06**,
+**members 0.68**, **aggregate 0.53**), hist_build 5.25s [subtraction frontier]; diamonds wall 9.9s —
+leaf_refine 5.27s (grad_hess 1.56 [SE seq], backtrack 1.43, **members 0.62**, **aggregate 0.51**, init_dev
+0.29), hist_build 2.68s. The untapped frontier is the leaf-refine SETUP cluster (members/init_dev/aggregate)
+that commit 0e0ba6d instrumented — every other phase is either at the byte-locked subtraction frontier or
+already parallelized.
+
+### ✅ WIN #10 — Reuse grow's per-row leaf map in leaf-refine (eliminate refine.members re-walk) [G5] — BYTE-IDENTICAL
+`refine.members` re-walked the whole tree per row (per tree × 2000 trees) to assign each row its leaf —
+but `grow_oblivious_tree` ALREADY computes exactly that partition (`leaf_of_row`, set at its "Sample→leaf
+update" loop via the SAME canonical `low_bit` the walk uses). Renamed grow → `grow_oblivious_tree_with_leaf_map`
+returning `(tree, leaf_of_row)` (a `#[cfg(test)]` wrapper keeps the old name for the structure-only unit
+tests — zero test churn); `refine_tree_leaves_after_grow` takes an `Option<&[u8]>` hint and GATHERS
+`leaf_of_row[rows[i]]` instead of re-walking. The hint is passed ONLY when `sampled_rows.len() ==
+train_rows.len()` (no subsample — `sample_rows(Full)` and MVS-with-`k==n` return the full set in train order,
+so len-equality ⟺ grow saw exactly these rows); under subsampling it falls back to the walk (unchanged).
+- **Byte-identical:** the gathered map equals the tree walk bit-for-bit (grow's bits come from the SAME
+  `low_bit(bin, bin_le, missing_left)`, and `tree.splits` never changes after construction). Pinned by new
+  unit test `grow_leaf_map_matches_tree_walk_memberships_bit_for_bit` (full rows + a reordered subset with
+  repeats). Real-data scores EXACTLY unchanged (diamonds 0.09022, kick 0.76975). 232 core + 20 py green;
+  clippy + fmt clean. Verified by a 3-skeptic adversarial workflow (byte-identity / gate-correctness / G0
+  lenses) — **zero issues, unanimous SHIP**.
+- **Measured (o3, n=2000, refine=4, 4 threads):** `refine.members` diamonds 0.62s → **0.046s (−93%)**,
+  kick 0.68s → **0.061s (−91%)** — the tree re-walk is gone, leaving only the cheap O(rows) gather.
+  Generalizes to every `leaf_refine>0` fit without row subsampling (the default).

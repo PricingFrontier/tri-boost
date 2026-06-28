@@ -27,7 +27,8 @@ use crate::cat::CatEncoderStore;
 use crate::constraints::MonoSign;
 use crate::data::{compute_offset, BinnedMatrix};
 use crate::engine::split::{
-    clamp_monotone, grow_oblivious_tree, refit_tree_leaves, GrowConfig, TableBudgetPenalty,
+    clamp_monotone, grow_oblivious_tree_with_leaf_map, refit_tree_leaves, GrowConfig,
+    TableBudgetPenalty,
 };
 use crate::engine::{
     tree_leaf_index_for_row_with_columns, tree_split_columns, tree_value_for_row_with_columns,
@@ -469,11 +470,22 @@ fn fit_single(
         round_grow_cfg.lr =
             learning_rate_for_round(config.learning_rate, config.learning_rate_decay, t);
         let grown = prof::timed("grow_tree", || {
-            grow_oblivious_tree(x, &gh, &sampled_rows, &round_axes, &round_grow_cfg, weight)
+            grow_oblivious_tree_with_leaf_map(
+                x,
+                &gh,
+                &sampled_rows,
+                &round_axes,
+                &round_grow_cfg,
+                weight,
+            )
         })?;
         match grown {
-            Some(mut tree) => {
-                if sampled_rows.len() != train_rows.len() {
+            Some((mut tree, leaf_of_row)) => {
+                // grow's `leaf_of_row` is the per-row leaf partition over `sampled_rows`; it equals
+                // the partition over `train_rows` exactly when grow saw the full set (no subsample),
+                // in which case the line search can reuse it instead of re-walking the tree.
+                let full_sample = sampled_rows.len() == train_rows.len();
+                if !full_sample {
                     refit_tree_leaves(x, &gh, &train_rows, &mut tree, &round_grow_cfg)?;
                 }
                 prof::timed("leaf_refine", || {
@@ -488,6 +500,7 @@ fn fit_single(
                         monotone_ref,
                         &mut tree,
                         &round_grow_cfg,
+                        full_sample.then_some(leaf_of_row.as_slice()),
                     )
                 })?;
                 if let Some(dart) = dart_cfg {
@@ -534,15 +547,18 @@ fn fit_single(
                         config.learning_rate_decay,
                         t,
                     );
-                    if let Some(mut correction) = grow_oblivious_tree(
-                        x,
-                        &gh,
-                        &correction_rows,
-                        &round_axes,
-                        &correction_cfg,
-                        weight,
-                    )? {
-                        if correction_rows.len() != train_rows.len() {
+                    if let Some((mut correction, corr_leaf_of_row)) =
+                        grow_oblivious_tree_with_leaf_map(
+                            x,
+                            &gh,
+                            &correction_rows,
+                            &round_axes,
+                            &correction_cfg,
+                            weight,
+                        )?
+                    {
+                        let corr_full = correction_rows.len() == train_rows.len();
+                        if !corr_full {
                             refit_tree_leaves(
                                 x,
                                 &gh,
@@ -562,6 +578,7 @@ fn fit_single(
                             monotone_ref,
                             &mut correction,
                             &correction_cfg,
+                            corr_full.then_some(corr_leaf_of_row.as_slice()),
                         )?;
                         update_raw(&mut raw, x, &correction)?;
                         trees.push((1.0, correction));
@@ -2294,6 +2311,10 @@ fn refine_tree_leaves_after_grow(
     monotone: Option<&[Option<MonoSign>]>,
     tree: &mut ObliviousTree,
     grow_cfg: &GrowConfig<'_>,
+    // grow's per-row leaf map (absolute-indexed), passed `Some` only when grow saw exactly `rows`
+    // (no subsample). When present it is gathered in `rows` order to skip the tree re-walk —
+    // byte-identical, since grow set it with the SAME canonical `low_bit` the walk uses.
+    precomputed_leaf_of_row: Option<&[u8]>,
 ) -> Result<(), PbError> {
     if config.leaf_refine_steps == 0 || rows.is_empty() {
         return Ok(());
@@ -2307,10 +2328,18 @@ fn refine_tree_leaves_after_grow(
             ),
         });
     }
-    let columns = tree_split_columns(tree, &x.data)?;
     let n_leaves = 1usize << usize::from(tree.depth);
-    let memberships = prof::timed("refine.members", || {
-        tree_memberships_for_rows(tree, &columns, rows, n_leaves)
+    let memberships = prof::timed("refine.members", || -> Result<Vec<u8>, PbError> {
+        match precomputed_leaf_of_row {
+            // grow already assigned each row its leaf via the SAME canonical `low_bit` the tree
+            // walk uses, so `leaf_of_row[rows[i]]` is bit-identical to a re-walk — gather it in
+            // `rows` order and skip the per-row walk. (Caller guarantees grow saw exactly `rows`.)
+            Some(leaf_of_row) => gather_memberships(leaf_of_row, rows, n_leaves),
+            None => {
+                let columns = tree_split_columns(tree, &x.data)?;
+                tree_memberships_for_rows(tree, &columns, rows, n_leaves)
+            }
+        }
     })?;
     // The line search reads y/weight and the base score ONLY at `rows`, and only the 8 leaf
     // VALUES change per trial. Gather those three into DENSE per-tree buffers ONCE (constant
@@ -2466,6 +2495,38 @@ fn incremental_leaf_delta(
         });
     }
     Ok(step as f32)
+}
+
+/// Gather grow's absolute-indexed `leaf_of_row` into the compact `rows`-ordered membership vector
+/// the line search consumes. grow sets `leaf_of_row[r]` with the SAME canonical `low_bit` the tree
+/// walk applies, so `leaf_of_row[rows[i]]` is bit-identical to `tree_memberships_for_rows(...)[i]`
+/// — but free of the per-row tree re-walk. Sound only when grow saw exactly `rows` (no subsample);
+/// the caller gates on `sampled_rows.len() == train_rows.len()`. The `< n_leaves` guard catches a
+/// stale/under-populated map (e.g. a row grow never visited).
+fn gather_memberships(
+    leaf_of_row: &[u8],
+    rows: &[u32],
+    n_leaves: usize,
+) -> Result<Vec<u8>, PbError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(rows.len())
+        .map_err(|_| PbError::Internal {
+            what: "leaf refinement membership gather allocation failed".into(),
+        })?;
+    for &r in rows {
+        let leaf = *leaf_of_row
+            .get(r as usize)
+            .ok_or_else(|| PbError::Internal {
+                what: "leaf refinement precomputed membership row escaped".into(),
+            })?;
+        if usize::from(leaf) >= n_leaves {
+            return Err(PbError::Internal {
+                what: "leaf refinement precomputed membership escaped depth".into(),
+            });
+        }
+        out.push(leaf);
+    }
+    Ok(out)
 }
 
 fn tree_memberships_for_rows(
@@ -2734,6 +2795,62 @@ mod tests {
                 dense[i]
             );
         }
+    }
+
+    /// WIN #10 invariant: grow returns its per-row leaf map (`leaf_of_row`); the leaf-refine line
+    /// search reuses it instead of re-walking the tree. Gathering that map over `rows` must be
+    /// BIT-IDENTICAL to `tree_memberships_for_rows` (the walk) — both assign leaves via the SAME
+    /// canonical `low_bit`. If they ever diverged, the reused-membership fast path would silently
+    /// refine the wrong leaves and break exact decomposition.
+    #[test]
+    fn grow_leaf_map_matches_tree_walk_memberships_bit_for_bit() {
+        let n = 240usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 3) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| x0[i] + 2.0 * x1[i] - x2[i] + x0[i] * x1[i])
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let weight = vec![1.0_f32; n];
+        let raw = vec![0.0_f32; n];
+        let sqe = SquaredError;
+        let mut gh = GradHess::default();
+        sqe.grad_hess(&y, &raw, &weight, &mut gh).unwrap();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let cfg = GrowConfig {
+            lambda: 1.0,
+            l1_leaf: 0.0,
+            lr: 0.5,
+            min_split_gain: 0.0,
+            max_order: 3,
+            max_delta_step: None,
+            hist_precision: HistPrecision::FullF64,
+            quant_seed: 0,
+            round: 0,
+            random_strength: 0.0,
+            groups: None,
+            monotone: None,
+            table_budget_penalty: None,
+            credibility: CredibilityFloor::default(),
+            unit_weight: true,
+            hist_subtraction: true,
+        };
+        let (tree, leaf_of_row) =
+            grow_oblivious_tree_with_leaf_map(&x, &gh, &rows, &[0, 1, 2], &cfg, &weight)
+                .unwrap()
+                .expect("a tree");
+        let n_leaves = 1usize << usize::from(tree.depth);
+        let columns = tree_split_columns(&tree, &x.data).unwrap();
+        // Full rows: gather of grow's map == tree-walk memberships, element for element.
+        let walk = tree_memberships_for_rows(&tree, &columns, &rows, n_leaves).unwrap();
+        let gathered = gather_memberships(&leaf_of_row, &rows, n_leaves).unwrap();
+        assert_eq!(walk, gathered, "grow leaf map != tree-walk memberships");
+        // Reordered subset with repeats (the line search passes arbitrary `rows`).
+        let sub: Vec<u32> = vec![5, 0, 123, 239, 17, 88, 200, 9, 0, 123];
+        let walk_sub = tree_memberships_for_rows(&tree, &columns, &sub, n_leaves).unwrap();
+        let gathered_sub = gather_memberships(&leaf_of_row, &sub, n_leaves).unwrap();
+        assert_eq!(walk_sub, gathered_sub, "subset: grow leaf map != tree-walk");
     }
 
     /// Gate G2 (exact): an additive piecewise-constant target on 2 features is
