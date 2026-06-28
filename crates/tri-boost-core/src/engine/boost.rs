@@ -2375,16 +2375,31 @@ fn refine_tree_leaves_after_grow(
     // `apply_membership_leaves`'s output over `rows`, so `deviance` matches the old path exactly.
     let mut trial_raw_sub = base_sub.clone();
     fill_leaf_raw_contiguous(&mut trial_raw_sub, &base_sub, &memberships, &tree.leaves)?;
-    let init_dev = prof::timed("refine.init_dev", || {
-        loss.deviance(&y_sub, &trial_raw_sub, &w_sub)
-    })?;
-    let mut best_deviance = f64::from(init_dev);
     let mut gh = GradHess::default();
+    // When grow saw EVERY row (`rows == 0..n`, no validation split), the initial deviance over the
+    // gathered subset is bit-identical to the deviance over the FULL `(y, raw, weight)` (same rows,
+    // same values, same chunked fold) — so fuse it with step-0's grad_hess into ONE pass that shares
+    // the link σ/exp (`grad_hess_and_deviance`), yielding both `init_dev` and step-0's `gh`. With a
+    // validation split (`rows ⊊ 0..n`) the domains differ, so compute `init_dev` over the subset.
+    let fuse_first = rows.len() == n_rows;
+    let init_dev = if fuse_first {
+        prof::timed("refine.init_dev", || {
+            loss.grad_hess_and_deviance(y, &raw, weight, &mut gh)
+        })?
+    } else {
+        prof::timed("refine.init_dev", || {
+            loss.deviance(&y_sub, &trial_raw_sub, &w_sub)
+        })?
+    };
+    let mut best_deviance = f64::from(init_dev);
 
-    for _ in 0..config.leaf_refine_steps {
-        prof::timed("refine.grad_hess", || {
-            loss.grad_hess(y, &raw, weight, &mut gh)
-        })?;
+    for step in 0..config.leaf_refine_steps {
+        // When fused, step 0's `gh` was already produced by the `init_dev` pass above.
+        if !(fuse_first && step == 0) {
+            prof::timed("refine.grad_hess", || {
+                loss.grad_hess(y, &raw, weight, &mut gh)
+            })?;
+        }
         let mut g = [0.0_f64; 8];
         let mut h = [0.0_f64; 8];
         prof::timed("refine.aggregate", || -> Result<(), PbError> {

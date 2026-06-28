@@ -428,3 +428,24 @@ the WIN #6 machinery). Two levers, both weak:
   validation fallback. Disproportionately invasive for the payoff relative to the two banked tree-walk wins —
   deferred unless a log-link speed push is prioritized. The two CLEAN setup-cluster wins (the redundant
   tree-walks #10/#11) are banked; init_dev/aggregate are at the byte-identical+parallelism frontier.
+
+### ✅ WIN #12 — Fuse init_dev into step-0 grad_hess (shared σ/exp) [G5] — BYTE-IDENTICAL (log-link)
+(Built after the user prioritized the log-link speed push the assessment above flagged.) The leaf-refine line
+search computes, at the grown-tree raw, BOTH the baseline deviance (`init_dev`) and step-0's grad/hess — two
+passes recomputing the SAME link transcendental per row. New `Loss::grad_hess_and_deviance` does both in ONE
+pass: a fused helper `fill_grad_hess_and_fold_deviance` writes g/h (the map, bit-identical to
+`fill_grad_hess_parallel`) AND folds the deviance per `PAR_DEVIANCE_CHUNK` chunk combined in chunk order
+(bit-identical to `parallel_deviance_fold`), computing σ/exp ONCE. Overridden for Logistic (shares the
+sigmoid), Poisson (shares `exp(F)`), Tweedie (shares both F-exps); SquaredError + Gamma use a default
+(unfused `grad_hess` then `deviance` — Gamma's `e^{−F}` g/h vs `e^{F}` deviance share nothing, SE is cheap).
+- **Byte-identical, not merely accuracy-neutral.** refine uses the fused call for step 0 ONLY when
+  `fuse_first = rows.len() == n_rows` — and `carve_validation_rows` returns `(0..n)` sorted when
+  `validation_fraction` is None (else a sorted strict subset, len<n), so the gate ⟺ `rows == [0..n]` sorted ⟺
+  the fused full-slice fold has the SAME values in the SAME order as the old gathered-subset fold (a validation
+  split keeps the subset path). Pinned by `fused_grad_hess_and_deviance_is_bit_identical_to_separate` (all 5
+  losses, n=20k > chunk, g/h + deviance bit-for-bit). Real-data scores EXACTLY unchanged (diamonds 0.09022,
+  kick 0.76975). 234 core + 20 py green; clippy + fmt clean.
+- **Measured (o3, n=2000, refine=4, 4 threads):** kick (Logistic) `init_dev + refine.grad_hess` 3.07s →
+  **2.72s (−0.35s, −12%)** (init_dev now subsumes step-0 grad_hess; net drops by the shared sigmoid + one
+  fewer memory pass), wall 16.3→15.9s. Diamonds (SquaredError, default) neutral, score exact. Generalizes to
+  every full-sample log-link fit (Logistic/Poisson/Tweedie — the insurance objectives).

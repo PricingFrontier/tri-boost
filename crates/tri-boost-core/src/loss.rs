@@ -209,6 +209,79 @@ where
     Ok((sum_w, acc))
 }
 
+/// Fused single-pass `(g, h)` MAP + `(Σw, deviance)` FOLD for compute-bound (log-link) objectives,
+/// so a caller needing BOTH at the same `raw` (the leaf-refine line-search baseline `init_dev`)
+/// computes the link transcendental ONCE per row instead of in two separate passes. `per_row`
+/// returns `(g, h, w_contrib, dev_contrib)` with the UNCHECKED `(g, h)` (the per-row finite/domain
+/// guards run inside it); the `ensure_finite_grad_hess` guard runs here, exactly as in
+/// [`fill_grad_hess_parallel`]. The g/h writes are an order-independent map (bit-identical to
+/// `fill_grad_hess_parallel`); the deviance folds per FIXED-size chunk and combines partials in
+/// CHUNK ORDER with the SAME `PAR_DEVIANCE_CHUNK` (bit-identical to [`parallel_deviance_fold`]) ⇒
+/// the result is byte-for-byte the separate `grad_hess` then `deviance`, just one σ/exp cheaper.
+/// Returns `(Σw, acc)`; the caller applies the all-zero-weight check + `finish_deviance` (matching
+/// `deviance`). `out.{g,h}` are resized to `n`; the caller guards lengths first.
+fn fill_grad_hess_and_fold_deviance<F>(
+    obj: &'static str,
+    out: &mut GradHess,
+    y: &[f32],
+    raw: &[f32],
+    weight: &[f32],
+    per_row: F,
+) -> Result<(f64, f64), PbError>
+where
+    F: Fn(usize, f32, f32, f32) -> Result<(f32, f32, f64, f64), PbError> + Sync,
+{
+    let n = y.len();
+    out.g.clear();
+    out.g.resize(n, 0.0);
+    out.h.clear();
+    out.h.resize(n, 0.0);
+    let body = |base: usize,
+                gc: &mut [f32],
+                hc: &mut [f32],
+                yc: &[f32],
+                rc: &[f32],
+                wc: &[f32]|
+     -> Result<(f64, f64), PbError> {
+        let (mut sw, mut acc) = (0.0_f64, 0.0_f64);
+        for (k, ((gi, hi), ((&yi, &fi), &wi))) in gc
+            .iter_mut()
+            .zip(hc.iter_mut())
+            .zip(yc.iter().zip(rc).zip(wc))
+            .enumerate()
+        {
+            let i = base + k;
+            let (g, h, w, d) = per_row(i, yi, fi, wi)?;
+            let (g, h) = ensure_finite_grad_hess(obj, i, g, h)?;
+            *gi = g;
+            *hi = h;
+            sw += w;
+            acc += d;
+        }
+        Ok((sw, acc))
+    };
+    if n < PAR_DEVIANCE_CHUNK {
+        return body(0, &mut out.g, &mut out.h, y, raw, weight);
+    }
+    let partials: Result<Vec<(f64, f64)>, PbError> = out
+        .g
+        .par_chunks_mut(PAR_DEVIANCE_CHUNK)
+        .zip(out.h.par_chunks_mut(PAR_DEVIANCE_CHUNK))
+        .zip(y.par_chunks(PAR_DEVIANCE_CHUNK))
+        .zip(raw.par_chunks(PAR_DEVIANCE_CHUNK))
+        .zip(weight.par_chunks(PAR_DEVIANCE_CHUNK))
+        .enumerate()
+        .map(|(ci, ((((gc, hc), yc), rc), wc))| body(ci * PAR_DEVIANCE_CHUNK, gc, hc, yc, rc, wc))
+        .collect();
+    // Combine partials in CHUNK ORDER (matches `parallel_deviance_fold`).
+    let (mut sum_w, mut acc) = (0.0_f64, 0.0_f64);
+    for (csw, ca) in partials? {
+        sum_w += csw;
+        acc += ca;
+    }
+    Ok((sum_w, acc))
+}
+
 /// Shared entry length-guard for the three slice methods (§05.2): the one in-method
 /// failure for the closed-form losses, checked once before any hot loop.
 fn require_equal_len(
@@ -374,6 +447,23 @@ pub trait Loss: Send + Sync {
     /// Strictly-proper deviance for early stopping (NOT RMSE on Poisson/Gamma/Tweedie).
     /// `f64` fold, reported in `f32`. Same invalid-domain typed errors as `init_score`.
     fn deviance(&self, y: &[f32], raw: &[f32], weight: &[f32]) -> Result<f32, PbError>;
+
+    /// One pass computing BOTH the grad/hess (into `out`) AND the deviance — for a caller that
+    /// needs both at the SAME `raw` (the leaf-refine line-search baseline) and would otherwise pay
+    /// the link transcendental (σ/exp) twice. The returned deviance is bit-identical to
+    /// `self.deviance(y, raw, weight)` and `out` is bit-identical to `self.grad_hess(y, raw,
+    /// weight, out)`. The default is exactly that unfused pair (correct, no sharing); compute-bound
+    /// log-link objectives override it to share the transcendental in a single fused pass.
+    fn grad_hess_and_deviance(
+        &self,
+        y: &[f32],
+        raw: &[f32],
+        weight: &[f32],
+        out: &mut GradHess,
+    ) -> Result<f32, PbError> {
+        self.grad_hess(y, raw, weight, out)?;
+        self.deviance(y, raw, weight)
+    }
 
     /// The objective's natural early-stopping metric (deviance by default).
     fn default_metric(&self) -> Metric;
@@ -660,6 +750,53 @@ impl Loss for Logistic {
         finish_deviance("logistic", acc)
     }
 
+    fn grad_hess_and_deviance(
+        &self,
+        y: &[f32],
+        raw: &[f32],
+        weight: &[f32],
+        out: &mut GradHess,
+    ) -> Result<f32, PbError> {
+        require_equal_len(
+            "logistic",
+            "grad_hess_and_deviance",
+            y.len(),
+            &[("raw", raw.len()), ("weight", weight.len())],
+        )?;
+        // One σ(F) per row, reused for BOTH (g, h) and the binomial deviance — bit-identical to
+        // the separate `grad_hess` (same `stable_sigmoid(fi)` ⇒ same g/h) and `deviance` (same
+        // clamped `p`, same chunked fold).
+        let floor = self.hessian_floor();
+        let (sum_w, acc) =
+            fill_grad_hess_and_fold_deviance("logistic", out, y, raw, weight, |i, yi, fi, wi| {
+                require_finite("logistic", "y", i, yi)?;
+                require_finite("logistic", "raw", i, fi)?;
+                require_weight("logistic", i, wi)?;
+                if !(0.0..=1.0).contains(&yi) {
+                    return Err(invalid_input(format!(
+                        "logistic: y[{i}] must be in [0, 1], got {yi}"
+                    )));
+                }
+                let s = stable_sigmoid(fi);
+                let g = wi * (s - yi);
+                let h = (wi * s * (1.0 - s)).max(floor);
+                let p = f64::from(s).clamp(EPS_INIT, 1.0 - EPS_INIT);
+                let yy = f64::from(yi);
+                let t1 = if yy > 0.0 { yy * (yy / p).ln() } else { 0.0 };
+                let omy = 1.0 - yy;
+                let t2 = if omy > 0.0 {
+                    omy * (omy / (1.0 - p)).ln()
+                } else {
+                    0.0
+                };
+                Ok((g, h, f64::from(wi), f64::from(wi) * 2.0 * (t1 + t2)))
+            })?;
+        if sum_w <= 0.0 {
+            return Err(invalid_input("logistic deviance: all-zero weights".into()));
+        }
+        finish_deviance("logistic", acc)
+    }
+
     fn default_metric(&self) -> Metric {
         Metric::LogLoss
     }
@@ -752,6 +889,50 @@ impl Loss for Poisson {
             let term = if yy > 0.0 { yy * (yy / mu).ln() } else { 0.0 };
             Ok((f64::from(wi), f64::from(wi) * 2.0 * (term - (yy - mu))))
         })?;
+        if sum_w <= 0.0 {
+            return Err(invalid_input("poisson deviance: all-zero weights".into()));
+        }
+        finish_deviance("poisson", acc)
+    }
+
+    fn grad_hess_and_deviance(
+        &self,
+        y: &[f32],
+        raw: &[f32],
+        weight: &[f32],
+        out: &mut GradHess,
+    ) -> Result<f32, PbError> {
+        require_equal_len(
+            "poisson",
+            "grad_hess_and_deviance",
+            y.len(),
+            &[("raw", raw.len()), ("weight", weight.len())],
+        )?;
+        // One μ=exp(F) per row, reused for (g, h) and the Poisson deviance.
+        let floor = self.hessian_floor();
+        let (sum_w, acc) =
+            fill_grad_hess_and_fold_deviance("poisson", out, y, raw, weight, |i, yi, fi, wi| {
+                require_finite("poisson", "y", i, yi)?;
+                require_finite("poisson", "raw", i, fi)?;
+                require_weight("poisson", i, wi)?;
+                if yi < 0.0 {
+                    return Err(invalid_input(format!(
+                        "poisson: y[{i}] must be >= 0, got {yi}"
+                    )));
+                }
+                let mu = clamp_exp(fi);
+                let g = wi * (mu - yi);
+                let h = (wi * mu).max(floor);
+                let muf = f64::from(mu);
+                let yy = f64::from(yi);
+                let term = if yy > 0.0 { yy * (yy / muf).ln() } else { 0.0 };
+                Ok((
+                    g,
+                    h,
+                    f64::from(wi),
+                    f64::from(wi) * 2.0 * (term - (yy - muf)),
+                ))
+            })?;
         if sum_w <= 0.0 {
             return Err(invalid_input("poisson deviance: all-zero weights".into()));
         }
@@ -1004,6 +1185,54 @@ impl Loss for Tweedie {
         finish_deviance("tweedie", acc)
     }
 
+    fn grad_hess_and_deviance(
+        &self,
+        y: &[f32],
+        raw: &[f32],
+        weight: &[f32],
+        out: &mut GradHess,
+    ) -> Result<f32, PbError> {
+        require_equal_len(
+            "tweedie",
+            "grad_hess_and_deviance",
+            y.len(),
+            &[("raw", raw.len()), ("weight", weight.len())],
+        )?;
+        // The two F-exps (μ^{1−ρ}, μ^{2−ρ}) per row are reused for (g, h) AND the deviance — the
+        // only extra deviance work is the y-only `y^{2−ρ}` term. Bit-identical to the separate
+        // kernels (same `clamp_exp(p·fi)` ⇒ same a/b ⇒ same g/h and same mu_p1/mu_p2).
+        let floor = self.hessian_floor();
+        let p1f = 1.0 - self.rho; // (1−ρ) < 0, f32 (matches grad_hess + the exp arg)
+        let p2f = 2.0 - self.rho; // (2−ρ) > 0, f32
+        let p1d = 1.0 - f64::from(self.rho); // f64 (matches the deviance d-formula)
+        let p2d = 2.0 - f64::from(self.rho);
+        let (sum_w, acc) =
+            fill_grad_hess_and_fold_deviance("tweedie", out, y, raw, weight, |i, yi, fi, wi| {
+                require_finite("tweedie", "y", i, yi)?;
+                require_finite("tweedie", "raw", i, fi)?;
+                require_weight("tweedie", i, wi)?;
+                if yi < 0.0 {
+                    return Err(invalid_input(format!(
+                        "tweedie: y[{i}] must be >= 0, got {yi}"
+                    )));
+                }
+                let a = clamp_exp(p1f * fi); // e^{(1−ρ)F} = μ^{1−ρ}
+                let b = clamp_exp(p2f * fi); // e^{(2−ρ)F} = μ^{2−ρ}
+                let g = wi * (-yi * a + b);
+                let h = (wi * (-yi * p1f * a + p2f * b)).max(floor);
+                let yy = f64::from(yi);
+                let y_term = if yy > 0.0 { (p2d * yy.ln()).exp() } else { 0.0 };
+                let mu_p1 = f64::from(a);
+                let mu_p2 = f64::from(b);
+                let d = y_term / (p1d * p2d) - yy * mu_p1 / p1d + mu_p2 / p2d;
+                Ok((g, h, f64::from(wi), f64::from(wi) * 2.0 * d))
+            })?;
+        if sum_w <= 0.0 {
+            return Err(invalid_input("tweedie deviance: all-zero weights".into()));
+        }
+        finish_deviance("tweedie", acc)
+    }
+
     fn default_metric(&self) -> Metric {
         Metric::TweedieDeviance { rho: self.rho }
     }
@@ -1040,6 +1269,55 @@ mod tests {
         // g = w(F−y): [1·(3−2), 2·(3−4)] = [1, −2]; h = w: [1, 2].
         assert_eq!(gh.g, vec![1.0, -2.0]);
         assert_eq!(gh.h, vec![1.0, 2.0]);
+    }
+
+    /// WIN #12: the fused `grad_hess_and_deviance` must be BYTE-IDENTICAL to the separate
+    /// `grad_hess` then `deviance` — same `out.{g,h}` bits and same returned deviance bits — for
+    /// every objective (the σ/exp-sharing overrides AND the default). `n > PAR_DEVIANCE_CHUNK`
+    /// exercises the parallel chunked path, so the chunk-order deviance fold must match too.
+    #[test]
+    fn fused_grad_hess_and_deviance_is_bit_identical_to_separate() {
+        let n = 20_000usize; // > PAR_DEVIANCE_CHUNK (8192) ⇒ multiple chunks
+        let raw: Vec<f32> = (0..n).map(|i| ((i % 41) as f32 - 20.0) * 0.13).collect();
+        let weight: Vec<f32> = (0..n).map(|i| 0.5 + (i % 7) as f32).collect();
+        let check = |loss: &dyn Loss, y: &[f32], label: &str| {
+            let mut gh_sep = GradHess::default();
+            loss.grad_hess(y, &raw, &weight, &mut gh_sep).unwrap();
+            let dev_sep = loss.deviance(y, &raw, &weight).unwrap();
+            let mut gh_fused = GradHess::default();
+            let dev_fused = loss
+                .grad_hess_and_deviance(y, &raw, &weight, &mut gh_fused)
+                .unwrap();
+            assert_eq!(
+                dev_sep.to_bits(),
+                dev_fused.to_bits(),
+                "{label}: deviance bits differ"
+            );
+            for i in 0..n {
+                assert_eq!(
+                    gh_sep.g[i].to_bits(),
+                    gh_fused.g[i].to_bits(),
+                    "{label}: g[{i}] differs"
+                );
+                assert_eq!(
+                    gh_sep.h[i].to_bits(),
+                    gh_fused.h[i].to_bits(),
+                    "{label}: h[{i}] differs"
+                );
+            }
+        };
+        // SquaredError + Gamma use the default (unfused) impl; Logistic/Poisson/Tweedie override it.
+        let y_sqe: Vec<f32> = (0..n).map(|i| (i % 13) as f32 - 6.0).collect();
+        check(&SquaredError, &y_sqe, "squared_error");
+        let y_log: Vec<f32> = (0..n).map(|i| ((i % 5) as f32) / 4.0).collect(); // y ∈ [0,1]
+        check(&Logistic, &y_log, "logistic");
+        let y_pois: Vec<f32> = (0..n).map(|i| (i % 4) as f32).collect(); // y ≥ 0 (incl. 0)
+        check(&Poisson, &y_pois, "poisson");
+        let y_gam: Vec<f32> = (0..n).map(|i| 0.25 + (i % 6) as f32).collect(); // y > 0
+        check(&Gamma, &y_gam, "gamma");
+        let tw = Tweedie::new(1.5).unwrap();
+        let y_tw: Vec<f32> = (0..n).map(|i| (i % 3) as f32 * 0.7).collect(); // y ≥ 0
+        check(&tw, &y_tw, "tweedie");
     }
 
     #[test]
