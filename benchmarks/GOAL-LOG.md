@@ -400,3 +400,31 @@ call sites (main + Nesterov correction).
 - **Measured (o3, n=2000, refine=4, 4 threads):** `update_raw` diamonds 0.49s → **0.033s (−93%)**, kick
   0.64s → **0.043s (−93%)**. Cumulative WIN #10+#11 (members+update_raw, the two redundant tree-walks):
   diamonds wall ~9.9s → ~8.4s, kick ~18.1s → ~16.3s. Generalizes to every full-sample fit (the default).
+
+### ❌ refine.aggregate parallelization — MEASURED SLOWER, reverted (2026-06-29)
+The third setup-cluster item. The leaf-refine `aggregate` scatter-sums `gh.g[row]`/`gh.h[row]` into the 8
+leaf accumulators over `rows` — 2 reads + 2 f64 adds per row (~1ns/row), and the `gh` arrays (≤464KB) stay
+in L2 across the ≤4 refine steps, so it is L2-bandwidth bound. Chunked-parallel version (per-chunk `[f64;8]`
+partials combined in chunk order, accuracy-neutral). **Measured SLOWER**: kick `refine.aggregate` 0.52s →
+**0.757s (+46%)**, wall 16.3→16.9s (score unchanged 0.76975). Cause: ~65µs of memory-bound work per call
+across ~8000 calls — rayon's per-call spawn/join overhead exceeds the split. Reverted. This is the loop's
+**settled memory-bound lesson** (the twice-reverted grad_hess parallelizations) confirmed a third time: only
+COMPUTE-bound per-row work parallelizes; a memory-bound reduction does not. (As a bonus it would have relaxed
+byte-identity to a continuous ~1e-11 leaf-value drift — a worse trade than the deviance fold, which only
+perturbs the line-search ACCEPT decision at a near-tie.)
+
+### ⏸ refine.init_dev fusion — assessed, deferred (frontier; modest log-link-only win, invasive)
+`init_dev` (kick 1.0s, diamonds 0.29s) is the deviance of the grown tree's leaves over `rows`, computed once
+per tree before the line search. It is already a chunked-parallel compute-bound fold (`parallel_deviance_fold`,
+the WIN #6 machinery). Two levers, both weak:
+- **Overlap** (`rayon::join` it with the first refine `grad_hess`): net-NEUTRAL — both ops already saturate
+  the 4 cores (`fill_grad_hess_parallel` + `parallel_deviance_fold`), so concurrently they just time-slice
+  the same cores, no wall gain.
+- **Fusion** (one pass computing g/h AND the deviance, sharing the sigmoid): byte-identical-achievable (chunk
+  the fused pass by `PAR_DEVIANCE_CHUNK` and combine deviance partials in chunk order → bit-identical to the
+  current `init_dev`; grad_hess is a map, unaffected). But the deviance's TWO logs remain (only the sigmoid +
+  one memory pass over (y,raw,weight) are shared), so the win is PARTIAL (~0.3–0.5s on kick, ~0.1s diamonds),
+  and it needs a new fused kernel across the 5 losses + a refine restructure (step-0 special case) +
+  validation fallback. Disproportionately invasive for the payoff relative to the two banked tree-walk wins —
+  deferred unless a log-link speed push is prioritized. The two CLEAN setup-cluster wins (the redundant
+  tree-walks #10/#11) are banked; init_dev/aggregate are at the byte-identical+parallelism frontier.
