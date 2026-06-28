@@ -384,3 +384,19 @@ so len-equality ⟺ grow saw exactly these rows); under subsampling it falls bac
 - **Measured (o3, n=2000, refine=4, 4 threads):** `refine.members` diamonds 0.62s → **0.046s (−93%)**,
   kick 0.68s → **0.061s (−91%)** — the tree re-walk is gone, leaving only the cheap O(rows) gather.
   Generalizes to every `leaf_refine>0` fit without row subsampling (the default).
+
+### ✅ WIN #11 — Reuse grow's leaf map in `update_raw` (eliminate its per-row tree re-walk) [G5] — BYTE-IDENTICAL
+The same redundant tree-walk as WIN #10, at the OTHER hot site: `update_raw` (apply the just-grown tree to
+the running `raw`) walked the tree per row via `tree_value_for_row_with_columns` to fetch `tree.leaves[leaf]`.
+Reuse grow's `leaf_of_row`: `raw[r] += tree.leaves[leaf_of_row[r]]` — byte-identical (grow's leaf bits come
+from the SAME canonical `low_bit`, and leaf-refinement changed only leaf VALUES, never memberships). Gate is
+STRICTER than members' because `raw` spans ALL n rows (incl. any held-out validation rows the early-stopper
+scores, which `leaf_of_row` only covers when grow saw the full set): passed only when
+`sampled_rows.len() == x.n_rows` (subsample OR a validation split ⇒ fall back to the walk, unchanged). Two
+call sites (main + Nesterov correction).
+- **Byte-identical:** new unit test `update_raw_leaf_map_matches_tree_walk_bit_for_bit` pins the leaf-map
+  update == the walk update bit-for-bit over a non-trivial base raw. Real-data scores EXACTLY unchanged
+  (diamonds 0.09022, kick 0.76975). 233 core + 20 py green; clippy + fmt clean.
+- **Measured (o3, n=2000, refine=4, 4 threads):** `update_raw` diamonds 0.49s → **0.033s (−93%)**, kick
+  0.64s → **0.043s (−93%)**. Cumulative WIN #10+#11 (members+update_raw, the two redundant tree-walks):
+  diamonds wall ~9.9s → ~8.4s, kick ~18.1s → ~16.3s. Generalizes to every full-sample fit (the default).

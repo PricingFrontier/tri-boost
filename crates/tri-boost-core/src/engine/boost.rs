@@ -510,7 +510,18 @@ fn fit_single(
                 } else {
                     prev_alphas = current_alphas;
                     raw = fit_raw;
-                    prof::timed("update_raw", || update_raw(&mut raw, x, &tree))?;
+                    // `raw` spans ALL rows (incl. any validation rows); grow's `leaf_of_row` covers
+                    // every one of them only when grow saw the full set, so reuse it for the
+                    // tree-walk-free update just then. Otherwise update_raw re-walks (unchanged).
+                    let covers_all_rows = sampled_rows.len() == x.n_rows as usize;
+                    prof::timed("update_raw", || {
+                        update_raw(
+                            &mut raw,
+                            x,
+                            &tree,
+                            covers_all_rows.then_some(leaf_of_row.as_slice()),
+                        )
+                    })?;
                     trees.push((1.0, tree));
                 }
                 if should_refit_after_round(&config.boosters.refit_leaves, trees.len())? {
@@ -580,7 +591,13 @@ fn fit_single(
                             &correction_cfg,
                             corr_full.then_some(corr_leaf_of_row.as_slice()),
                         )?;
-                        update_raw(&mut raw, x, &correction)?;
+                        let corr_covers_all = correction_rows.len() == x.n_rows as usize;
+                        update_raw(
+                            &mut raw,
+                            x,
+                            &correction,
+                            corr_covers_all.then_some(corr_leaf_of_row.as_slice()),
+                        )?;
                         trees.push((1.0, correction));
                         if should_refit_after_round(&config.boosters.refit_leaves, trees.len())? {
                             let problem = RefitProblem {
@@ -2667,7 +2684,31 @@ fn fill_leaf_raw_contiguous(
 /// Add a freshly-grown tree's contribution to every row's raw score (spec §06.6
 /// sample→leaf update). Scores ALL rows (not just the round's subsample) so the next
 /// round's gradients are correct everywhere. Panic-free; uses the canonical low bit.
-fn update_raw(raw: &mut [f32], x: &BinnedMatrix, tree: &ObliviousTree) -> Result<(), PbError> {
+fn update_raw(
+    raw: &mut [f32],
+    x: &BinnedMatrix,
+    tree: &ObliviousTree,
+    // grow's per-row leaf map; `Some` only when grow saw EVERY row of `raw` (full sample, no
+    // validation split — the caller gates on `sampled_rows.len() == x.n_rows`). Reused to add
+    // `tree.leaves[leaf_of_row[r]]` directly — byte-identical to the walk (grow set the map with
+    // the SAME canonical `low_bit` the walk applies, and refinement changed only leaf VALUES, not
+    // memberships) — skipping the per-row tree re-walk.
+    precomputed_leaf_of_row: Option<&[u8]>,
+) -> Result<(), PbError> {
+    if let Some(leaf_of_row) = precomputed_leaf_of_row {
+        for (r, slot) in raw.iter_mut().enumerate() {
+            let leaf = *leaf_of_row.get(r).ok_or_else(|| PbError::Internal {
+                what: "update_raw precomputed membership row escaped".into(),
+            })?;
+            *slot += *tree
+                .leaves
+                .get(usize::from(leaf))
+                .ok_or_else(|| PbError::Internal {
+                    what: "update_raw precomputed leaf escaped".into(),
+                })?;
+        }
+        return Ok(());
+    }
     let columns = tree_split_columns(tree, &x.data)?;
     for (r, slot) in raw.iter_mut().enumerate() {
         *slot += tree_value_for_row_with_columns(tree, &columns, r)?;
@@ -2851,6 +2892,65 @@ mod tests {
         let walk_sub = tree_memberships_for_rows(&tree, &columns, &sub, n_leaves).unwrap();
         let gathered_sub = gather_memberships(&leaf_of_row, &sub, n_leaves).unwrap();
         assert_eq!(walk_sub, gathered_sub, "subset: grow leaf map != tree-walk");
+    }
+
+    /// WIN #11 invariant: `update_raw` fed grow's `leaf_of_row` must add EXACTLY the same per-row
+    /// contribution as the tree walk (`tree_value_for_row_with_columns`) — both index `tree.leaves`
+    /// by the canonical-`low_bit` leaf, so the tree-walk-free update is bit-identical. Pinned here so
+    /// it can never drift the accumulated `raw` (hence predictions).
+    #[test]
+    fn update_raw_leaf_map_matches_tree_walk_bit_for_bit() {
+        let n = 240usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 3) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| x0[i] + 2.0 * x1[i] - x2[i] + x0[i] * x1[i])
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let weight = vec![1.0_f32; n];
+        let raw0 = vec![0.0_f32; n];
+        let sqe = SquaredError;
+        let mut gh = GradHess::default();
+        sqe.grad_hess(&y, &raw0, &weight, &mut gh).unwrap();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let cfg = GrowConfig {
+            lambda: 1.0,
+            l1_leaf: 0.0,
+            lr: 0.5,
+            min_split_gain: 0.0,
+            max_order: 3,
+            max_delta_step: None,
+            hist_precision: HistPrecision::FullF64,
+            quant_seed: 0,
+            round: 0,
+            random_strength: 0.0,
+            groups: None,
+            monotone: None,
+            table_budget_penalty: None,
+            credibility: CredibilityFloor::default(),
+            unit_weight: true,
+            hist_subtraction: true,
+        };
+        let (tree, leaf_of_row) =
+            grow_oblivious_tree_with_leaf_map(&x, &gh, &rows, &[0, 1, 2], &cfg, &weight)
+                .unwrap()
+                .expect("a tree");
+        // Non-trivial base raw so the ADD (not just the leaf value) is exercised.
+        let base: Vec<f32> = (0..n).map(|i| 0.1 * i as f32 - 3.0).collect();
+        let mut raw_walk = base.clone();
+        update_raw(&mut raw_walk, &x, &tree, None).unwrap();
+        let mut raw_map = base.clone();
+        update_raw(&mut raw_map, &x, &tree, Some(&leaf_of_row)).unwrap();
+        for r in 0..n {
+            assert_eq!(
+                raw_walk[r].to_bits(),
+                raw_map[r].to_bits(),
+                "row {r}: tree-walk update {} != leaf-map update {}",
+                raw_walk[r],
+                raw_map[r]
+            );
+        }
     }
 
     /// Gate G2 (exact): an additive piecewise-constant target on 2 features is
