@@ -90,8 +90,18 @@ pub fn build_grid(
         quantile_borders(&sample, cfg.max_bin)?
     };
 
-    if cfg.min_data_per_bin > 0 && !borders.is_empty() {
-        borders = collapse_rare_bins(&fw, &borders, cfg.min_data_per_bin)?;
+    if cfg.min_data_per_bin > 0 {
+        if !borders.is_empty() {
+            borders = collapse_rare_bins(&fw, &borders, cfg.min_data_per_bin)?;
+        }
+    } else {
+        // Reclaim bin budget the quantile builder's point-mass dedup left unused (a no-op when the
+        // budget is already full). On heavy-point-mass features (a magic-size grid like diamonds
+        // carat) many uniform-quantile probes collapse onto one border, leaving the continuous
+        // regions under-resolved; refilling sharpens the main-effect shape. Order-independent
+        // (G0-preserving). Skipped when a rare-bin floor is active (a refill split could create a
+        // sub-`min` bin and break collapse_rare_bins's guarantee).
+        borders = refill_borders(borders, &fw, max_bin);
     }
 
     let n_bins = u16::try_from(borders.len() + 2).map_err(|_| PbError::Internal {
@@ -195,6 +205,100 @@ fn dedup_ascending(mut v: Vec<f32>) -> Vec<f32> {
     v.sort_by(f32::total_cmp);
     v.dedup();
     v
+}
+
+/// Reclaim bin budget the quantile builder's point-mass `dedup` left unused. When the interior
+/// borders fall short of the `max_bin - 1` budget — because heavy point-masses collapsed many
+/// uniform-quantile probes into a single border — fill the rest by greedily splitting the
+/// highest-row-mass SPLITTABLE interval at the distinct-value boundary nearest its weighted-mass
+/// median, until the budget is met or no interval can be split. Resolves the continuous regions
+/// instead of leaving budget unused. Deterministic (pure function of `fw`; densest-first then nearest
+/// boundary) and G0-preserving (binning never changes the fANOVA order).
+fn refill_borders(borders: Vec<f32>, fw: &[(f32, f64)], max_bin: usize) -> Vec<f32> {
+    let target = max_bin.saturating_sub(1);
+    let n = fw.len();
+    if borders.len() >= target || n < 2 {
+        return borders;
+    }
+    let val = |i: usize| fw.get(i).map(|p| p.0);
+    // prefix[i] = Σ weight of fw[0..i].
+    let prefix: Vec<f64> = std::iter::once(0.0_f64)
+        .chain(fw.iter().scan(0.0_f64, |acc, &(_, w)| {
+            *acc += w;
+            Some(*acc)
+        }))
+        .collect();
+    let psum = |i: usize| prefix.get(i).copied().unwrap_or(0.0);
+    // fw index bounds of the current intervals (value-sorted; border b ⇒ first index with value >= b).
+    let mut bounds: Vec<usize> = Vec::with_capacity(borders.len() + 2);
+    bounds.push(0);
+    for &b in &borders {
+        bounds.push(fw.partition_point(|&(v, _)| v < b));
+    }
+    bounds.push(n);
+    bounds.sort_unstable();
+    bounds.dedup();
+    let mut intervals: Vec<(usize, usize)> = bounds
+        .windows(2)
+        .filter_map(|w| match w {
+            &[a, b] => Some((a, b)),
+            _ => None,
+        })
+        .collect();
+
+    let mut out = borders;
+    while out.len() < target {
+        // Densest interval that still holds >= 2 distinct values.
+        let mut best: Option<(usize, usize, usize)> = None; // (k, lo, hi)
+        let mut best_mass = f64::NEG_INFINITY;
+        for (k, &(lo, hi)) in intervals.iter().enumerate() {
+            if hi - lo < 2 || val(lo) == val(hi - 1) {
+                continue;
+            }
+            let mass = psum(hi) - psum(lo);
+            if mass > best_mass {
+                best_mass = mass;
+                best = Some((k, lo, hi));
+            }
+        }
+        let Some((k, lo, hi)) = best else { break };
+        let half = psum(lo) + (psum(hi) - psum(lo)) * 0.5;
+        let mut m = lo + 1;
+        while m + 1 < hi && psum(m) < half {
+            m += 1;
+        }
+        let Some(split) = nearest_distinct_boundary(fw, lo, hi, m) else {
+            break;
+        };
+        let (Some(a), Some(b)) = (val(split - 1), val(split)) else {
+            break;
+        };
+        out.push(((f64::from(a) + f64::from(b)) * 0.5) as f32);
+        if let Some(slot) = intervals.get_mut(k) {
+            *slot = (lo, split);
+        }
+        intervals.insert(k + 1, (split, hi));
+    }
+    dedup_ascending(out)
+}
+
+/// Nearest index `j` in `(lo, hi)` with `fw[j-1] != fw[j]` (a valid split boundary), searching
+/// outward from `m`. `None` only if `fw[lo..hi]` is a single value (caller pre-checks splittable).
+fn nearest_distinct_boundary(fw: &[(f32, f64)], lo: usize, hi: usize, m: usize) -> Option<usize> {
+    let val = |i: usize| fw.get(i).map(|p| p.0);
+    let m = m.clamp(lo + 1, hi.saturating_sub(1));
+    for d in 0..(hi - lo) {
+        let up = m + d;
+        if up < hi && val(up - 1) != val(up) {
+            return Some(up);
+        }
+        if let Some(dn) = m.checked_sub(d) {
+            if dn > lo && val(dn - 1) != val(dn) {
+                return Some(dn);
+            }
+        }
+    }
+    None
 }
 
 /// Draw `k` rows from a VALUE-SORTED `(value, weight)` slice without replacement,

@@ -826,3 +826,38 @@ count, L1-resident scatter), and the logistic line-search rejects are genuinely 
 jagged stride (pass 3) was the last structural lever. Further training speedup requires fewer ops
 (G0 relaxation — fewer trees/axes/order, off the table) or `unsafe` SIMD (which won't help an
 L1-resident throughput-bound scatter much). Campaign training-speed frontier: closed.
+
+## G1 ACCURACY: beat EBM at order 1/2/3 (2026-06-29) — campaign reopened
+
+Re-measured the EBM gap (tri o1/o2/o3 vs ebm mains/o2, EBM from cache). A 5-investigator team ranked
+G0-preserving levers (bagging, binning, lr/smoothing, interaction selection). Findings:
+
+### KEY INSIGHT — the gap was largely an UNDER-FITTING artifact (n_trees cap too small)
+Initial measurements capped n_trees=4000 (fair_compare BUDGET). With lr=0.05 tri converges slowly, so
+4000 truncates before the validation plateau — under-measuring tri vs EBM (which self-converges). At a
+proper **16000-tree cap + early_stopping_rounds=500** the gap collapses (diamonds + miami, no bagging):
+| dataset/order | 4000-cap gap | 16000-cap + refill gap |
+|---|---|---|
+| diamonds o1 | -4.42% | **-0.56%** |
+| diamonds o2 | -1.03% | **-0.59%** |
+| diamonds o3 | +2.66% WIN | +1.85% WIN |
+| miami o1 | -2.86% | **-1.10%** |
+| miami o2 | +2.19% WIN | +3.04% WIN |
+| miami o3 | +2.90% WIN | +3.74% WIN |
+The "diamonds@1 is structurally hard" read was WRONG — it was truncation. ALWAYS benchmark tri with a
+large n_trees cap + early stopping (memory: tri-perf-early-stop-large-trees).
+
+### ✅ Bin-budget refill (reclaim dedup-collapsed bins) — G0-preserving accuracy lever
+The quantile binning's point-mass dedup (diamonds carat magic sizes 0.3/0.5/0.7/1.0 collapse uniform
+quantile probes onto one border) wastes bin budget. New `refill_borders` (grid.rs) greedily splits the
+densest splittable interval at distinct-value boundaries until the `max_bin-1` budget is met. Gated off
+when a rare-bin floor is active (a split could break collapse_rare_bins's min). Order-independent
+(G0-preserving), deterministic. At convergence it is net-positive (4000-cap A/B: diamonds o2 better,
+miami o1/o2/o3 better; only diamonds o1/o3 ~+0.1/+0.4%). The n=400-suite "miami regression" was a
+low-tree artifact (gone at convergence).
+
+### Bagging (n_bags) — G0-clean partial win, never tested at depth-1 before
+Outer bagging (soup_models averages Exact members) closed ~1/4-1/3 of the depth-1 gap at the 4000-cap
+(diamonds -5.21%->-3.97%); to be re-measured at the large cap on the remaining close losses.
+
+NEXT: full re-baseline at FAIR_BUDGET=16000 + refill, then add bagging to any residual losses.
