@@ -591,5 +591,19 @@ to an O(8) closed form (`refine_tree_leaves_se_quadratic`, gated on `LossId::Squ
 
 ### ❌ borrowable trims also tested this pass: dead grad/hess memset (KEPT, byte-identical), degenerate-axis pre-filter
 (KEPT, byte-identical, benchmark-neutral), count-free hot cell (≈0, reverted), HistogramPool reuse (infeasible under
-determinism), i128 QHIST (≈0). Categorical label factorization (intern labels→int ids, ~−20% allstate binning,
-byte-identical) is the remaining un-built win — next.
+determinism), i128 QHIST (≈0).
+
+### ✅ Categorical label factorization — BYTE-IDENTICAL, −16% off allstate binning
+The high-cardinality categorical TS encoder operated on `&[String]` row labels through string-keyed `BTreeMap`s. Now
+`fit_cat_encoder` interns the collapsed per-row labels into integer ids ONCE (`intern_levels`, a local `HashMap` keyed
+in ROW order so the result is deterministic and never serialized), and the two dominant phases index dense `Vec`s by
+id: `full_data_encoder` aggregates `(sum_y,denom)` into `Vec[n_ids]`, and `kfold_training_encodings` uses `Vec[n_ids]`
+total + `Vec[k·n_ids]` per-fold (vs `BTreeMap<&str>` / `BTreeMap<(u32,&str)>`). Plus the earlier sub-fixes
+(clone-on-first-occurrence in full_data, set-based rare lookup in collapse). Ordered/LOO (non-default) keep the string
+path. **Byte-identical**: every `(sum_y,denom)` reduction stays in row order (same f64 sums); the Fisher sort re-orders
+by (encoding, label) so the build order is irrelevant; rare-bucket members come from the unchanged `collapse_rare_levels`.
+- **Measured (allstate, n_trees=1 ≈ isolates binning, best-of-3):** 2.61s (orig) → 2.42 (sub-fixes) → **2.18s
+  (−16% total)**. Scores byte-identical on every cat-heavy dataset incl. the rare-collapse path (allstate 0.55744,
+  amazon 0.85224, kick 0.77228). 234 core + 20 py green; clippy + fmt + no-hashmap-serialized gate green.
+- Remaining cat binning cost (the OOF compute + the serve `encode_label` loop) is smaller; serve is a separate O(n·d)
+  loop (bin.rs) a lookup-map would fix — minor, deferred.

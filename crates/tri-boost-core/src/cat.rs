@@ -542,6 +542,10 @@ pub fn fit_cat_encoder(
     let row_terms = categorical_row_terms(y, w, spec.exposure, spec.config.target)?;
     let (fit_levels, members) =
         collapse_rare_levels(levels, &row_terms, spec.config.min_data_per_group)?;
+    // Intern the collapsed per-row labels into integer ids ONCE, so the dominant full-data + k-fold
+    // encoders index dense Vecs by id instead of string-keyed BTreeMaps per row (the high-card
+    // binning cost). Byte-identical (every reduction stays in row order; Fisher re-sorts by label).
+    let (fit_ids, id_labels) = intern_levels(&fit_levels)?;
     let base = categorical_base_from_terms(&row_terms, spec.config.target)?;
     let smooth = resolve_smooth(&fit_levels, &row_terms, base, spec.config.smooth)?;
     let mut resolved_config = spec.config.clone();
@@ -549,24 +553,57 @@ pub fn fit_cat_encoder(
     let full = full_data_encoder(
         spec.raw,
         spec.id,
-        &fit_levels,
+        &fit_ids,
+        &id_labels,
         &row_terms,
         base,
         &resolved_config,
         &members,
     )?;
     let train = match spec.config.leakage {
+        // Ordered / LOO are non-default and keep the per-row string path (lower priority).
         LeakageScheme::Ordered { n_perms } => {
             ordered_training_encodings(&fit_levels, &row_terms, base, smooth, spec.seed, n_perms)?
         }
-        LeakageScheme::KFold { k } => {
-            kfold_training_encodings(&fit_levels, &row_terms, base, smooth, spec.seed, k)?
-        }
+        LeakageScheme::KFold { k } => kfold_training_encodings(
+            &fit_ids,
+            id_labels.len(),
+            &row_terms,
+            base,
+            smooth,
+            spec.seed,
+            k,
+        )?,
         LeakageScheme::LeaveOneOut => {
             loo_training_encodings(&fit_levels, &row_terms, base, smooth)?
         }
     };
     Ok((full, train))
+}
+
+/// Intern per-row (collapsed) labels into integer ids in FIRST-SEEN / ROW order, returning the
+/// per-row id vector and the id→label table. The `HashMap` is a local lookup only (never iterated,
+/// never serialized) so the result is deterministic by row order. Lets the full-data + k-fold
+/// encoders index dense `Vec`s by id — byte-identical to the string-keyed path.
+fn intern_levels(levels: &[String]) -> Result<(Vec<u32>, Vec<&str>), PbError> {
+    let mut id_of: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    let mut id_labels: Vec<&str> = Vec::new();
+    let mut ids: Vec<u32> = Vec::with_capacity(levels.len());
+    for label in levels {
+        let id = match id_of.get(label.as_str()) {
+            Some(&id) => id,
+            None => {
+                let id = u32::try_from(id_labels.len()).map_err(|_| PbError::InvalidInput {
+                    what: "categorical fit supports at most u32::MAX distinct levels".into(),
+                })?;
+                id_labels.push(label.as_str());
+                id_of.insert(label.as_str(), id);
+                id
+            }
+        };
+        ids.push(id);
+    }
+    Ok((ids, id_labels))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -655,41 +692,40 @@ fn categorical_base_from_terms(rows: &[CatRowTerm], target: CatTarget) -> Result
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn full_data_encoder(
     raw: FeatureId,
     id: TsEncodingId,
-    levels: &[String],
+    fit_ids: &[u32],
+    id_labels: &[&str],
     rows: &[CatRowTerm],
     base: f32,
     config: &TsConfig,
     members: &BTreeMap<String, Vec<String>>,
 ) -> Result<CatEncoder, PbError> {
-    let mut agg: BTreeMap<String, CatRowTerm> = BTreeMap::new();
-    for (label, term) in levels.iter().zip(rows) {
-        // Clone the key only on a label's FIRST occurrence (≤ d clones) instead of once per row
-        // (n clones, n−d immediately dropped by the old `entry(label.clone())`). `0.0 + x == x`
-        // exactly, so the accumulated (sum_y, denom) — in the same row order — is byte-identical.
-        if let Some(entry) = agg.get_mut(label.as_str()) {
-            entry.sum_y += term.sum_y;
-            entry.denom += term.denom;
-        } else {
-            agg.insert(
-                label.clone(),
-                CatRowTerm {
-                    sum_y: term.sum_y,
-                    denom: term.denom,
-                },
-            );
-        }
+    // Aggregate (sum_y, denom) per level id by walking rows in order — same row order, hence the
+    // same f64 sums, as the old string-keyed BTreeMap. `out` is built in id order, but
+    // `assign_fisher_bins` re-sorts by (encoding, label) (labels distinct ⇒ total order), so the
+    // final encoder is byte-identical regardless of the build order.
+    let mut agg = vec![CatRowTerm::default(); id_labels.len()];
+    for (&lid, term) in fit_ids.iter().zip(rows) {
+        let entry = agg.get_mut(lid as usize).ok_or_else(|| PbError::Internal {
+            what: "full-data encoder level id escaped".into(),
+        })?;
+        entry.sum_y += term.sum_y;
+        entry.denom += term.denom;
     }
-    let mut out = Vec::with_capacity(agg.len());
-    for (label, term) in agg {
+    let mut out = Vec::with_capacity(id_labels.len());
+    for (lid, term) in agg.iter().enumerate() {
+        let label = *id_labels.get(lid).ok_or_else(|| PbError::Internal {
+            what: "full-data encoder id label escaped".into(),
+        })?;
         out.push(CatLevel {
             members: members
-                .get(&label)
+                .get(label)
                 .cloned()
-                .unwrap_or_else(|| vec![label.clone()]),
-            label,
+                .unwrap_or_else(|| vec![label.to_owned()]),
+            label: label.to_owned(),
             encoding: shrunken_encoding(term.sum_y, term.denom, base, config.smooth)?,
             bin: 0,
             weight: term.denom as f32,
@@ -970,7 +1006,8 @@ fn loo_training_encodings(
 }
 
 fn kfold_training_encodings(
-    levels: &[String],
+    fit_ids: &[u32],
+    n_ids: usize,
     rows: &[CatRowTerm],
     base: f32,
     smooth: Smooth,
@@ -982,10 +1019,19 @@ fn kfold_training_encodings(
             what: format!("KFold target statistics require k >= 2, got {k}"),
         });
     }
-    let mut total: BTreeMap<&str, CatRowTerm> = BTreeMap::new();
-    let mut by_fold: BTreeMap<(u32, &str), CatRowTerm> = BTreeMap::new();
-    let mut folds = Vec::with_capacity(levels.len());
-    for (row, (label, term)) in levels.iter().zip(rows).enumerate() {
+    // Dense `[id]` total and `[fold*n_ids + id]` per-fold accumulators (vs the old string-keyed
+    // `BTreeMap<&str>` / `BTreeMap<(u32,&str)>`). Same row order ⇒ byte-identical f64 sums, and the
+    // OOF held-out subtraction `total[id] − by_fold[fold,id]` reads the same values.
+    let fold_cells = usize::try_from(k)
+        .ok()
+        .and_then(|kk| kk.checked_mul(n_ids))
+        .ok_or_else(|| PbError::Internal {
+            what: "kfold accumulator size overflow".into(),
+        })?;
+    let mut total = vec![CatRowTerm::default(); n_ids];
+    let mut by_fold = vec![CatRowTerm::default(); fold_cells];
+    let mut folds = Vec::with_capacity(fit_ids.len());
+    for (row, (&lid, term)) in fit_ids.iter().zip(rows).enumerate() {
         let fold = (pb_seed(
             seed,
             0,
@@ -995,23 +1041,42 @@ fn kfold_training_encodings(
             })?,
         ) % u64::from(k)) as u32;
         folds.push(fold);
-        let t = total.entry(label.as_str()).or_default();
+        let t = total
+            .get_mut(lid as usize)
+            .ok_or_else(|| PbError::Internal {
+                what: "kfold total level id escaped".into(),
+            })?;
         t.sum_y += term.sum_y;
         t.denom += term.denom;
-        let f = by_fold.entry((fold, label.as_str())).or_default();
+        let fc = (fold as usize)
+            .checked_mul(n_ids)
+            .and_then(|b| b.checked_add(lid as usize))
+            .ok_or_else(|| PbError::Internal {
+                what: "kfold by_fold index overflow".into(),
+            })?;
+        let f = by_fold.get_mut(fc).ok_or_else(|| PbError::Internal {
+            what: "kfold by_fold cell escaped".into(),
+        })?;
         f.sum_y += term.sum_y;
         f.denom += term.denom;
     }
-    let mut out = Vec::with_capacity(levels.len());
-    for (row, label) in levels.iter().enumerate() {
+    let mut out = Vec::with_capacity(fit_ids.len());
+    for (row, &lid) in fit_ids.iter().enumerate() {
         let fold = *folds.get(row).ok_or_else(|| PbError::Internal {
             what: "kfold categorical row escaped folds".into(),
         })?;
-        let all = total.get(label.as_str()).copied().unwrap_or_default();
-        let held = by_fold
-            .get(&(fold, label.as_str()))
-            .copied()
-            .unwrap_or_default();
+        let all = *total.get(lid as usize).ok_or_else(|| PbError::Internal {
+            what: "kfold total read escaped".into(),
+        })?;
+        let fc = (fold as usize)
+            .checked_mul(n_ids)
+            .and_then(|b| b.checked_add(lid as usize))
+            .ok_or_else(|| PbError::Internal {
+                what: "kfold by_fold read index overflow".into(),
+            })?;
+        let held = *by_fold.get(fc).ok_or_else(|| PbError::Internal {
+            what: "kfold by_fold read escaped".into(),
+        })?;
         let term = CatRowTerm {
             sum_y: all.sum_y - held.sum_y,
             denom: all.denom - held.denom,
