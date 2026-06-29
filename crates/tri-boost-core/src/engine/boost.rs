@@ -2405,26 +2405,20 @@ fn refine_tree_leaves_after_grow(
     let mut trial_raw_sub = base_sub.clone();
     fill_leaf_raw_contiguous(&mut trial_raw_sub, &base_sub, &memberships, &tree.leaves)?;
     let mut gh = GradHess::default();
-    // step-0 fuses init_dev with grad_hess into ONE pass sharing the link σ/exp
-    // (`grad_hess_and_deviance`), over the dense subset. The deviance is bit-identical to the old
-    // full `(y, raw, weight)` deviance when grow saw every row (`rows == 0..n` ⇒ subset == full, same
-    // chunked fold); with a validation split it is the subset deviance, exactly as before.
-    let fuse_first = rows.len() == n_rows;
-    let init_dev = if fuse_first {
-        prof::timed("refine.init_dev", || {
-            loss.grad_hess_and_deviance(&y_sub, &trial_raw_sub, &w_sub, &mut gh)
-        })?
-    } else {
-        prof::timed("refine.init_dev", || {
-            loss.deviance(&y_sub, &trial_raw_sub, &w_sub)
-        })?
-    };
+    // ALWAYS fuse init_dev with step-0's grad_hess into ONE pass over the dense subset
+    // (`grad_hess_and_deviance` shares the link σ/exp): the returned deviance is bit-identical to the
+    // standalone `deviance`, and `gh` is then step-0's gradient (bit-identical to a separate
+    // grad_hess). On a validation split (`rows ⊊ 0..n`) this drops the previously-separate step-0
+    // grad_hess pass — a pure byte-identical reduction (the full-sample path already did this).
+    let init_dev = prof::timed("refine.init_dev", || {
+        loss.grad_hess_and_deviance(&y_sub, &trial_raw_sub, &w_sub, &mut gh)
+    })?;
     let mut best_deviance = f64::from(init_dev);
 
     for step in 0..config.leaf_refine_steps {
-        // When fused, step 0's `gh` was already produced by the `init_dev` pass above. Otherwise a
-        // pointwise grad_hess over the dense subset (O(rows)); `gh` is therefore subset-indexed.
-        if !(fuse_first && step == 0) {
+        // step 0's `gh` was produced by the fused `init_dev` pass above; later steps recompute the
+        // gradient over the dense subset (O(rows)). `gh` is subset-indexed throughout.
+        if step != 0 {
             prof::timed("refine.grad_hess", || {
                 loss.grad_hess(&y_sub, &trial_raw_sub, &w_sub, &mut gh)
             })?;
