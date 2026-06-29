@@ -652,3 +652,50 @@ pre-session commit f44d299 ("WIN #9") both give **0.1614045724** — identical t
 untouched (miami has one categorical, `avno60plus`, so the factorization path was exercised). Confirms the whole G5
 bottleneck pass — categorical factorization, serve map, sub-fixes, memset, degenerate-axis, SmallVec (suite) + SE
 closed-form leaf-refine (o3) — is byte-identical on every dataset.
+
+## Bottleneck pass 2 (2026-06-29) — granular component timings + a 5-investigator team, then experiment with each idea
+
+Profiled both configs to per-`prof::timed`-phase granularity. **hist_build dominates** (SUITE: allstate 8.2s/96%,
+particulate 2.4s; O3: allstate 45s/75%, kick 6.5s); then logistic leaf-refine (kick backtrack_eval 5.4s + init_dev
+1.4s — SE closed-form is regression-only), then the per-step refine.grad_hess (allstate 6.0s, diamonds/kick ~1.9s). A
+Workflow team (5 component investigators → adversarial verify each proposal vs G0/forbid-unsafe/determinism/byte-id →
+ROI synthesis; 15 proposals, 12 survived) ranked them; then each was BUILT and MEASURED:
+
+### ✅ ① SE leaf-refine: fuse grad_hess + aggregate (the flagship) — BYTE-IDENTICAL, -37/-38% refine
+New `Loss::grad_hess_aggregate` (default = old two-pass; SquaredError overrides with a fused kernel computing each
+row's f32 (g,h) inline — EXACTLY `grad_hess`'s `g=w(F-y)`/`h=w.max(floor)` via `ensure_finite_grad_hess` — and folding
+straight into the per-leaf f64 sums, visiting only `rows`). Removes the whole materialized-gradient round-trip
+(separate write + re-read) the SE closed-form left behind. Bit-identical (diamonds o3 0.09022, allstate o3 0.53974).
+Measured: diamonds leaf_refine 3.10→1.94s (-37%, wall 7.2→5.8 -19%), allstate 10.27→6.35s (-38%, refine grad_hess+agg
+7.63→3.90 -49%, wall 63.9→57.5 -10%). The single biggest win of the pass. Commit ce65fbb.
+
+### ✅ ② generic leaf-refine reads the dense subset raw — BYTE-IDENTICAL, drops full-raw clone
+grad_hess now runs over (y_sub, trial_raw_sub, w_sub) — pointwise ⇒ gh[i] bit-identical to the old gh[rows[i]] — so the
+full-length `raw` clone + per-accept apply_membership_leaves scatter are gone, and it's O(rows) on validation splits.
+Bit-identical (kick o3 0.76975, diamonds 0.09022). Net-neutral on full-sample (within variance), helps the validation/
+early-stop config; also makes trial_raw_sub the single source of truth. Commit 6e51a23.
+
+### ✅ ③ numeric grid build borrows the whole-column sample — BYTE-IDENTICAL
+Dropped an O(n) `fw.clone()` on the quantile path (only existed for type-unification). Negligible but free. Commit 4df054f.
+
+### ❌ ⑧ fuse logistic backtrack deviance with next-step grad_hess — REVERTED (net-neutral)
+grad_hess_and_deviance on the scale=1 trial, carry gh to the next step. Byte-identical (kick 0.76975); the mechanism
+WORKED (refine.grad_hess collapsed to ~0 ⇒ scale=1 accept-rate is high). BUT net-neutral: refine.backtrack_eval grew
++2.2s, exactly absorbing the -2.0s grad_hess it saved. The link σ/exp sharing doesn't pay — the exp is not the
+bottleneck (the gh write + g/h arithmetic + memory traffic offset it). The work just moved. Reverted.
+
+### ❌ ⑤ level-0 (n_leaves==1) histogram kernel specialization — REVERTED (~0, confirms the floor)
+Skip the per-row leaf_of_row read + leaf bounds-check + offset2 multiply when n_leaves==1 (idx==bin). Byte-identical for
+valid input. MEASURED allstate suite hist_build 8.59-9.1s vs 8.2s baseline — NO improvement (within variance, if not
+slightly worse). Confirms the team's gate: the kernel is **scatter-bound** (the random write into out.ghc[bin]
+dominates; the leaf-read/offset were latency-hidden), so removing them frees nothing. The histogram engine is at its
+safe-Rust floor — the dominant cost is irreducible without `unsafe` SIMD/prefetch (off the table). All downstream hist
+ideas (⑥/⑦/⑪/⑫, gated on this) are therefore not worth building. Reverted (also it skipped a safety-validation test).
+
+### ⏸ ⑨/⑩ categorical intern-before-collapse + serve id-lookup — NOT pursued
+A small one-time-binning extension of the already-shipped categorical factorization (-20% binning). Bounded by the cat
+fit's small share of the 8-45s wall; deprioritized given the bulk is already captured and run-to-run variance is high.
+
+**Net of pass 2:** one real win (① SE fusion, -37/-38% refine — compounds with the earlier SE closed-form), two
+byte-identical cleanups (②③). The hist_build elephant is confirmed irreducible in safe Rust (⑤ prototype = ~0). The
+remaining training cost is now genuinely dominated by the histogram scatter, which only `unsafe` could move.
