@@ -666,9 +666,21 @@ fn full_data_encoder(
 ) -> Result<CatEncoder, PbError> {
     let mut agg: BTreeMap<String, CatRowTerm> = BTreeMap::new();
     for (label, term) in levels.iter().zip(rows) {
-        let entry = agg.entry(label.clone()).or_default();
-        entry.sum_y += term.sum_y;
-        entry.denom += term.denom;
+        // Clone the key only on a label's FIRST occurrence (≤ d clones) instead of once per row
+        // (n clones, n−d immediately dropped by the old `entry(label.clone())`). `0.0 + x == x`
+        // exactly, so the accumulated (sum_y, denom) — in the same row order — is byte-identical.
+        if let Some(entry) = agg.get_mut(label.as_str()) {
+            entry.sum_y += term.sum_y;
+            entry.denom += term.denom;
+        } else {
+            agg.insert(
+                label.clone(),
+                CatRowTerm {
+                    sum_y: term.sum_y,
+                    denom: term.denom,
+                },
+            );
+        }
     }
     let mut out = Vec::with_capacity(agg.len());
     for (label, term) in agg {
@@ -732,10 +744,15 @@ fn collapse_rare_levels(
         members.insert(RARE_LEVEL_LABEL.to_owned(), rare_members.clone());
     }
 
+    // Membership test against a set (O(1)/row) instead of `rare_members.iter().any()` (O(rare)/row,
+    // i.e. O(n·rare) total on high-cardinality columns). Byte-identical: same partition into rare
+    // (→ RARE_LEVEL_LABEL) vs kept (→ label).
+    let rare_set: std::collections::HashSet<&str> =
+        rare_members.iter().map(String::as_str).collect();
     let collapsed = levels
         .iter()
         .map(|label| {
-            if rare_members.iter().any(|rare| rare == label) {
+            if rare_set.contains(label.as_str()) {
                 RARE_LEVEL_LABEL.to_owned()
             } else {
                 label.clone()
