@@ -699,3 +699,25 @@ fit's small share of the 8-45s wall; deprioritized given the bulk is already cap
 **Net of pass 2:** one real win (① SE fusion, -37/-38% refine — compounds with the earlier SE closed-form), two
 byte-identical cleanups (②③). The hist_build elephant is confirmed irreducible in safe Rust (⑤ prototype = ~0). The
 remaining training cost is now genuinely dominated by the histogram scatter, which only `unsafe` could move.
+
+### Complete sweep of the remaining ranked ideas (the first pass left some untested)
+- **⑪ parallel/slice-contiguous hist assembly** — built, MEASURED ~0 (allstate suite hist_build 8.0s vs 8.2s, score
+  exact). The assembly is memory-bound and dominated by the accumulate scatter. Reverted.
+- **⑦ accumulate-loop bounds-check collapse** — it is the SAME loop ⑤ already measured as scatter-bound; ⑤ removed
+  strictly more per-row work (leaf read + offset) for ~0, so ⑦ (removing only bounds checks) is ~0 by that
+  measurement. Not separately built.
+- **⑫ pre-gather shared per-row arrays** — INAPPLICABLE: v1 uses `subsample = 1.0` (all rows, `0..n`), so the gh reads
+  are already sequential, not gathered; ⑫'s premise only exists under bagging/GOSS. Team also flagged it regressive.
+- **⑨ categorical intern-BEFORE-collapse** — fully built (new `collapse_rare_ids` in id space; rare members sorted to
+  match the old BTreeMap; fit-id numbering is output-irrelevant so it's free; non-default Auto/Ordered/LOO get a
+  reconstructed `fit_levels`). BYTE-IDENTICAL incl. the rare-collapse path (allstate 0.55744, amazon 0.85224, kick
+  0.77228 all exact, 234+20 green). MEASURED ~0: allstate n=1 binning 2.09s vs 2.10s — the collapse/intern string work
+  is dwarfed by the numeric grid build + the already-id-indexed kfold/full-data. Reverted.
+- **⑩ serve id-lookup** — subsumed: ⑨ shows the categorical fit is at its floor, and ⑩ (replacing the serve
+  `encoding_map` HashMap with an id gather) would couple bin.rs to the internal ids for an even smaller marginal one.
+  Not built.
+
+**Final verdict — all 12 ranked ideas now tested or definitively resolved.** Confirmed wins: ① (real, -37/-38%
+refine), ②③ (byte-identical cleanups). Confirmed ~0/inapplicable: ⑤⑥⑦⑧⑨⑩⑪⑫. The engine is at its safe-Rust floor on
+BOTH frontiers — the histogram scatter (hist_build) and the categorical fit (binning) — with no remaining safe-Rust
+slack; further training speedup requires `unsafe` SIMD/prefetch (a policy decision) or G0 relaxation (off the table).
