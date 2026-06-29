@@ -18,9 +18,9 @@ use crate::backend::{pb_seed, Stage};
 use crate::constraints::{CredibilityFloor, MonoSign};
 use crate::data::BinnedMatrix;
 use crate::engine::hist::{
-    build_histogram, build_quantized_histogram, subtract_sibling_into, QuantizeContext,
+    build_histogram, build_quantized_histogram, quantize_grad_hess, subtract_sibling_into,
 };
-use crate::engine::{low_bit, Hist, HistPrecision, ObliviousTree, Split};
+use crate::engine::{low_bit, Hist, HistPrecision, ObliviousTree, QuantGradHess, Split};
 use crate::error::PbError;
 use crate::explain::FeatureSet;
 use crate::loss::GradHess;
@@ -862,19 +862,22 @@ pub(crate) fn refit_tree_leaves(
     Ok(())
 }
 
-/// Build a level-`L` (`L >= 1`) FullF64 histogram via the **subtraction trick** instead of a full
-/// build: accumulate only the SMALLER of each parent leaf's two children, then derive the larger by
+/// Build a level-`L` (`L >= 1`) histogram via the **subtraction trick** instead of a full build:
+/// accumulate only the SMALLER of each parent leaf's two children, then derive the larger by
 /// subtracting from the retained level-`(L-1)` parent histogram (`prev_hist`, columns = `prev_admissible`
 /// = A_{L-1}). It visits only ~half the rows. Every row's level-`L` leaf is already fixed in
 /// `leaf_of_row` (bits `0..L-1`, values in `[0, 2^L)`) by the committed earlier splits, so the sibling
 /// pairing — parent `p` in `[0, 2^(L-1))`, children `{p, p + 2^(L-1)}` — is known BEFORE this level's
 /// split (no circular dependency). Accuracy moves only at ~1e-11 (g/h drift; count exact; wsum exact
 /// under unit weights); determinism is preserved because `small_rows` is filtered in fixed row order
-/// before the (chunk-deterministic) build. FullF64 only — the quantized path keeps full builds.
+/// before the (chunk-deterministic) build. Works for BOTH precisions: `qgh = Some(..)` builds the
+/// smaller children via the quantized integer accumulation, `None` via the FullF64 builder; the
+/// subtraction itself runs on the (dequantized) f64 parent either way.
 #[allow(clippy::too_many_arguments)]
 fn build_subtracted_level(
     x: &BinnedMatrix,
     gh: &GradHess,
+    qgh: Option<&QuantGradHess>,
     rows: &[u32],
     leaf_of_row: &[u8],
     level: usize,
@@ -940,16 +943,23 @@ fn build_subtracted_level(
             small_rows.push(r);
         }
     }
-    let mut hist = build_histogram(
-        x,
-        gh,
-        &small_rows,
-        leaf_of_row,
-        n_leaves,
-        admissible,
-        weight,
-        unit_weight,
-    )?;
+    // Build the smaller children with the active precision; the larger are derived by subtraction
+    // below (so neither path visits the larger children's rows).
+    let mut hist = match qgh {
+        Some(q) => {
+            build_quantized_histogram(x, q, &small_rows, leaf_of_row, n_leaves, admissible, weight)?
+        }
+        None => build_histogram(
+            x,
+            gh,
+            &small_rows,
+            leaf_of_row,
+            n_leaves,
+            admissible,
+            weight,
+            unit_weight,
+        )?,
+    };
     // Step C — axis-position map A_L -> A_{L-1} (total: A_L ⊆ A_{L-1}, append-only `used_raws`).
     let mut axis_map: Vec<usize> = Vec::with_capacity(admissible.len());
     for &a in admissible {
@@ -994,6 +1004,13 @@ pub(crate) fn grow_oblivious_tree_with_leaf_map(
     // (the histogram-subtraction trick) instead of a full pass. Captured only on the FullF64 path.
     let mut prev_hist: Option<Hist> = None;
     let mut prev_admissible: Option<Vec<u32>> = None;
+    // QHIST quantizes the (tree-constant) gradients/hessians ONCE here — not once per level — since
+    // `gh` does not change within a tree. Bit-identical to the prior per-level re-quantization
+    // (same `gh`, seed, round ⇒ same `QuantGradHess`), just computed a third as often.
+    let qgh: Option<QuantGradHess> = match cfg.hist_precision {
+        HistPrecision::QuantizedI32 => Some(quantize_grad_hess(gh, cfg.quant_seed, cfg.round)?),
+        HistPrecision::FullF64 => None,
+    };
 
     for level in 0..3usize {
         if used_raws.len() >= order_cap {
@@ -1029,19 +1046,19 @@ pub(crate) fn grow_oblivious_tree_with_leaf_map(
         let n_leaves = 1usize << level;
         let hist =
             crate::engine::boost::prof::timed("grow.hist_build", || -> Result<Hist, PbError> {
-                // Histogram-subtraction fast path: levels 1 and 2, FullF64, with the previous level's
-                // histogram retained as the parent. Builds the larger sibling-children by subtraction
-                // (visits ~half the rows). FullF64 only (quantized keeps full builds). Level 2's parent
-                // is itself a subtracted hist, so g/h drift compounds to ~2e-11 — still accuracy-neutral
-                // (the equivalence test grows the same tree as the full build).
-                if cfg.hist_subtraction
-                    && level >= 1
-                    && matches!(cfg.hist_precision, HistPrecision::FullF64)
-                {
+                // Histogram-subtraction fast path: levels 1 and 2 (BOTH precisions), with the
+                // previous level's histogram retained as the parent. Build only the SMALLER
+                // sibling-children by accumulation (~half the rows) and derive the larger by
+                // subtracting from the parent. FullF64 subtracts dequantized f64 (drift ~1e-11);
+                // QHIST builds the smaller via the quantized integer accumulation and subtracts on
+                // the dequantized hist (also ~1e-11) — accuracy-neutral, and now QHIST gets the same
+                // ~half-rows saving FullF64 has.
+                if cfg.hist_subtraction && level >= 1 {
                     if let (Some(ph), Some(pa)) = (prev_hist.as_ref(), prev_admissible.as_ref()) {
                         return build_subtracted_level(
                             x,
                             gh,
+                            qgh.as_ref(),
                             rows,
                             &leaf_of_row,
                             level,
@@ -1066,15 +1083,11 @@ pub(crate) fn grow_oblivious_tree_with_leaf_map(
                     ),
                     HistPrecision::QuantizedI32 => build_quantized_histogram(
                         x,
-                        gh,
+                        qgh.as_ref().ok_or_else(internal("QHIST qgh missing"))?,
                         rows,
                         &leaf_of_row,
                         n_leaves,
                         &admissible,
-                        QuantizeContext {
-                            seed: cfg.quant_seed,
-                            round: cfg.round,
-                        },
                         weight,
                     ),
                 }
@@ -1145,10 +1158,11 @@ pub(crate) fn grow_oblivious_tree_with_leaf_map(
             *leaf_of_row.get_mut(ru).ok_or_else(internal("leaf set"))? |= bit;
         }
 
-        // Retain this level's FullF64 histogram + axis ids as the parent for the NEXT level's
-        // subtraction (level 0 → parent for level 1; level 1 → parent for level 2). Level 2 is the
-        // last level, so its histogram is never retained. (Quantized stays on full builds.)
-        if level < 2 && matches!(cfg.hist_precision, HistPrecision::FullF64) {
+        // Retain this level's histogram + axis ids as the parent for the NEXT level's subtraction
+        // (level 0 → parent for level 1; level 1 → parent for level 2). Level 2 is the last level,
+        // so its histogram is never retained. Both precisions retain (the dequantized QHIST hist is
+        // the parent its subtracted children derive from).
+        if level < 2 {
             prev_admissible = Some(admissible.clone());
             prev_hist = Some(hist);
         }
@@ -2209,9 +2223,12 @@ mod tests {
     }
 
     #[test]
-    fn level2_subtraction_flag_off_matches_full_build_and_quantized_unaffected() {
-        // The flag is inert for QuantizedI32 (always full build): a quantized grow is identical
-        // whether the subtraction flag is on or off.
+    fn quantized_subtraction_reproduces_full_build_tree() {
+        // QHIST now uses histogram subtraction at levels 1+2 (build only the smaller children by
+        // quantized integer accumulation, derive the larger by subtracting from the retained parent).
+        // The integer accumulation + dequantized-f64 subtraction perturbs g/h only at ~1e-11 — far
+        // below any non-tie split gap — so the subtracted quantized grow selects the SAME splits and
+        // gh-derived leaves as the full-build quantized grow (accuracy-neutral).
         let (x, gh, rows) = subtraction_fixture();
         let w = ones(x.n_rows as usize);
         let axes = [0u32, 1, 2, 3];
@@ -2230,9 +2247,14 @@ mod tests {
         let t_off = grow_oblivious_tree(&x, &gh, &rows, &axes, &q_off, &w)
             .unwrap()
             .expect("tree");
+        assert!(
+            t_on.depth >= 2,
+            "fixture must reach depth 2 so the quantized subtraction path engages (got {})",
+            t_on.depth
+        );
         assert_eq!(
             t_on, t_off,
-            "subtraction flag must be inert on the quantized path"
+            "quantized subtraction must reproduce the full-build quantized tree"
         );
     }
 

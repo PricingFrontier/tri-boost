@@ -29,15 +29,6 @@ use rayon::prelude::*;
 const ROW_PAR_MIN_ROWS: usize = 32_768;
 const ROW_PAR_CHUNK_ROWS: usize = 8_192;
 
-/// Deterministic quantization re-seed coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct QuantizeContext {
-    /// Base model seed.
-    pub seed: u64,
-    /// Boosting round.
-    pub round: u32,
-}
-
 fn oob(what: &'static str) -> impl Fn() -> PbError {
     move || PbError::Internal { what: what.into() }
 }
@@ -233,16 +224,22 @@ fn scale_for(max_abs: f64) -> Result<f32, PbError> {
 fn stochastic_round(value: f64, seed: u64, round: u32, block: u32) -> Result<i32, PbError> {
     let lo = value.floor();
     let frac = value - lo;
-    let bits = pb_seed(seed, round, Stage::Quantize as u32, block);
-    let unit = ((bits >> 11) as f64 + 1.0) / ((1_u64 << 53) as f64 + 1.0);
+    // The frozen `Quantize` stream is consulted ONLY at an exact tie (`frac == 0.5`), so compute
+    // its hash lazily — `pb_seed` is a pure function of the coordinates, so deferring it to the
+    // (rare) tie branch is bit-identical to computing it every row, but skips the per-row hash on
+    // the overwhelming majority of rows (the hot quantization pass).
     let rounded = if frac > 0.5 {
         lo + 1.0
     } else if frac < 0.5 {
         lo
-    } else if unit < 0.5 {
-        lo + 1.0
     } else {
-        lo
+        let bits = pb_seed(seed, round, Stage::Quantize as u32, block);
+        let unit = ((bits >> 11) as f64 + 1.0) / ((1_u64 << 53) as f64 + 1.0);
+        if unit < 0.5 {
+            lo + 1.0
+        } else {
+            lo
+        }
     };
     if rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
         return Err(PbError::InvalidInput {
@@ -260,15 +257,13 @@ fn stochastic_round(value: f64, seed: u64, round: u32, block: u32) -> Result<i32
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_quantized_histogram(
     x: &BinnedMatrix,
-    gh: &GradHess,
+    qgh: &QuantGradHess,
     rows: &[u32],
     leaf_of_row: &[u8],
     n_leaves: usize,
     axes: &[u32],
-    ctx: QuantizeContext,
     weight: &[f32],
 ) -> Result<Hist, PbError> {
-    let qgh = quantize_grad_hess(gh, ctx.seed, ctx.round)?;
     let mut max_bins = 0usize;
     for &a in axes {
         let grid = x
@@ -281,7 +276,7 @@ pub(crate) fn build_quantized_histogram(
     let subs: Result<Vec<AxisQHist>, PbError> = axes
         .par_iter()
         .map(|&a| {
-            accumulate_axis_quantized(x, &qgh, rows, leaf_of_row, n_leaves, a, max_bins, weight)
+            accumulate_axis_quantized(x, qgh, rows, leaf_of_row, n_leaves, a, max_bins, weight)
         })
         .collect();
     let subs = subs?;
@@ -1238,6 +1233,7 @@ mod tests {
     #[test]
     fn quantized_histogram_is_thread_count_independent() {
         let (x, gh, rows, leaf_of_row) = fixture();
+        let qgh = quantize_grad_hess(&gh, 99, 4).unwrap();
         let build = |threads: usize| -> Hist {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -1246,12 +1242,11 @@ mod tests {
             pool.install(|| {
                 build_quantized_histogram(
                     &x,
-                    &gh,
+                    &qgh,
                     &rows,
                     &leaf_of_row,
                     4,
                     &[0, 1],
-                    QuantizeContext { seed: 99, round: 4 },
                     &vec![1.0_f32; gh.g.len()],
                 )
                 .unwrap()

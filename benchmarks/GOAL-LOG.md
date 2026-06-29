@@ -449,3 +449,35 @@ sigmoid), Poisson (shares `exp(F)`), Tweedie (shares both F-exps); SquaredError 
   **2.72s (−0.35s, −12%)** (init_dev now subsumes step-0 grad_hess; net drops by the shared sigmoid + one
   fewer memory pass), wall 16.3→15.9s. Diamonds (SquaredError, default) neutral, score exact. Generalizes to
   every full-sample log-link fit (Logistic/Poisson/Tweedie — the insurance objectives).
+
+## G5 QHIST track — quantized-integer histograms (the remaining hist_build lever)
+
+### FullF64 accuracy baseline across the suite (2026-06-29, n=400, refine=0, 4 threads)
+The reference the QHIST path must not regress (RMSE-log↓ reg, ROC-AUC↑ clf):
+| dataset | task | full score | full fit s |
+|---|---|---|---|
+| allstate | reg | 0.55744 | 11.7 |
+| particulate | reg | 0.35804 | 15.6 |
+| diamonds | reg | 0.11376 | 0.73 |
+| miami_housing | reg | 0.16140 | 0.44 |
+| amazon_access | clf | 0.85224 | 1.10 |
+| kick | clf | 0.77228 | 1.83 |
+
+### ✅ QHIST speedups (lazy-RNG + quantize-once + integer subtraction) — accuracy-neutral, NOT yet faster than FullF64
+The existing `QuantizedI32` path was 1.5–2.6× SLOWER than FullF64 (and accuracy-neutral — the i32 scale
+`i32::MAX·0.5/max|g|` is fine enough that split selection barely moves: Δacc ≤ 0.01% on every dataset). Three
+fixes, all preserving the quantized path's existing determinism + accuracy:
+- **lazy RNG**: `stochastic_round` computed a `pb_seed` hash per row but only USES it at an exact tie
+  (`frac==0.5`); defer the hash to that branch — bit-identical, skips the per-row hash on ~all rows.
+- **quantize once per tree**: `build_quantized_histogram` re-quantized the (tree-constant) `gh` on EVERY level
+  (3×/tree); hoist `quantize_grad_hess` above the level loop — bit-identical, 3×→1×.
+- **integer histogram subtraction**: subtraction was gated to FullF64; wire it for QuantizedI32 too (build the
+  smaller children via quantized accumulation, derive the larger by subtracting the dequantized parent) so QHIST
+  gets the same ~half-rows saving at levels 1+2. Pinned by `quantized_subtraction_reproduces_full_build_tree`.
+- **Measured (n=400, refine=0):** QHIST speedup vs FullF64 went **0.39–0.66× → 0.66–0.86×** (allstate 0.41→0.78,
+  diamonds 0.40→0.66, kick 0.39→0.74, miami 0.57→0.80, amazon 0.61→0.76, particulate 0.66→0.86). Accuracy still
+  neutral (Δacc ≤ 0.01%). FullF64 scores byte-unchanged (the default path is untouched). 234 core + 20 py green.
+- **Still slower than FullF64**, because FullF64 already has the AoS cache-packed accumulator (WIN #8) + unit-weight
+  fast path, while the quantized accumulator is SoA (4 separate arrays) and pays a quantize + dequantize pass. NEXT:
+  AoS-pack the quantized accumulator (apply WIN #8 to the i64 path) to close the per-row-scatter gap; the real 2×
+  LightGBM win needs NARROW-integer (i16) histograms (more cells/cache-line + SIMD) — a bigger rewrite.
