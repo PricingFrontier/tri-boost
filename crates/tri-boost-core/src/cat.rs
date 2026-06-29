@@ -215,6 +215,23 @@ impl CatEncoder {
             .map_or(self.base, |level| level.encoding)
     }
 
+    /// Build a `label → encoding` lookup map (each level's own label AND its `members`) for batch
+    /// serve-time encoding — O(1) per label vs [`encode_label`]'s O(#levels) linear scan. Labels and
+    /// members are disjoint across levels, so `map.get(label)` returns exactly what `encode_label`'s
+    /// `find` would; unseen labels still fall back to [`CatEncoder::base`] at the call site. The map
+    /// is a local lookup (never iterated for output order, never serialized).
+    #[must_use]
+    pub fn encoding_map(&self) -> std::collections::HashMap<&str, f32> {
+        let mut map = std::collections::HashMap::with_capacity(self.levels.len());
+        for level in &self.levels {
+            map.insert(level.label.as_str(), level.encoding);
+            for member in &level.members {
+                map.insert(member.as_str(), level.encoding);
+            }
+        }
+        map
+    }
+
     /// Reconstruct the ordinal Fisher [`BorderGrid`] for this encoder.
     ///
     /// The grid is derived from the stored level encodings and their frozen bin ids,

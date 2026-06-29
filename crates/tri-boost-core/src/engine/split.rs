@@ -408,16 +408,16 @@ pub(crate) fn best_level_split(
         }
 
         // Per-leaf totals (all bins) and the missing-bin (bin 0) mass.
-        let mut total_g = vec![0.0_f64; nl];
-        let mut total_h = vec![0.0_f64; nl];
-        let mut miss_g = vec![0.0_f64; nl];
-        let mut miss_h = vec![0.0_f64; nl];
+        let mut total_g = smallvec::SmallVec::<[f64; 4]>::from_elem(0.0_f64, nl);
+        let mut total_h = smallvec::SmallVec::<[f64; 4]>::from_elem(0.0_f64, nl);
+        let mut miss_g = smallvec::SmallVec::<[f64; 4]>::from_elem(0.0_f64, nl);
+        let mut miss_h = smallvec::SmallVec::<[f64; 4]>::from_elem(0.0_f64, nl);
         // Per-leaf count/Σw totals + missing mass for the credibility floor (only filled
         // when a floor can bind, so the inert path keeps its exact arithmetic).
-        let mut total_c = vec![0u64; nl];
-        let mut total_w = vec![0.0_f64; nl];
-        let mut miss_c = vec![0u64; nl];
-        let mut miss_w = vec![0.0_f64; nl];
+        let mut total_c = smallvec::SmallVec::<[u64; 4]>::from_elem(0u64, nl);
+        let mut total_w = smallvec::SmallVec::<[f64; 4]>::from_elem(0.0_f64, nl);
+        let mut miss_c = smallvec::SmallVec::<[u64; 4]>::from_elem(0u64, nl);
+        let mut miss_w = smallvec::SmallVec::<[f64; 4]>::from_elem(0.0_f64, nl);
         for leaf in 0..nl {
             let mut tg = 0.0_f64;
             let mut th = 0.0_f64;
@@ -467,10 +467,10 @@ pub(crate) fn best_level_split(
             .sum();
 
         // Prefix the data bins 1..=v as v advances; evaluate both missing directions.
-        let mut data_l_g = vec![0.0_f64; nl];
-        let mut data_l_h = vec![0.0_f64; nl];
-        let mut data_l_c = vec![0u64; nl];
-        let mut data_l_w = vec![0.0_f64; nl];
+        let mut data_l_g = smallvec::SmallVec::<[f64; 4]>::from_elem(0.0_f64, nl);
+        let mut data_l_h = smallvec::SmallVec::<[f64; 4]>::from_elem(0.0_f64, nl);
+        let mut data_l_c = smallvec::SmallVec::<[u64; 4]>::from_elem(0u64, nl);
+        let mut data_l_w = smallvec::SmallVec::<[f64; 4]>::from_elem(0.0_f64, nl);
         for v in 1..ndb {
             for leaf in 0..nl {
                 let o = hist

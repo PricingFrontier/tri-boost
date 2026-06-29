@@ -253,10 +253,16 @@ pub fn bin_train_columns(
             )?;
             let grid = encoder.border_grid()?;
             let train_bins = bin_values(&train_encoded, &grid)?;
+            let serve_map = encoder.encoding_map();
             let serve_encoded: Vec<f32> = col
                 .levels
                 .iter()
-                .map(|level| encoder.encode_label(level))
+                .map(|level| {
+                    serve_map
+                        .get(level.as_str())
+                        .copied()
+                        .unwrap_or(encoder.base)
+                })
                 .collect();
             let serve_bins = bin_values(&serve_encoded, &grid)?;
             Ok((encoder, grid, train_bins, serve_bins))
@@ -360,9 +366,15 @@ pub fn bin_serve_columns(
                     });
                 }
                 let encoder = cat_encoders.get(encoding, prov.raw)?;
+                let serve_map = encoder.encoding_map();
                 let encoded: Vec<f32> = levels
                     .iter()
-                    .map(|level| encoder.encode_label(level))
+                    .map(|level| {
+                        serve_map
+                            .get(level.as_str())
+                            .copied()
+                            .unwrap_or(encoder.base)
+                    })
                     .collect();
                 data.push(bin_values(&encoded, grid)?);
             }

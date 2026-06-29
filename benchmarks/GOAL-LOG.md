@@ -607,3 +607,25 @@ by (encoding, label) so the build order is irrelevant; rare-bucket members come 
   amazon 0.85224, kick 0.77228). 234 core + 20 py green; clippy + fmt + no-hashmap-serialized gate green.
 - Remaining cat binning cost (the OOF compute + the serve `encode_label` loop) is smaller; serve is a separate O(n·d)
   loop (bin.rs) a lookup-map would fix — minor, deferred.
+
+### ✅ Final byte-identical sweeps — serve lookup map + stack split buffers
+Two more byte-identical trims closing the bottleneck pass:
+- **Serve `encode_label` lookup map.** Serve-time re-encoding (`bin_train_columns` serve build + `bin_serve_columns`)
+  called `CatEncoder::encode_label` per row — an O(#levels) linear scan over labels+members. New
+  `CatEncoder::encoding_map()` builds a `label→encoding` HashMap once (local, never serialized); the call sites do
+  O(1) lookups with the same `base` fallback. Byte-identical (labels/members disjoint across levels ⇒ `get` returns
+  exactly what `find` did).
+- **Stack-allocated split buffers.** `best_level_split`'s 12 per-leaf `vec![…; nl]` accumulators → `SmallVec<[_;4]>`
+  (`nl = hist.n_leaves ≤ 4` by the depth-3 G0 invariant), so they stay on the stack — no heap alloc per (level, axis).
+  Byte-identical (same values; only the storage moves).
+- **Measured:** allstate binning 2.18 → **2.10s** (serve map), so the full cat-binning pass is **2.61 → 2.10s
+  (−20%)**. Scores byte-identical (allstate 0.55744, amazon 0.85224, diamonds 0.11376). 234 core + 20 py green;
+  clippy + fmt + no-hashmap-serialized gate green.
+
+### ⏸ Axis-saturation histogram gate — NOT shipped (accuracy-neutral, against this batch's byte-identical grain)
+The nested row-chunk parallelism inside `accumulate_axis` is redundant when the outer `axes.par_iter()` already
+saturates the thread pool (wide builds, e.g. allstate's many cat axes); gating it off above a FIXED axis-count floor
+(never `current_num_threads()`, which would break determinism) would cut ~−7% off allstate hist. But it changes the
+per-cell f64 fold order (chunked → sequential) ⇒ ~1e-11 model change ⇒ NOT byte-identical (thread-deterministic, but a
+different model). Every other win this pass is byte-identical; this one is accuracy-neutral, so it is left as an
+available option rather than shipped by default.
