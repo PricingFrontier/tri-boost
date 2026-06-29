@@ -770,3 +770,30 @@ alloc/fill/assemble when no credibility floor binds (stacks with the jagged stri
 verification + subtract-path touch-ups), ⑦ Cow the no-subsample sampled_rows/round_axes clones.
 Parked: ⑧ leaf-refine scratch pool (L effort), ⑨ logistic grad_hess_aggregate (accuracy-neutral, only
 the 0.78s aggregate; the 7.2s logistic backtrack_eval remains the genuinely-hard untouched lever).
+
+## Pass-3 deferred-work exploration (2026-06-29) — measure each before assuming it's small
+
+Prompted by the jagged-stride surprise (a flagged-speculative idea that became the campaign's biggest
+win), explored every deferred pass-3 idea instead of assuming sub-second:
+
+- ✅ **⑤ always-fuse init_dev** — SHIPPED. Zero on the full-sample profiled config (already fused) but
+  REAL on the validation/early-stop config the production harness uses: A/B at validation_fraction=0.1
+  gave refine.grad_hess 1.48->1.09s (-26%), leaf_refine 6.29->5.88s (-7%, ~0.4s), byte-identical
+  (kick val score 0.776137 unchanged), and removes the fuse_first gate (simpler). The "more meaningful
+  than expected" find — meaningful exactly where the profiler didn't look.
+- ❌ **⑨ logistic grad_hess_aggregate** — NOT viable byte-identical: Logistic::grad_hess uses
+  fill_grad_hess_parallel (parallel), so a sequential fused version (the SE-① pattern) would serialize
+  the compute-bound sigmoid and regress. The team's parallel version is only accuracy-neutral. (The SE
+  ① won precisely because SquaredError::grad_hess is sequential — no parallelism to lose.) Set aside.
+- ❌ **⑥ skip wsum (dead when !check_cred)** — PROBED ~0. Confirmed benchmark has no credibility floor
+  (defaults all-zero => check_cred=false, score 0.55744 with wsum skipped), but skipping the unit-weight
+  wsum=count pass left allstate suite hist 7.31s vs 7.06s (no change). Latency-hidden, especially
+  post-jagged (the cells are already small). Bounded dead-work, not a hidden lever.
+- ⏸ **③ dead fit_raw clone / ④ gate Nesterov alphas / ⑦ Cow no-subsample clones** — all in the ~6.6s
+  unprofiled boosting-loop overhead; bandwidth math + that band's size put each at sub-0.2s, and ③ needs
+  a borrow-checker/AGBM/DART-aware restructure, ⑦ an MVS/colsample-aware one. Confirmed sub-second
+  byte-identical code-hygiene cleanups — available, not worth the restructure risk for the gain.
+
+**Lesson reinforced:** the jagged stride was a one-off STRUCTURAL (cache-locality) surprise; the rest of
+the deferred set is bounded linear dead-work that measures as predicted. But ⑤ shows it's still worth
+MEASURING each at the config where it actually fires (⑤ was invisible on the profiler's full-sample run).
