@@ -122,9 +122,10 @@ where
     F: Fn(f32, f32, f32) -> (f32, f32) + Sync,
 {
     let n = y.len();
-    out.g.clear();
+    // No `clear()`: the kernel below overwrites all `n` entries, so resizing to `n` is a no-op when
+    // `out` is reused at the same length (the common case across boosting rounds) — this skips a
+    // redundant per-call zero-fill. Byte-identical (every element is written before it is read).
     out.g.resize(n, 0.0);
-    out.h.clear();
     out.h.resize(n, 0.0);
     let body = |base: usize, gc: &mut [f32], hc: &mut [f32], yc: &[f32], rc: &[f32], wc: &[f32]| {
         for (k, ((gi, hi), ((&yi, &fi), &wi))) in gc
@@ -232,9 +233,10 @@ where
     F: Fn(usize, f32, f32, f32) -> Result<(f32, f32, f64, f64), PbError> + Sync,
 {
     let n = y.len();
-    out.g.clear();
+    // No `clear()`: the kernel below overwrites all `n` entries, so resizing to `n` is a no-op when
+    // `out` is reused at the same length (the common case across boosting rounds) — this skips a
+    // redundant per-call zero-fill. Byte-identical (every element is written before it is read).
     out.g.resize(n, 0.0);
-    out.h.clear();
     out.h.resize(n, 0.0);
     let body = |base: usize,
                 gc: &mut [f32],
@@ -512,9 +514,9 @@ impl Loss for SquaredError {
                 ),
             });
         }
-        out.g.clear();
+        // No `clear()`: the loop overwrites all `n` entries, so resizing to `n` is a no-op when
+        // `out` is reused at the same length — skips a redundant per-call zero-fill (byte-identical).
         out.g.resize(n, 0.0);
-        out.h.clear();
         out.h.resize(n, 0.0);
         let floor = self.hessian_floor();
         // izip! ⇒ no indexing in the hot loop (§05 hot-loop policy). g = w(F−y);
