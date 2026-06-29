@@ -946,9 +946,16 @@ fn build_subtracted_level(
     // Build the smaller children with the active precision; the larger are derived by subtraction
     // below (so neither path visits the larger children's rows).
     let mut hist = match qgh {
-        Some(q) => {
-            build_quantized_histogram(x, q, &small_rows, leaf_of_row, n_leaves, admissible, weight)?
-        }
+        Some(q) => build_quantized_histogram(
+            x,
+            q,
+            &small_rows,
+            leaf_of_row,
+            n_leaves,
+            admissible,
+            weight,
+            unit_weight,
+        )?,
         None => build_histogram(
             x,
             gh,
@@ -1089,6 +1096,7 @@ pub(crate) fn grow_oblivious_tree_with_leaf_map(
                         n_leaves,
                         &admissible,
                         weight,
+                        cfg.unit_weight,
                     ),
                 }
             })?;

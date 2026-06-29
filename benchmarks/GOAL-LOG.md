@@ -504,3 +504,22 @@ by measurement, the two remaining FullF64 levers: refine.aggregate parallelizati
 data-major histogram (cache-buffer regression). `hist_build` (the 57–74% bottleneck) stays feature-major + AoS +
 unit-weight + L1/L2 subtraction — at its frontier. The only un-banked speed lever is QHIST→i16 narrow-int
 histograms (changes outputs; a substantial rewrite), deferred. The FullF64 engine is at its byte-identical floor.
+
+### ✅ QHIST AoS accumulator + unit-weight skip (root-cause fix) — accuracy-neutral; ❌ i16 narrow-int rejected
+A 3-angle design workflow found the REAL reason QHIST lost: `accumulate_axis_quantized` used a SoA accumulator
+(`g/h/wsum/count` as 4 separate arrays = **4 cache-line writes per row**) with NO unit-weight fast path, while
+FullF64 is AoS (`GhcCell`, 1 cache line) + skips `wsum` under unit weights. The i64 width gave zero density benefit.
+- **Fix (kept):** AoS-pack the quantized hot cell into one `QHotCell{g:i64,h:i64,count:u32}` (mirrors `GhcCell`, one
+  cache-line scatter), add the unit-weight `wsum`-skip, reduce per-chunk hot cells into the existing SoA i64
+  `AxisQHist`. i32 quantization unchanged ⇒ **accuracy-neutral** (Δacc ≤ 0.01% on every suite dataset; determinism
+  preserved — integer adds are associative). Measured QHIST speedup vs FullF64: **0.78→0.91 allstate, 0.74→0.82 kick,
+  0.76→0.83 amazon, 0.66→0.68 diamonds** (suite n=400). 234 core + 20 py green.
+- **i16 narrow-int (rejected):** also built it (scale to i16 range → dense 12-byte i32 cells, 2× denser than FullF64).
+  Measured: NO extra speed over the i64 AoS (kick i16 0.74 vs i64 0.82 — i16 was actually SLOWER) because the per-axis
+  histogram is already L1-resident, so denser cells don't help the scatter; AND i16's coarser quantization REGRESSED
+  miami −0.23% (exceeds the accuracy gate). Reverted i16 → i32. The density hypothesis is refuted.
+- **Conclusion — QHIST cannot beat FullF64 here.** Even at its best (allstate 0.91×, i.e. 1.1× slower) the quantized
+  path still trails: the per-tree `quantize_grad_hess` pass is pure overhead FullF64 never pays, and the histogram
+  scatter is already L1-resident so neither integer width nor density helps. In safe Rust (`forbid(unsafe)`, no
+  hand-SIMD) the LightGBM 2× is not reachable on this workload. QHIST stays a non-default, accuracy-neutral path —
+  now ~as close to FullF64 as it gets. Speed campaign is at its floor on BOTH precisions.

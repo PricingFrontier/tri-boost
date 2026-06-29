@@ -206,6 +206,10 @@ pub fn quantize_grad_hess(gh: &GradHess, seed: u64, round: u32) -> Result<QuantG
 }
 
 fn scale_for(max_abs: f64) -> Result<f32, PbError> {
+    // Map |max| to half the i32 range (|q| <= i32::MAX/2 ≈ 1.07e9). Fine-grained quantization keeps
+    // QHIST accuracy-neutral (Δacc <= 0.01% on the suite; the coarser i16 range was measured to cost
+    // miami −0.23%). The per-row q sums accumulate into i64 AoS cells (see `QHotCell`), which never
+    // overflow for realistic n.
     let scale = if max_abs > 0.0 {
         (f64::from(i32::MAX) * 0.5) / max_abs
     } else {
@@ -263,6 +267,7 @@ pub(crate) fn build_quantized_histogram(
     n_leaves: usize,
     axes: &[u32],
     weight: &[f32],
+    unit_weight: bool,
 ) -> Result<Hist, PbError> {
     let mut max_bins = 0usize;
     for &a in axes {
@@ -276,7 +281,17 @@ pub(crate) fn build_quantized_histogram(
     let subs: Result<Vec<AxisQHist>, PbError> = axes
         .par_iter()
         .map(|&a| {
-            accumulate_axis_quantized(x, qgh, rows, leaf_of_row, n_leaves, a, max_bins, weight)
+            accumulate_axis_quantized(
+                x,
+                qgh,
+                rows,
+                leaf_of_row,
+                n_leaves,
+                a,
+                max_bins,
+                weight,
+                unit_weight,
+            )
         })
         .collect();
     let subs = subs?;
@@ -349,6 +364,36 @@ impl AxisQHist {
             h: Hist::try_zeroed_vec(size, "axis quant histogram h")?,
             wsum: Hist::try_zeroed_vec(size, "axis quant histogram wsum")?,
             count: Hist::try_zeroed_vec(size, "axis quant histogram count")?,
+        })
+    }
+}
+
+/// AoS hot cell for the quantized per-row scatter: the quantized `g`/`h` sums in `i64`, packed with
+/// `count` into ONE cell (mirrors the FullF64 `GhcCell`), so the per-row scatter is a single
+/// bounds-checked write to one cache line — vs the previous SoA `AxisQHist` that touched 4 separate
+/// arrays (4 cache lines) per row, the root cause of QHIST's slowness. `i64` holds any realistic
+/// `Σ q` (n·i32::MAX/2 ≪ i64::MAX), so the plain `+=` never overflows.
+#[derive(Clone, Copy, Default)]
+struct QHotCell {
+    g: i64,
+    h: i64,
+    count: u32,
+}
+
+/// One axis's per-chunk quantized sub-histogram (stride `max_bins`): `g`/`h`/`count` packed into one
+/// [`QHotCell`] per cell; `wsum` stays a separate f64 array, touched only for non-unit weights
+/// (mirrors [`AxisHist`]).
+struct AxisQHistHot {
+    ghc: Vec<QHotCell>,
+    wsum: Vec<f64>,
+}
+
+impl AxisQHistHot {
+    fn try_zeros(n_leaves: usize, max_bins: usize) -> Result<Self, PbError> {
+        let size = Hist::checked_cell_count(n_leaves, 1, max_bins)?;
+        Ok(Self {
+            ghc: Hist::try_zeroed_vec(size, "axis quant hot ghc")?,
+            wsum: Hist::try_zeroed_vec(size, "axis quant hot wsum")?,
         })
     }
 }
@@ -499,9 +544,13 @@ fn accumulate_axis_quantized(
     axis: u32,
     max_bins: usize,
     weight: &[f32],
+    unit_weight: bool,
 ) -> Result<AxisQHist, PbError> {
+    // The dense AoS hot path accumulates into i64 cells (see `QHotCell`) then reduces per-chunk into
+    // this SoA `AxisQHist` via `add_qhot_into_qhist` — the fix for the old 4-cache-line SoA scatter.
+    let mut out = AxisQHist::try_zeros(n_leaves, max_bins)?;
     if rows.len() < ROW_PAR_MIN_ROWS {
-        return accumulate_axis_quantized_sequential(
+        let hot = accumulate_axis_quantized_sequential(
             x,
             qgh,
             rows,
@@ -510,9 +559,12 @@ fn accumulate_axis_quantized(
             axis,
             max_bins,
             weight,
-        );
+            unit_weight,
+        )?;
+        add_qhot_into_qhist(&mut out, &hot)?;
+        return Ok(out);
     }
-    let chunks: Result<Vec<AxisQHist>, PbError> = rows
+    let chunks: Result<Vec<AxisQHistHot>, PbError> = rows
         .par_chunks(ROW_PAR_CHUNK_ROWS)
         .map(|chunk| {
             accumulate_axis_quantized_sequential(
@@ -524,13 +576,13 @@ fn accumulate_axis_quantized(
                 axis,
                 max_bins,
                 weight,
+                unit_weight,
             )
         })
         .collect();
     let chunks = chunks?;
-    let mut out = AxisQHist::try_zeros(n_leaves, max_bins)?;
     for chunk in &chunks {
-        add_axis_qhist(&mut out, chunk)?;
+        add_qhot_into_qhist(&mut out, chunk)?;
     }
     Ok(out)
 }
@@ -545,12 +597,13 @@ fn accumulate_axis_quantized_sequential(
     axis: u32,
     max_bins: usize,
     weight: &[f32],
-) -> Result<AxisQHist, PbError> {
+    unit_weight: bool,
+) -> Result<AxisQHistHot, PbError> {
     let col = x
         .data
         .get(axis as usize)
         .ok_or_else(oob("axis has no column"))?;
-    let mut out = AxisQHist::try_zeros(n_leaves, max_bins)?;
+    let mut out = AxisQHistHot::try_zeros(n_leaves, max_bins)?;
     for &r in rows {
         let ru = r as usize;
         let bin = usize::from(*col.get(ru).ok_or_else(oob("quant row out of column"))?);
@@ -570,47 +623,48 @@ fn accumulate_axis_quantized_sequential(
             max_bins,
             "quant axis histogram row offset overflow",
         )?;
-        *out.g.get_mut(idx).ok_or_else(oob("quant g cell"))? +=
-            i64::from(*qgh.g_q.get(ru).ok_or_else(oob("qgh.g"))?);
-        *out.h.get_mut(idx).ok_or_else(oob("quant h cell"))? +=
-            i64::from(*qgh.h_q.get(ru).ok_or_else(oob("qgh.h"))?);
-        *out.wsum.get_mut(idx).ok_or_else(oob("quant wsum cell"))? +=
-            f64::from(*weight.get(ru).ok_or_else(oob("quant weight"))?);
-        let c = out.count.get_mut(idx).ok_or_else(oob("quant count cell"))?;
-        *c = c
+        // One bounds-checked write to the packed g/h/count cell (one cache line); the i64 sums hold
+        // any realistic Σ q without overflow.
+        let cell = out.ghc.get_mut(idx).ok_or_else(oob("quant ghc cell"))?;
+        cell.g += i64::from(*qgh.g_q.get(ru).ok_or_else(oob("qgh.g"))?);
+        cell.h += i64::from(*qgh.h_q.get(ru).ok_or_else(oob("qgh.h"))?);
+        cell.count = cell
+            .count
             .checked_add(1)
             .ok_or_else(oob("quant bin count overflow"))?;
+        if !unit_weight {
+            *out.wsum.get_mut(idx).ok_or_else(oob("quant wsum cell"))? +=
+                f64::from(*weight.get(ru).ok_or_else(oob("quant weight"))?);
+        }
+    }
+    if unit_weight {
+        // wsum == count for unit weights (Σ 1.0 == count, exact in f64); the per-chunk reduction then
+        // sums per-chunk counts, matching the per-row Σw exactly (cf. the FullF64 path).
+        for (w, c) in out.wsum.iter_mut().zip(&out.ghc) {
+            *w = f64::from(c.count);
+        }
     }
     Ok(out)
 }
 
-fn add_axis_qhist(dst: &mut AxisQHist, src: &AxisQHist) -> Result<(), PbError> {
-    if dst.g.len() != src.g.len()
-        || dst.h.len() != src.h.len()
-        || dst.wsum.len() != src.wsum.len()
-        || dst.count.len() != src.count.len()
-    {
+/// Reduce a per-chunk AoS hot histogram into the SoA `AxisQHist` accumulator (chunk reduction in
+/// fixed order ⇒ thread-count independent; integer addition is exact + associative).
+fn add_qhot_into_qhist(dst: &mut AxisQHist, src: &AxisQHistHot) -> Result<(), PbError> {
+    if dst.g.len() != src.ghc.len() || dst.wsum.len() != src.wsum.len() {
         return Err(PbError::Internal {
             what: "axis quant histogram chunk shape mismatch".into(),
         });
     }
-    for (d, s) in dst.g.iter_mut().zip(&src.g) {
-        *d = d
-            .checked_add(*s)
-            .ok_or_else(oob("axis quant histogram chunk g overflow"))?;
-    }
-    for (d, s) in dst.h.iter_mut().zip(&src.h) {
-        *d = d
-            .checked_add(*s)
-            .ok_or_else(oob("axis quant histogram chunk h overflow"))?;
+    for (i, cell) in src.ghc.iter().enumerate() {
+        *dst.g.get_mut(i).ok_or_else(oob("qhist g cell"))? += cell.g;
+        *dst.h.get_mut(i).ok_or_else(oob("qhist h cell"))? += cell.h;
+        let c = dst.count.get_mut(i).ok_or_else(oob("qhist count cell"))?;
+        *c = c
+            .checked_add(cell.count)
+            .ok_or_else(oob("axis quant histogram chunk count overflow"))?;
     }
     for (d, s) in dst.wsum.iter_mut().zip(&src.wsum) {
         *d += *s;
-    }
-    for (d, s) in dst.count.iter_mut().zip(&src.count) {
-        *d = d
-            .checked_add(*s)
-            .ok_or_else(oob("axis quant histogram chunk count overflow"))?;
     }
     Ok(())
 }
@@ -1248,6 +1302,7 @@ mod tests {
                     4,
                     &[0, 1],
                     &vec![1.0_f32; gh.g.len()],
+                    false,
                 )
                 .unwrap()
             })
