@@ -481,3 +481,26 @@ fixes, all preserving the quantized path's existing determinism + accuracy:
   fast path, while the quantized accumulator is SoA (4 separate arrays) and pays a quantize + dequantize pass. NEXT:
   AoS-pack the quantized accumulator (apply WIN #8 to the i64 path) to close the per-row-scatter gap; the real 2×
   LightGBM win needs NARROW-integer (i16) histograms (more cells/cache-line + SIMD) — a bigger rewrite.
+
+### ❌ FullF64 data-major histogram (read gh once, scatter to all axes) — MEASURED SLOWER, reverted (2026-06-29)
+`build_histogram` is FEATURE-major (`axes.par_iter()` → each axis re-streams `gh`/`leaf_of_row` over all rows, so
+the gradients are read `n_axes×`). Built the LightGBM-style DATA-major alternative: each row-chunk reads `(g,h,leaf)`
+ONCE and scatters into all axes' bins, chunked by the SAME `ROW_PAR_CHUNK` with chunk-order reduction. Confirmed
+**byte-identical** — swapping the axis/row loop nesting never changes a cell's f64 add order; pinned by
+`data_major_matches_feature_major_bit_for_bit` (large fixture, both weight modes) + suite scores byte-unchanged.
+Gated to `rows >= ROW_PAR_MIN_ROWS` (row-chunk parallelism), feature-major below.
+- **Measured (suite n=400, best-of-2, vs HEAD):** NEUTRAL on diamonds/miami/particulate, but REGRESSED the
+  high-cardinality sets: allstate 11.7→14.7s (**+26%**), kick 1.83→2.13s (**+16%**), amazon ~+7%. Revert restored
+  allstate→11.98, kick→1.81. REVERTED.
+- **Why it lost (hypothesis refuted):** the `gh` re-reads are CHEAP (gh fits L2/L3, so re-streaming is cache-resident,
+  not RAM) — so data-major saves little. Meanwhile its per-chunk MULTI-axis buffer (`n_axes·n_leaves·max_bins`) is LARGE
+  for many-feature datasets and spills cache, so the per-row scattered writes (one cell per axis) miss, where
+  feature-major writes into a small per-axis buffer that stays in L1. No regime wins: small-buffer → neutral,
+  large-buffer → regress. **Feature-major axis-parallel is the right design.**
+
+### FRONTIER (2026-06-29) — FullF64 default path is exhausted for byte-identical/accuracy-neutral speed
+This session banked the leaf-refine eliminations (members #10, update_raw #11, init_dev fusion #12) and rejected,
+by measurement, the two remaining FullF64 levers: refine.aggregate parallelization (memory-bound) and the
+data-major histogram (cache-buffer regression). `hist_build` (the 57–74% bottleneck) stays feature-major + AoS +
+unit-weight + L1/L2 subtraction — at its frontier. The only un-banked speed lever is QHIST→i16 narrow-int
+histograms (changes outputs; a substantial rewrite), deferred. The FullF64 engine is at its byte-identical floor.
