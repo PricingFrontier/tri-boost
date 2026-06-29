@@ -629,3 +629,26 @@ saturates the thread pool (wide builds, e.g. allstate's many cat axes); gating i
 per-cell f64 fold order (chunked → sequential) ⇒ ~1e-11 model change ⇒ NOT byte-identical (thread-deterministic, but a
 different model). Every other win this pass is byte-identical; this one is accuracy-neutral, so it is left as an
 available option rather than shipped by default.
+
+### ✅ Full-suite byte-identity confirmation (2026-06-29, HEAD = 5fb3c28)
+Ran the whole batch end-to-end against the recorded baselines — all 6 datasets at the suite config (n=400, refine=0,
+the canonical `tri_boost_case`) plus diamonds/kick at o3 (n=2000, refine=4, which exercises the SE closed-form
+leaf-refine). Every score reproduces its baseline within ±5e-6 (the 5-decimal recording precision, both signs — ~20×
+below the 1e-4 floor of a real regression):
+
+| dataset | config | baseline | measured |
+|---|---|---|---|
+| allstate | suite | 0.55744 | 0.557437 |
+| particulate | suite | 0.35804 | 0.358044 |
+| diamonds | suite | 0.11376 | 0.113762 |
+| miami_housing | suite | 0.16140 | 0.161405 |
+| amazon_access | suite | 0.85224 | 0.852237 |
+| kick | suite | 0.77228 | 0.772276 |
+| diamonds | o3 | 0.09022 | 0.09022 |
+| kick | o3 | 0.76975 | 0.769749 |
+
+miami landed exactly on the 5e-6 rounding boundary, so it was settled with a full-precision A/B: HEAD and the
+pre-session commit f44d299 ("WIN #9") both give **0.1614045724** — identical to 10 decimals, i.e. the batch left it
+untouched (miami has one categorical, `avno60plus`, so the factorization path was exercised). Confirms the whole G5
+bottleneck pass — categorical factorization, serve map, sub-fixes, memset, degenerate-axis, SmallVec (suite) + SE
+closed-form leaf-refine (o3) — is byte-identical on every dataset.
