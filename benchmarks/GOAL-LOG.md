@@ -565,3 +565,31 @@ the L1-resident scatter + same-cache-line AoS layout, none of the four recovered
 EMPIRICALLY confirms the teardown's verdict: **tri-boost's histogram engine is at its safe-Rust floor.** Further speed
 requires relaxing G0 (off the table — it's the product) or `forbid(unsafe)` for a vetted prefetch/SIMD scatter (a
 policy decision). The higher-value frontier is ACCURACY (G1 mains / amazon categorical), not speed.
+
+## Bottleneck-pass wins (2026-06-29) — a fresh 4-agent timing analysis found real leaf-refine + binning slack
+
+A second timing teardown re-profiled BOTH configs and surfaced two genuine misses (the leaf-refine campaign had only
+removed plumbing; binning was only parallelized across features, never algorithmically fixed).
+
+### ✅ SE closed-form-deviance leaf refinement — BYTE-IDENTICAL, −8 to −26% on the refine config
+SquaredError's half-deviance is EXACTLY the separable 8-D quadratic `D_l(v)=C_l+v·B_l+½v²·H_l`, so the O(rows)
+deviance re-folds (`refine.init_dev` + `refine.backtrack_eval`, the line-search deviance evaluated every trial) collapse
+to an O(8) closed form (`refine_tree_leaves_se_quadratic`, gated on `LossId::SquaredError`). The per-row f32
+`grad_hess`+aggregate that produce the leaf UPDATES are KEPT VERBATIM, and the closed-form value is f32-cast exactly as
+`SquaredError::deviance` ⇒ **byte-identical** model (the leaves, scores, AND early-stop trajectory are unchanged).
+- **Measured (n=4000, refine=4, A/B vs the per-row path):** scores reproduce bit-for-bit on ALL 4 SE datasets at BOTH
+  converged (es=500) and fixed-4000 — diamonds 0.089809, miami 0.132031, allstate 0.540092, particulate 0.338236
+  (converged). Speed: converged **diamonds 20.2→15.9s (−21%), miami 4.8→3.9s (−19%), allstate 62.5→57.4s (−8%),
+  particulate 139.4→106.6s (−24%)**; fixed-4000 diamonds −21%, particulate −26%. Smaller on allstate (binning/hist-
+  dominated, not refine). Log-link is untouched (non-quadratic). 234 core + 20 py green.
+- **❌ Full f64 recurrence (1B) — REJECTED.** Also collapsing the per-step `grad_hess`+aggregate via the exact
+  recurrence `G_l=B_l+H_l·v_l` gives −57% on diamonds o3, BUT the recurrence is f64 while the engine stores gradients
+  in f32 — and that gap, via the EARLY-STOPPING interaction, shifts the stop point and costs real accuracy at
+  convergence (**miami +1.53%**, diamonds +0.19%). It is NOT accuracy-neutral (the f32 vs f64 difference compounds with
+  tree count, amplified by where early stopping fires). The f32 grad must stay ⇒ the per-row `grad_hess` cannot be
+  eliminated byte-identically. So 1A (deviance-only) is the shippable version.
+
+### ❌ borrowable trims also tested this pass: dead grad/hess memset (KEPT, byte-identical), degenerate-axis pre-filter
+(KEPT, byte-identical, benchmark-neutral), count-free hot cell (≈0, reverted), HistogramPool reuse (infeasible under
+determinism), i128 QHIST (≈0). Categorical label factorization (intern labels→int ids, ~−20% allstate binning,
+byte-identical) is the remaining un-built win — next.

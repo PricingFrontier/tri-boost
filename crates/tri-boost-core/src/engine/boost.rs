@@ -2358,6 +2358,29 @@ fn refine_tree_leaves_after_grow(
             }
         }
     })?;
+    // SquaredError's half-deviance is EXACTLY the separable 8-D quadratic `D_l(v) = C_l + v·B_l +
+    // ½·v²·H_l` (`B_l = Σ_{rows∈l} w(base−y)`, `H_l = Σw`, `C_l = ½Σw(base−y)²`, all CONSTANT across
+    // steps). So the multi-step damped-Newton refine + backtrack collapse to O(8) per step — one
+    // O(rows) aggregate of `B_l/H_l/C_l` up front, then the per-step aggregate gradient is the exact
+    // recurrence `G_l = B_l + H_l·v_l` and every trial deviance is the closed form — eliminating the
+    // O(rows) grad_hess / deviance re-folds (`refine.grad_hess`, `refine.backtrack_eval`). Iterates
+    // are the same damped-Newton steps as the per-row path; accuracy-neutral (~1e-11, the summation
+    // groups differently). Only SE is quadratic — log-link keeps the per-row path below.
+    if matches!(loss.objective_tag().loss, crate::loss::LossId::SquaredError) {
+        return refine_tree_leaves_se_quadratic(
+            config,
+            loss,
+            y,
+            weight,
+            base_raw,
+            rows,
+            monotone,
+            tree,
+            grow_cfg,
+            &memberships,
+            n_leaves,
+        );
+    }
     // The line search reads y/weight and the base score ONLY at `rows`, and only the 8 leaf
     // VALUES change per trial. Gather those three into DENSE per-tree buffers ONCE (constant
     // across every step + backtrack), so each trial is a single contiguous fill + the
@@ -2483,6 +2506,167 @@ fn refine_tree_leaves_after_grow(
                 // Reflect the accepted leaves into the full raw at `rows` for the next step's
                 // grad_hess (its only consumer); a scatter only on accept, not per trial.
                 apply_membership_leaves(&mut raw, base_raw, rows, &memberships, &tree.leaves)?;
+                best_deviance = deviance;
+                accepted = true;
+                break;
+            }
+            scale *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Closed-form-DEVIANCE leaf refinement for SquaredError (Identity link). SE's half-deviance is the
+/// separable 8-D quadratic `D_l(v) = C_l + v·B_l + ½·v²·H_l` (`B_l = Σ_{rows∈l} w·(base−y)`,
+/// `H_l = Σw`, `C_l = ½Σw·(base−y)²`, all CONSTANT), so the O(rows) deviance re-folds collapse to
+/// O(8). The per-row `grad_hess` + aggregate that produce the leaf UPDATES are KEPT VERBATIM (same
+/// f32 path as the generic `refine_tree_leaves_after_grow`), so the leaves — hence the model, scores
+/// and early-stop trajectory — are byte-identical; only `refine.init_dev`/`refine.backtrack_eval`
+/// turn from an O(rows) fold into the O(8) closed form. The closed-form value is f32-cast EXACTLY as
+/// `Loss::deviance`, so the accept comparison matches the per-row deviance save for a vanishingly
+/// rare f32-boundary straddle. Deterministic: the coefficient fold is one fixed-order sequential pass.
+#[allow(clippy::too_many_arguments)]
+fn refine_tree_leaves_se_quadratic(
+    config: &Config,
+    loss: &dyn crate::loss::Loss,
+    y: &[f32],
+    weight: &[f32],
+    base_raw: &[f32],
+    rows: &[u32],
+    monotone: Option<&[Option<MonoSign>]>,
+    tree: &mut ObliviousTree,
+    grow_cfg: &GrowConfig<'_>,
+    memberships: &[u8],
+    n_leaves: usize,
+) -> Result<(), PbError> {
+    // Per-leaf quadratic coefficients of SE's half-deviance, from the FIXED base score (one pass).
+    let mut coef_b = [0.0_f64; 8];
+    let mut coef_h = [0.0_f64; 8];
+    let mut coef_c = [0.0_f64; 8];
+    for (&row, &leaf_u8) in rows.iter().zip(memberships) {
+        let ru = row as usize;
+        let leaf = usize::from(leaf_u8);
+        let wi = f64::from(*weight.get(ru).ok_or_else(|| PbError::Internal {
+            what: "se refine weight row escaped".into(),
+        })?);
+        let ri = f64::from(*base_raw.get(ru).ok_or_else(|| PbError::Internal {
+            what: "se refine base row escaped".into(),
+        })?) - f64::from(*y.get(ru).ok_or_else(|| PbError::Internal {
+            what: "se refine y row escaped".into(),
+        })?);
+        *coef_b.get_mut(leaf).ok_or_else(|| PbError::Internal {
+            what: "se refine B leaf escaped".into(),
+        })? += wi * ri;
+        *coef_h.get_mut(leaf).ok_or_else(|| PbError::Internal {
+            what: "se refine H leaf escaped".into(),
+        })? += wi;
+        *coef_c.get_mut(leaf).ok_or_else(|| PbError::Internal {
+            what: "se refine C leaf escaped".into(),
+        })? += 0.5 * wi * ri * ri;
+    }
+    // Closed-form half-deviance `Σ_l (C_l + v_l·B_l + ½·v_l²·H_l)`, f32-cast EXACTLY as
+    // `SquaredError::deviance` (`finish_deviance(0.5·acc)`) then widened — so the accept comparison
+    // matches the per-row deviance bit-for-bit save for a rare f32-boundary straddle.
+    let deviance_of = |leaves: &[f32; 8]| -> f64 {
+        let mut d = 0.0_f64;
+        for leaf in 0..n_leaves {
+            let v = f64::from(leaves.get(leaf).copied().unwrap_or(0.0));
+            d += coef_c.get(leaf).copied().unwrap_or(0.0)
+                + v * coef_b.get(leaf).copied().unwrap_or(0.0)
+                + 0.5 * v * v * coef_h.get(leaf).copied().unwrap_or(0.0);
+        }
+        f64::from(d as f32)
+    };
+    // `raw` kept valid at `rows` for the per-step grad_hess (leaf updates come from the SAME f32
+    // aggregate the generic path uses ⇒ byte-identical leaves).
+    let mut raw = base_raw.to_vec();
+    apply_membership_leaves(&mut raw, base_raw, rows, memberships, &tree.leaves)?;
+    let mut gh = GradHess::default();
+    let mut best_deviance = prof::timed("refine.init_dev", || {
+        Ok::<f64, PbError>(deviance_of(&tree.leaves))
+    })?;
+
+    for _ in 0..config.leaf_refine_steps {
+        // KEEP the per-row f32 grad_hess + aggregate VERBATIM (same as the generic path) ⇒ the leaf
+        // updates — and the whole model — are byte-identical. Only the deviance below is closed-form.
+        prof::timed("refine.grad_hess", || {
+            loss.grad_hess(y, &raw, weight, &mut gh)
+        })?;
+        let mut g = [0.0_f64; 8];
+        let mut h = [0.0_f64; 8];
+        prof::timed("refine.aggregate", || -> Result<(), PbError> {
+            for (&row, &leaf_u8) in rows.iter().zip(memberships) {
+                let ru = row as usize;
+                let leaf = usize::from(leaf_u8);
+                *g.get_mut(leaf).ok_or_else(|| PbError::Internal {
+                    what: "se refine g leaf escaped".into(),
+                })? += f64::from(*gh.g.get(ru).ok_or_else(|| PbError::Internal {
+                    what: "se refine gradient row escaped".into(),
+                })?);
+                *h.get_mut(leaf).ok_or_else(|| PbError::Internal {
+                    what: "se refine h leaf escaped".into(),
+                })? += f64::from(*gh.h.get(ru).ok_or_else(|| PbError::Internal {
+                    what: "se refine hessian row escaped".into(),
+                })?);
+            }
+            Ok(())
+        })?;
+        let mut delta = [0.0_f32; 8];
+        let mut any_delta = false;
+        for leaf in 0..n_leaves {
+            let step = incremental_leaf_delta(
+                *g.get(leaf).ok_or_else(|| PbError::Internal {
+                    what: "se refine g lookup escaped".into(),
+                })?,
+                *h.get(leaf).ok_or_else(|| PbError::Internal {
+                    what: "se refine h lookup escaped".into(),
+                })?,
+                grow_cfg.lambda,
+                grow_cfg.l1_leaf,
+                grow_cfg.max_delta_step,
+                grow_cfg.lr,
+            )?;
+            if step.abs() > 1.0e-7 {
+                any_delta = true;
+            }
+            *delta.get_mut(leaf).ok_or_else(|| PbError::Internal {
+                what: "se refine delta escaped".into(),
+            })? = step;
+        }
+        if !any_delta {
+            break;
+        }
+
+        let mut accepted = false;
+        let mut scale = 1.0_f32;
+        for _ in 0..config.leaf_refine_backtracks {
+            let mut trial_leaves = tree.leaves;
+            for (leaf_value, delta_value) in trial_leaves.iter_mut().zip(delta.iter()) {
+                let value = f64::from(*leaf_value) + f64::from(scale * *delta_value);
+                if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX)
+                {
+                    return Err(PbError::InvalidInput {
+                        what: "leaf refinement value is not finite/representable".into(),
+                    });
+                }
+                *leaf_value = value as f32;
+            }
+            clamp_monotone(
+                &mut trial_leaves,
+                &tree.splits,
+                usize::from(tree.depth),
+                monotone,
+            )?;
+            let deviance = prof::timed("refine.backtrack_eval", || {
+                Ok::<f64, PbError>(deviance_of(&trial_leaves))
+            })?;
+            if deviance < best_deviance {
+                tree.leaves = trial_leaves;
+                // Reflect the accepted leaves into `raw` at `rows` for the next step's grad_hess.
+                apply_membership_leaves(&mut raw, base_raw, rows, memberships, &tree.leaves)?;
                 best_deviance = deviance;
                 accepted = true;
                 break;
