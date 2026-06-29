@@ -748,3 +748,25 @@ landed where the micro-ops didn't.
   allstate suite 8.0->7.06s (-12%); diamonds o3 3.39->2.25s (-34%, wall 8.1->5.6 -31%); kick o3
   8.51->4.96s (-42%). Helps EVERY dataset (any axis with n_bins < max_bins), biggest where low-card
   axes dominate. The single largest training speedup of the campaign.
+
+### ✅ Reuse the round-invariant SquaredError hessian (boosting grad_hess) — BYTE-IDENTICAL, -28 to -43%
+For SquaredError `h = w·max(floor)` is raw-independent and weights are round-invariant, so `gh.h` is
+bit-identical every boosting round. New `Loss::hessian_depends_on_raw()` (default true; SE false) +
+`Loss::fill_grad_reusing_hessian()` (default = full grad_hess; SE refills ONLY `gh.g`). The boosting
+loop uses the reuse path after round 0 for round-invariant-hessian losses; Logistic/Poisson/Gamma/
+Tweedie keep the full pass. Byte-identical (g computed exactly as grad_hess; h left as round 0 set it).
+Measured: boosting grad_hess allstate o3 1.67->1.20s (-28%), diamonds o3 0.61->0.35s (-43%). SE-only.
+
+### Pass-3 net + remaining (identified, not yet built)
+**TWO real wins, both byte-identical and both BIGGER than the team estimated:** the jagged bin stride
+(-23 to -42% hist_build, the campaign's largest) and the SE hessian reuse (-28 to -43% boosting
+grad_hess). Combined, allstate o3 wall ~67->~52s, diamonds o3 ~8.1->~5.6s, kick o3 ~24.8->~16s — all
+byte-identical (all 6 suite + o3 spot-checks exact). The "histogram floor" verdict from pass 2 was
+WRONG (it was cache-bound, not count-bound).
+Remaining ranked-but-unbuilt (all sub-second / byte-identical, deferred): ③ kill the dead common-path
+`fit_raw = raw.clone()` (~0.1-0.2s, tangled with AGBM/DART branches), ④ gate Nesterov alpha bookkeeping
+behind agbm.is_some(), ⑤ always-fuse init_dev (helps the validation/early-stop path only), ⑥ skip wsum
+alloc/fill/assemble when no credibility floor binds (stacks with the jagged stride; needs check_cred
+verification + subtract-path touch-ups), ⑦ Cow the no-subsample sampled_rows/round_axes clones.
+Parked: ⑧ leaf-refine scratch pool (L effort), ⑨ logistic grad_hess_aggregate (accuracy-neutral, only
+the 0.78s aggregate; the 7.2s logistic backtrack_eval remains the genuinely-hard untouched lever).
