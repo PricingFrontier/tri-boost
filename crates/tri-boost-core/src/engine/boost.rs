@@ -2389,25 +2389,22 @@ fn refine_tree_leaves_after_grow(
     let y_sub = gather_rows(y, rows)?;
     let w_sub = gather_rows(weight, rows)?;
     let base_sub = gather_rows(base_raw, rows)?;
-    // Full raw kept valid at `rows` for the per-step grad_hess pass (grad_hess reads the whole
-    // slice; entries outside `rows` keep base_raw and their g/h are never aggregated). Derived
-    // from the memberships just computed — no SECOND tree walk.
-    let mut raw = base_raw.to_vec();
-    apply_membership_leaves(&mut raw, base_raw, rows, &memberships, &tree.leaves)?;
-    // Reused dense subset-raw scratch (no per-trial alloc). Bit-identical to gathering
-    // `apply_membership_leaves`'s output over `rows`, so `deviance` matches the old path exactly.
+    // Reused dense subset-raw scratch (no per-trial alloc) — the SINGLE source of truth for the raw
+    // at `rows`. The backtrack refills it each trial; on accept it already holds the accepted leaves'
+    // raw, so the next step's grad_hess reads it directly. grad_hess is pointwise, so evaluating it
+    // over (y_sub, trial_raw_sub, w_sub) gives bit-identical (g,h) to the old full-length grad_hess
+    // read at `rows` — and is O(rows) not O(n), with no full `raw` clone and no per-accept scatter.
     let mut trial_raw_sub = base_sub.clone();
     fill_leaf_raw_contiguous(&mut trial_raw_sub, &base_sub, &memberships, &tree.leaves)?;
     let mut gh = GradHess::default();
-    // When grow saw EVERY row (`rows == 0..n`, no validation split), the initial deviance over the
-    // gathered subset is bit-identical to the deviance over the FULL `(y, raw, weight)` (same rows,
-    // same values, same chunked fold) — so fuse it with step-0's grad_hess into ONE pass that shares
-    // the link σ/exp (`grad_hess_and_deviance`), yielding both `init_dev` and step-0's `gh`. With a
-    // validation split (`rows ⊊ 0..n`) the domains differ, so compute `init_dev` over the subset.
+    // step-0 fuses init_dev with grad_hess into ONE pass sharing the link σ/exp
+    // (`grad_hess_and_deviance`), over the dense subset. The deviance is bit-identical to the old
+    // full `(y, raw, weight)` deviance when grow saw every row (`rows == 0..n` ⇒ subset == full, same
+    // chunked fold); with a validation split it is the subset deviance, exactly as before.
     let fuse_first = rows.len() == n_rows;
     let init_dev = if fuse_first {
         prof::timed("refine.init_dev", || {
-            loss.grad_hess_and_deviance(y, &raw, weight, &mut gh)
+            loss.grad_hess_and_deviance(&y_sub, &trial_raw_sub, &w_sub, &mut gh)
         })?
     } else {
         prof::timed("refine.init_dev", || {
@@ -2417,26 +2414,28 @@ fn refine_tree_leaves_after_grow(
     let mut best_deviance = f64::from(init_dev);
 
     for step in 0..config.leaf_refine_steps {
-        // When fused, step 0's `gh` was already produced by the `init_dev` pass above.
+        // When fused, step 0's `gh` was already produced by the `init_dev` pass above. Otherwise a
+        // pointwise grad_hess over the dense subset (O(rows)); `gh` is therefore subset-indexed.
         if !(fuse_first && step == 0) {
             prof::timed("refine.grad_hess", || {
-                loss.grad_hess(y, &raw, weight, &mut gh)
+                loss.grad_hess(&y_sub, &trial_raw_sub, &w_sub, &mut gh)
             })?;
         }
         let mut g = [0.0_f64; 8];
         let mut h = [0.0_f64; 8];
         prof::timed("refine.aggregate", || -> Result<(), PbError> {
-            for (&row, &leaf_u8) in rows.iter().zip(&memberships) {
-                let ru = row as usize;
+            // `gh` is subset-indexed (i ↔ rows[i]); fold each into its leaf in the SAME rows order as
+            // before ⇒ bit-identical per-leaf sums.
+            for (i, &leaf_u8) in memberships.iter().enumerate() {
                 let leaf = usize::from(leaf_u8);
                 *g.get_mut(leaf).ok_or_else(|| PbError::Internal {
                     what: "leaf refinement g leaf escaped".into(),
-                })? += f64::from(*gh.g.get(ru).ok_or_else(|| PbError::Internal {
+                })? += f64::from(*gh.g.get(i).ok_or_else(|| PbError::Internal {
                     what: "leaf refinement gradient row escaped".into(),
                 })?);
                 *h.get_mut(leaf).ok_or_else(|| PbError::Internal {
                     what: "leaf refinement h leaf escaped".into(),
-                })? += f64::from(*gh.h.get(ru).ok_or_else(|| PbError::Internal {
+                })? += f64::from(*gh.h.get(i).ok_or_else(|| PbError::Internal {
                     what: "leaf refinement hessian row escaped".into(),
                 })?);
             }
@@ -2503,9 +2502,9 @@ fn refine_tree_leaves_after_grow(
             })?;
             if deviance < best_deviance {
                 tree.leaves = trial_leaves;
-                // Reflect the accepted leaves into the full raw at `rows` for the next step's
-                // grad_hess (its only consumer); a scatter only on accept, not per trial.
-                apply_membership_leaves(&mut raw, base_raw, rows, &memberships, &tree.leaves)?;
+                // `trial_raw_sub` already holds this accepted trial's raw at `rows` (the backtrack
+                // just filled it), so it IS the next step's grad_hess input — no extra scatter, no
+                // full `raw` to maintain.
                 best_deviance = deviance;
                 accepted = true;
                 break;
