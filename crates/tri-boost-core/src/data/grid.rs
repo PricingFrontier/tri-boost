@@ -81,14 +81,12 @@ pub fn build_grid(
         // f64 midpoints can round to the same f32, so dedup is what guarantees the
         // strictly-ascending / no-duplicate BorderGrid invariant (§03.2).
         dedup_ascending(midpoint_borders(&distinct))
+    } else if u64::try_from(fw.len()).unwrap_or(u64::MAX) <= u64::from(cfg.subsample_for_binning) {
+        // Whole (already-sorted) column IS the sample — borrow it directly instead of cloning (it
+        // stays owned for collapse_rare_bins below). Byte-identical: quantile_borders only reads it.
+        quantile_borders(&fw, cfg.max_bin)?
     } else {
-        let sample = if u64::try_from(fw.len()).unwrap_or(u64::MAX)
-            <= u64::from(cfg.subsample_for_binning)
-        {
-            fw.clone()
-        } else {
-            subsample_sorted(&fw, cfg.subsample_for_binning, seed, feat)?
-        };
+        let sample = subsample_sorted(&fw, cfg.subsample_for_binning, seed, feat)?;
         quantile_borders(&sample, cfg.max_bin)?
     };
 
