@@ -1242,6 +1242,15 @@ fn axis_is_admissible(
     let Some(prov) = x.provenance.get(axis as usize) else {
         return false;
     };
+    // Degenerate-axis pre-filter: an axis with < 2 data bins (n_bins ≤ 2) has no candidate split
+    // and is unconditionally skipped in `best_level_split` (ndb < 2). Excluding it here is
+    // byte-identical to building-then-skipping it, but avoids the wasted O(rows) histogram build.
+    let Some(grid) = x.grids.get(axis as usize) else {
+        return false;
+    };
+    if usize::from(grid.n_bins).saturating_sub(1) < 2 {
+        return false;
+    }
     let raw = prov.raw;
     if used_raws.contains(&raw.0) {
         return false;

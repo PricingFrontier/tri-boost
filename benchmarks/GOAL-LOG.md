@@ -523,3 +523,45 @@ FullF64 is AoS (`GhcCell`, 1 cache line) + skips `wsum` under unit weights. The 
   scatter is already L1-resident so neither integer width nor density helps. In safe Rust (`forbid(unsafe)`, no
   hand-SIMD) the LightGBM 2× is not reachable on this workload. QHIST stays a non-default, accuracy-neutral path —
   now ~as close to FullF64 as it gets. Speed campaign is at its floor on BOTH precisions.
+
+## LightGBM head-to-head + speed teardown (2026-06-29)
+
+### Measured tri-boost vs LightGBM (matched depth-3, n=400, 4 threads)
+tri-boost (refine=4, its accuracy lever) BEATS LightGBM on 5/6 — allstate 0.5435 vs 0.5500, particulate 0.3494 vs
+0.3522, diamonds 0.09735 vs 0.09749, **miami 0.1395 vs 0.1599 (−12.7%)**, kick 0.7774 vs 0.7721 — loses only amazon
+(0.8444 vs 0.8581, all-categorical). At refine=0 (no levers) LightGBM wins 5/6. **SPEED:** tri is **2.5–5.9× slower**
+(refine=0), wider with refine=4. So tri trades training speed for exact decomposability + better accuracy on
+interaction-heavy data.
+
+### Teardown: a 4-agent workflow mapped LightGBM's speed to tri-boost
+Verdict (all agents converged + matches the frontier assessment): the 2.5–6× is **~55–70% STRUCTURAL/unborrowable**
+(leaf-wise growth reaches a loss in fewer trees — G0-forbidden since exact ≤3-order fANOVA needs depth-3 OBLIVIOUS
+trees; plus tri's own leaf-refine accuracy spend LightGBM never pays), **~25–35% MICRO-ARCH** mostly behind
+`forbid(unsafe)` (SW prefetch, bin packing — LightGBM's hot loop is SCALAR, NOT SIMD: bin scatter write-conflicts),
+and only **~5–10% genuinely borrowable byte-identical**. Off-limits (stop chasing): leaf-wise (G0), prefetch/SIMD
+(unsafe), int8/4-bin quantized (accuracy — i16 already failed), EFB/sparse-hist (inapplicable — tri TS-encodes each
+cat to ONE dense axis), GOSS (subsumed by MVS).
+
+### ✅/❌ Tested all 4 borrowable techniques — only #1 (degenerate-axis filter) kept; all ~ZERO on the benchmark
+- **✅ Degenerate-axis pre-filter (kept, byte-identical):** `axis_is_admissible` now drops axes with <2 data bins
+  (`n_bins ≤ 2`) — they were built (full O(rows) histogram) then unconditionally skipped in `best_level_split`.
+  Byte-identical (scores exact on all 6). Speed: **0 on the benchmark** (no degenerate features here) — a correctness
+  win for degenerate-feature/​rare-categorical production data, not for this suite.
+- **❌ Count-free hot cell (spike, rejected):** the hist `count`/`wsum` are read ONLY by `best_level_split` under
+  `check_cred` (leaf values recompute from `gh`), so on the unit-weight + inert-credibility default they're never
+  read. Spiked out the per-row count write + the wsum=count pass: scores byte-identical (confirms unread), speed
+  UNCHANGED within noise — `count` is same-cache-line as g/h (AoS `GhcCell`), so removing the write just overlaps
+  memory latency. Reverted.
+- **❌ HistogramPool buffer reuse (not pursued):** infeasible cleanly under the determinism gate — the fixed-order
+  collect-then-reduce requires every per-chunk `AxisHist` to coexist (can't alias a reused buffer), and the only
+  reusable buffer (the per-level assembly `Hist`) is O(cells)-tiny. The ~5–10% estimate didn't account for the
+  determinism constraint + allocator block reuse (freed blocks are recycled, so the "churn" is bookkeeping not page
+  faults). Net ≈0.
+- **❌ Packed i128 QHIST add (not pursued):** an i128 add is 2 machine instructions on x86-64 (add+adc) = the same as
+  two i64 adds, so ~0 net; QHIST already loses regardless.
+
+**CONCLUSION: the borrowable ~5–10% is ~0 in practice on this benchmark.** Under tri's real determinism constraint +
+the L1-resident scatter + same-cache-line AoS layout, none of the four recovered measurable wall-time. This
+EMPIRICALLY confirms the teardown's verdict: **tri-boost's histogram engine is at its safe-Rust floor.** Further speed
+requires relaxing G0 (off the table — it's the product) or `forbid(unsafe)` for a vetted prefetch/SIMD scatter (a
+policy decision). The higher-value frontier is ACCURACY (G1 mains / amazon categorical), not speed.
