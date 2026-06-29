@@ -2590,29 +2590,12 @@ fn refine_tree_leaves_se_quadratic(
     })?;
 
     for _ in 0..config.leaf_refine_steps {
-        // KEEP the per-row f32 grad_hess + aggregate VERBATIM (same as the generic path) ⇒ the leaf
-        // updates — and the whole model — are byte-identical. Only the deviance below is closed-form.
-        prof::timed("refine.grad_hess", || {
-            loss.grad_hess(y, &raw, weight, &mut gh)
-        })?;
-        let mut g = [0.0_f64; 8];
-        let mut h = [0.0_f64; 8];
-        prof::timed("refine.aggregate", || -> Result<(), PbError> {
-            for (&row, &leaf_u8) in rows.iter().zip(memberships) {
-                let ru = row as usize;
-                let leaf = usize::from(leaf_u8);
-                *g.get_mut(leaf).ok_or_else(|| PbError::Internal {
-                    what: "se refine g leaf escaped".into(),
-                })? += f64::from(*gh.g.get(ru).ok_or_else(|| PbError::Internal {
-                    what: "se refine gradient row escaped".into(),
-                })?);
-                *h.get_mut(leaf).ok_or_else(|| PbError::Internal {
-                    what: "se refine h leaf escaped".into(),
-                })? += f64::from(*gh.h.get(ru).ok_or_else(|| PbError::Internal {
-                    what: "se refine hessian row escaped".into(),
-                })?);
-            }
-            Ok(())
+        // FUSED grad_hess + per-leaf aggregate in ONE rows-order pass (no materialized gradient
+        // vector). The SquaredError override computes each row's f32 (g,h) inline and folds it into
+        // the per-leaf f64 sums — bit-identical to the old grad_hess-then-aggregate, and the leaves
+        // (hence the whole model) stay byte-identical. Only the deviance below is closed-form.
+        let (g, h) = prof::timed("refine.grad_hess", || {
+            loss.grad_hess_aggregate(y, &raw, weight, rows, memberships, &mut gh)
         })?;
         let mut delta = [0.0_f32; 8];
         let mut any_delta = false;

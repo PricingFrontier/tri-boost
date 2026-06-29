@@ -467,6 +467,41 @@ pub trait Loss: Send + Sync {
         self.deviance(y, raw, weight)
     }
 
+    /// Fused grad/hess + per-leaf aggregate over `rows` (`memberships[i]` = leaf id of `rows[i]`,
+    /// `< 8`): returns `(Σ g, Σ h)` per leaf as f64 sums folded in `rows` order. Bit-identical to
+    /// calling `grad_hess` then folding `out.{g,h}[rows[i]]` into per-leaf sums, but lets a loss skip
+    /// materializing the full-length gradient vector — the leaf-refine line search re-reads it
+    /// immediately, so the round-trip is pure waste. The default IS exactly that two-pass form (using
+    /// `scratch` as the gradient buffer). Deterministic: the fold is `rows`-order sequential.
+    fn grad_hess_aggregate(
+        &self,
+        y: &[f32],
+        raw: &[f32],
+        weight: &[f32],
+        rows: &[u32],
+        memberships: &[u8],
+        scratch: &mut GradHess,
+    ) -> Result<([f64; 8], [f64; 8]), PbError> {
+        self.grad_hess(y, raw, weight, scratch)?;
+        let mut g = [0.0_f64; 8];
+        let mut h = [0.0_f64; 8];
+        for (&row, &leaf) in rows.iter().zip(memberships) {
+            let ru = row as usize;
+            let l = usize::from(leaf);
+            *g.get_mut(l).ok_or_else(|| PbError::Internal {
+                what: "grad_hess_aggregate leaf id escaped".into(),
+            })? += f64::from(*scratch.g.get(ru).ok_or_else(|| PbError::Internal {
+                what: "grad_hess_aggregate gradient row escaped".into(),
+            })?);
+            *h.get_mut(l).ok_or_else(|| PbError::Internal {
+                what: "grad_hess_aggregate leaf id escaped".into(),
+            })? += f64::from(*scratch.h.get(ru).ok_or_else(|| PbError::Internal {
+                what: "grad_hess_aggregate hessian row escaped".into(),
+            })?);
+        }
+        Ok((g, h))
+    }
+
     /// The objective's natural early-stopping metric (deviance by default).
     fn default_metric(&self) -> Metric;
 
@@ -533,6 +568,51 @@ impl Loss for SquaredError {
             *hi = h;
         }
         Ok(())
+    }
+
+    fn grad_hess_aggregate(
+        &self,
+        y: &[f32],
+        raw: &[f32],
+        weight: &[f32],
+        rows: &[u32],
+        memberships: &[u8],
+        _scratch: &mut GradHess,
+    ) -> Result<([f64; 8], [f64; 8]), PbError> {
+        // FUSED SE kernel + per-leaf aggregate in ONE `rows`-order pass: each row's f32 `(g, h)` is
+        // EXACTLY what `grad_hess` computes (`g = w(F−y)`, `h = w.max(floor)`, same finite checks and
+        // same f32 rounding via `ensure_finite_grad_hess`), folded straight into the per-leaf f64
+        // sums — bit-identical to grad_hess-then-aggregate but WITHOUT materializing the full-length
+        // gradient vector (which the leaf-refine line search would re-read at once). Visits only
+        // `rows` (the train subset), not all n.
+        let floor = self.hessian_floor();
+        let mut g = [0.0_f64; 8];
+        let mut h = [0.0_f64; 8];
+        for (&row, &leaf) in rows.iter().zip(memberships) {
+            let ru = row as usize;
+            let l = usize::from(leaf);
+            let yi = *y.get(ru).ok_or_else(|| PbError::Internal {
+                what: "se grad_hess_aggregate y row escaped".into(),
+            })?;
+            let fi = *raw.get(ru).ok_or_else(|| PbError::Internal {
+                what: "se grad_hess_aggregate raw row escaped".into(),
+            })?;
+            let wi = *weight.get(ru).ok_or_else(|| PbError::Internal {
+                what: "se grad_hess_aggregate weight row escaped".into(),
+            })?;
+            require_finite("squared-error", "y", ru, yi)?;
+            require_finite("squared-error", "raw", ru, fi)?;
+            require_weight("squared-error", ru, wi)?;
+            let (gi, hi) =
+                ensure_finite_grad_hess("squared-error", ru, wi * (fi - yi), wi.max(floor))?;
+            *g.get_mut(l).ok_or_else(|| PbError::Internal {
+                what: "se grad_hess_aggregate g leaf escaped".into(),
+            })? += f64::from(gi);
+            *h.get_mut(l).ok_or_else(|| PbError::Internal {
+                what: "se grad_hess_aggregate h leaf escaped".into(),
+            })? += f64::from(hi);
+        }
+        Ok((g, h))
     }
 
     fn init_score(
