@@ -100,6 +100,7 @@ class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped 
         mvs_min_rows: int = 1,
         hist_precision: str | None = None,
         n_bags: int = 0,
+        bag_subsample: float = 1.0,
         ridge_refit_l2: float | None = None,
         ridge_refit_max_iter: int = 5,
         nesterov: bool = False,
@@ -141,6 +142,7 @@ class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped 
         self.mvs_min_rows = mvs_min_rows
         self.hist_precision = hist_precision
         self.n_bags = n_bags
+        self.bag_subsample = bag_subsample
         self.ridge_refit_l2 = ridge_refit_l2
         self.ridge_refit_max_iter = ridge_refit_max_iter
         self.nesterov = nesterov
@@ -344,6 +346,7 @@ class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped 
             mvs_min_rows=int(self.mvs_min_rows),
             hist_precision=self.hist_precision,
             n_bags=int(self.n_bags),
+            bag_subsample=float(self.bag_subsample),
             ridge_refit_l2=None if self.ridge_refit_l2 is None else float(self.ridge_refit_l2),
             ridge_refit_max_iter=int(self.ridge_refit_max_iter),
             nesterov=bool(self.nesterov),
@@ -547,6 +550,7 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):  # type: ignore[misc]
         mvs_min_rows: int = 1,
         hist_precision: str | None = None,
         n_bags: int = 0,
+        bag_subsample: float = 1.0,
         ridge_refit_l2: float | None = None,
         ridge_refit_max_iter: int = 5,
         nesterov: bool = False,
@@ -589,6 +593,7 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):  # type: ignore[misc]
             mvs_min_rows=mvs_min_rows,
             hist_precision=hist_precision,
             n_bags=n_bags,
+            bag_subsample=bag_subsample,
             ridge_refit_l2=ridge_refit_l2,
             ridge_refit_max_iter=ridge_refit_max_iter,
             nesterov=nesterov,

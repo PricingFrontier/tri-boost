@@ -3963,7 +3963,10 @@ mod tests {
                 learning_rate: 0.3,
                 lambda: 1.0,
                 boosters: BoosterConfig {
-                    ensemble: EnsembleSpec::OuterBag { n_bags: 2 },
+                    ensemble: EnsembleSpec::OuterBag {
+                        n_bags: 2,
+                        bag_subsample: 1.0,
+                    },
                     ..Default::default()
                 },
                 ..exact_cfg(80)

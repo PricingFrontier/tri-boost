@@ -213,6 +213,7 @@ impl PyBooster {
         mvs_min_rows=1,
         hist_precision=None,
         n_bags=0,
+        bag_subsample=1.0,
         ridge_refit_l2=None,
         ridge_refit_max_iter=5,
         nesterov=false,
@@ -253,6 +254,7 @@ impl PyBooster {
         mvs_min_rows: u32,
         hist_precision: Option<String>,
         n_bags: u16,
+        bag_subsample: f32,
         ridge_refit_l2: Option<f32>,
         ridge_refit_max_iter: u8,
         nesterov: bool,
@@ -272,7 +274,10 @@ impl PyBooster {
         let ensemble = if n_bags == 0 {
             EnsembleSpec::Off
         } else {
-            EnsembleSpec::OuterBag { n_bags }
+            EnsembleSpec::OuterBag {
+                n_bags,
+                bag_subsample,
+            }
         };
         let refit_leaves = match ridge_refit_l2 {
             None => RefitSpec::Off,

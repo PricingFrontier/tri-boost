@@ -37,6 +37,7 @@ use crate::engine::{
 use crate::error::PbError;
 use crate::loss::{GradHess, Link};
 use crate::serialize::SCHEMA_VERSION;
+use rand::RngCore;
 
 fn invalid_config(what: &'static str) -> PbError {
     PbError::InvalidConfig { what: what.into() }
@@ -230,9 +231,10 @@ pub(crate) fn fit(
 ) -> Result<Model, PbError> {
     match &config.boosters.ensemble {
         EnsembleSpec::Off => fit_single(config, x, y, spec, cat_encoders),
-        EnsembleSpec::OuterBag { n_bags } => {
-            fit_outer_bag(config, x, y, spec, *n_bags, cat_encoders)
-        }
+        EnsembleSpec::OuterBag {
+            n_bags,
+            bag_subsample,
+        } => fit_outer_bag(config, x, y, spec, *n_bags, *bag_subsample, cat_encoders),
         EnsembleSpec::GreedySelect {
             library_size,
             hp_grid,
@@ -799,6 +801,7 @@ fn fit_outer_bag(
     y: &[f32],
     spec: &FitSpec,
     n_bags: u16,
+    bag_subsample: f32,
     cat_encoders: &CatEncoderStore,
 ) -> Result<Model, PbError> {
     validate_ensemble_fit_inputs(config, x, y, spec)?;
@@ -815,9 +818,18 @@ fn fit_outer_bag(
             what: "OuterBag member allocation failed".into(),
         })?;
     let alpha = 1.0_f64 / f64::from(n_bags);
+    // bag_subsample >= 1 ⇒ full-size bootstrap WITH replacement (classic bagging); < 1 ⇒
+    // without-replacement subagging of round(f * n_rows) rows (faster, more diverse, leak-free).
+    let subsample = bag_subsample < 1.0;
+    let sample_len =
+        (((n_rows as f64) * f64::from(bag_subsample)).round() as usize).clamp(1, n_rows);
     for bag in 0..n_bags {
         let bag_round = u32::from(bag);
-        let rows = bootstrap_rows(spec.seed, bag_round, n_rows, n_rows)?;
+        let rows = if subsample {
+            subagging_rows(spec.seed, bag_round, n_rows, sample_len)?
+        } else {
+            bootstrap_rows(spec.seed, bag_round, n_rows, n_rows)?
+        };
         let data = row_subset(x, y, spec.weight, spec.exposure, &rows)?;
         let bag_seed = pb_seed(spec.seed, bag_round, Stage::Sample as u32, 0);
         let bag_spec = FitSpec {
@@ -1026,6 +1038,33 @@ fn bootstrap_rows(
         })?);
     }
     Ok(rows)
+}
+
+/// Draw `k` DISTINCT row indices from `[0, n_rows)` without replacement (subagging), deterministically
+/// via the per-bag `Pcg64` stream and a partial Fisher–Yates, returned sorted ascending for
+/// cache-friendly `row_subset`. Unlike `bootstrap_rows` (with replacement), no original row appears
+/// twice in a bag — which removes the train/val overlap leak in each bag's early-stop carve and
+/// injects more cross-bag diversity. Thread-independent ⇒ byte-deterministic.
+fn subagging_rows(seed: u64, round: u32, n_rows: usize, k: usize) -> Result<Vec<u32>, PbError> {
+    let k = k.min(n_rows);
+    let n32 = u32::try_from(n_rows).map_err(|_| PbError::InvalidInput {
+        what: "subagging supports at most u32::MAX rows".into(),
+    })?;
+    let mut idx: Vec<u32> = Vec::new();
+    idx.try_reserve_exact(n_rows)
+        .map_err(|_| PbError::Internal {
+            what: "subagging index allocation failed".into(),
+        })?;
+    idx.extend(0..n32);
+    let mut rng = pb_rng(seed, round, Stage::Sample, 0);
+    for i in 0..k {
+        let range = u64::try_from(n_rows - i).unwrap_or(1).max(1);
+        let offset = usize::try_from(rng.next_u64() % range).unwrap_or(0);
+        idx.swap(i, i + offset);
+    }
+    idx.truncate(k);
+    idx.sort_unstable();
+    Ok(idx)
 }
 
 fn holdout_split(seed: u64, n_rows: usize) -> Result<(Vec<u32>, Vec<u32>), PbError> {
@@ -3774,7 +3813,10 @@ mod tests {
             leaf_refine_steps: 0,
             leaf_refine_backtracks: 4,
             boosters: BoosterConfig {
-                ensemble: EnsembleSpec::OuterBag { n_bags: 3 },
+                ensemble: EnsembleSpec::OuterBag {
+                    n_bags: 3,
+                    bag_subsample: 1.0,
+                },
                 ..BoosterConfig::default()
             },
         };
@@ -3834,7 +3876,10 @@ mod tests {
             boosters: BoosterConfig::default(),
         };
         let mut bag_cfg = base_cfg.clone();
-        bag_cfg.boosters.ensemble = EnsembleSpec::OuterBag { n_bags: 1 };
+        bag_cfg.boosters.ensemble = EnsembleSpec::OuterBag {
+            n_bags: 1,
+            bag_subsample: 1.0,
+        };
         let base = Booster::with_config(base_cfg)
             .fit(&x, &y, &spec(&sqe))
             .unwrap();

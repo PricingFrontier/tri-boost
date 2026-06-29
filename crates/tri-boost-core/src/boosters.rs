@@ -148,6 +148,10 @@ pub enum EnsembleSpec {
     OuterBag {
         /// Number of bags to train and average.
         n_bags: u16,
+        /// Per-bag row sampling fraction. `>= 1.0` ⇒ full-size bootstrap WITH replacement (classic
+        /// bagging). `0 < f < 1.0` ⇒ without-replacement subsample of `round(f * n_rows)` rows
+        /// (subagging): faster per bag, more cross-bag diversity, and no within-bag train/val leak.
+        bag_subsample: f32,
     },
     /// Hyperparameter-diverse library with bagged greedy selection.
     GreedySelect {
@@ -166,10 +170,18 @@ impl EnsembleSpec {
     fn validate(&self) -> Result<(), PbError> {
         match self {
             EnsembleSpec::Off => Ok(()),
-            EnsembleSpec::OuterBag { n_bags } => {
+            EnsembleSpec::OuterBag {
+                n_bags,
+                bag_subsample,
+            } => {
                 if *n_bags == 0 {
                     return Err(PbError::InvalidConfig {
                         what: "OuterBag n_bags must be > 0".into(),
+                    });
+                }
+                if !(bag_subsample.is_finite() && *bag_subsample > 0.0) {
+                    return Err(PbError::InvalidConfig {
+                        what: "OuterBag bag_subsample must be finite and > 0".into(),
                     });
                 }
                 Ok(())
@@ -920,7 +932,10 @@ mod tests {
         };
         assert!(matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })));
         cfg.random_strength = 0.0;
-        cfg.ensemble = EnsembleSpec::OuterBag { n_bags: 0 };
+        cfg.ensemble = EnsembleSpec::OuterBag {
+            n_bags: 0,
+            bag_subsample: 1.0,
+        };
         assert!(matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })));
         cfg.ensemble = EnsembleSpec::Off;
         cfg.dart = Some(DartSpec {

@@ -861,3 +861,34 @@ Outer bagging (soup_models averages Exact members) closed ~1/4-1/3 of the depth-
 (diamonds -5.21%->-3.97%); to be re-measured at the large cap on the remaining close losses.
 
 NEXT: full re-baseline at FAIR_BUDGET=16000 + refill, then add bagging to any residual losses.
+
+## G1 ACCURACY (2026-06-29 cont.): the under-fitting fix + subagging
+
+### KEY: the depth-1/2 "gap" was mostly UNDER-FITTING (lr too low), not structural
+Higher lr (0.20) + bagging + the refill collapsed the depth-1 gap: diamonds -4.42%->-0.04% (TIE),
+allstate -0.07% (TIE), miami -0.38%, kick WIN; only particulate -2.08% remains (a real loss). Higher lr
+converges fully in FEW trees (fast) where lr=0.05 truncated. BUT lr=0.20 is NOT universal: it HURTS kick
+o2 (classification, overfits the interactions) — kick o2 -1.14% (lr.05) -> -3.11% (lr.20). The fast recipe
+(lr0.2 + bagging) is: diamonds/miami/allstate ~tie-or-win at o1; depth-2 miami WIN, diamonds/allstate ~-0.5%.
+
+### Team (5 investigators + adversarial critique) — de-risked plan
+Real losses are only particulate o1 (categorical-TS encoding, NOT binning) and kick o2 (pair selection).
+The o1 "ties" (diamonds/allstate -0.0x%) are NOISE vs a frozen EBM cache — don't chase. DROP per-dataset
+monotone tuning (benchmark overfitting) and lr-decay (speed-negative). Critique caught a real BUG: the
+outer-bag bootstrap is WITH replacement AND each bag carves its early-stop val from its own rows -> a row
+lands in both train+val -> optimistic val -> late stop -> overfit (hurts kick).
+
+### ✅ Subagging via new `bag_subsample` param (committed)
+`EnsembleSpec::OuterBag { n_bags, bag_subsample }` (+ pyo3 + sklearn). f>=1 ⇒ classic full-size bootstrap
+WITH replacement (default, backward-compatible). 0<f<1 ⇒ without-replacement subsample of round(f*n_rows)
+(`subagging_rows`). G0-safe (still averages Exact members), byte-identical across threads (verified 1 vs 4).
+Measured (n_bags=8, lr0.2):
+| case | f=1.0 | f=0.9 | f=0.63 | speed f.63 vs f1.0 |
+| diamonds o1 | -0.04% | -0.22% | -0.02% | 40s vs 65s |
+| miami o1 | -0.38% | -0.87% | -1.29% | 8.6s vs 21s |
+| allstate o1 | -0.07% | -0.09% | -0.14% | 125s vs 434s |
+| kick o2 | -3.11% | **-1.13%** | -1.54% | 18s vs 220s |
+Subagging is a big SPEED win (allstate -71%, kick -95%) AND fixes the leak (kick -3.11%->-1.13%), but the
+data loss hurts data-hungry small datasets (miami). f=0.9 is the compromise. The CLEAN fix (next) is OOB
+early-stop validation: train each bag on the full bootstrap (no data loss) but validate on the out-of-bag
+rows (disjoint => leak fixed) — gets kick's win without miami's cost.
