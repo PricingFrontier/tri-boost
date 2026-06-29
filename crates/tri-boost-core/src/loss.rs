@@ -502,6 +502,29 @@ pub trait Loss: Send + Sync {
         Ok((g, h))
     }
 
+    /// Whether the per-row hessian depends on the current `raw` score (so must be recomputed every
+    /// boosting round). Default `true` (safe). `SquaredError` returns `false`: its hessian
+    /// `h = w·max(floor)` is raw-independent and the weights are round-invariant, so the boosting
+    /// loop fills `h` once (round 0) and reuses it via [`fill_grad_reusing_hessian`].
+    fn hessian_depends_on_raw(&self) -> bool {
+        true
+    }
+
+    /// Refill ONLY the gradient column `out.g`, leaving `out.h` (the round-invariant hessian from a
+    /// prior full [`grad_hess`]) untouched — for the boosting loop when `!hessian_depends_on_raw()`.
+    /// The default IS a full `grad_hess`, so a loss that does not opt in stays correct; an opting-in
+    /// loss must keep `out.g` bit-identical to `grad_hess`'s. `out.h` must already be length `y.len()`
+    /// (a prior full pass established it).
+    fn fill_grad_reusing_hessian(
+        &self,
+        y: &[f32],
+        raw: &[f32],
+        weight: &[f32],
+        out: &mut GradHess,
+    ) -> Result<(), PbError> {
+        self.grad_hess(y, raw, weight, out)
+    }
+
     /// The objective's natural early-stopping metric (deviance by default).
     fn default_metric(&self) -> Metric;
 
@@ -613,6 +636,57 @@ impl Loss for SquaredError {
             })? += f64::from(hi);
         }
         Ok((g, h))
+    }
+
+    fn hessian_depends_on_raw(&self) -> bool {
+        // h = w·max(floor) is independent of `raw`, and weights are round-invariant ⇒ the hessian
+        // column is bit-identical every boosting round.
+        false
+    }
+
+    fn fill_grad_reusing_hessian(
+        &self,
+        y: &[f32],
+        raw: &[f32],
+        weight: &[f32],
+        out: &mut GradHess,
+    ) -> Result<(), PbError> {
+        let n = y.len();
+        if raw.len() != n || weight.len() != n {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "grad(reuse-h): y={n}, raw={}, weight={}",
+                    raw.len(),
+                    weight.len()
+                ),
+            });
+        }
+        // Only valid once a full pass has established `out.h`; otherwise fall back to the full kernel.
+        if out.h.len() != n {
+            return self.grad_hess(y, raw, weight, out);
+        }
+        out.g.resize(n, 0.0);
+        // g is computed EXACTLY as in `grad_hess` (g = w·(F−y), same finite checks/rounding); h is
+        // left as the prior full pass set it (= w·max(floor), unchanged this round) ⇒ bit-identical
+        // (g,h), at the cost of only the gradient store instead of g + the redundant hessian store.
+        for (i, (gi, (&yi, (&fi, &wi)))) in out
+            .g
+            .iter_mut()
+            .zip(y.iter().zip(raw.iter().zip(weight)))
+            .enumerate()
+        {
+            require_finite("squared-error", "y", i, yi)?;
+            require_finite("squared-error", "raw", i, fi)?;
+            require_weight("squared-error", i, wi)?;
+            let g = wi * (fi - yi);
+            if !g.is_finite() {
+                return Err(invalid_input(format!(
+                    "squared-error grad row {i} produced non-finite g: g={g}"
+                )));
+            }
+            *gi = g;
+        }
+        Ok(())
     }
 
     fn init_score(

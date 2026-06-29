@@ -461,7 +461,15 @@ fn fit_single(
             fit_raw = raw_minus_dropped(&raw, x, &trees, &dart_drops)?;
         }
         prof::timed("grad_hess", || {
-            spec.loss.grad_hess(y, &fit_raw, weight, &mut gh)
+            // After round 0, a loss whose hessian is round-invariant (SquaredError: h = w·max(floor))
+            // refills ONLY the gradient and reuses the established `gh.h` — bit-identical, fewer
+            // stores. Every other loss recomputes both via the full pass.
+            if t == 0 || spec.loss.hessian_depends_on_raw() {
+                spec.loss.grad_hess(y, &fit_raw, weight, &mut gh)
+            } else {
+                spec.loss
+                    .fill_grad_reusing_hessian(y, &fit_raw, weight, &mut gh)
+            }
         })?;
         let sampled_rows = sample_rows(&config.sampling, &gh, spec.seed, t, &train_rows)?;
         let round_axes = sample_axes(&axes, config.colsample_bytree, spec.seed, t)?;
