@@ -721,3 +721,30 @@ remaining training cost is now genuinely dominated by the histogram scatter, whi
 refine), ②③ (byte-identical cleanups). Confirmed ~0/inapplicable: ⑤⑥⑦⑧⑨⑩⑪⑫. The engine is at its safe-Rust floor on
 BOTH frontiers — the histogram scatter (hist_build) and the categorical fit (binning) — with no remaining safe-Rust
 slack; further training speedup requires `unsafe` SIMD/prefetch (a policy decision) or G0 relaxation (off the table).
+
+## Bottleneck pass 3 (2026-06-29) — the histogram floor was NOT a floor: jagged per-axis bin stride
+
+A third granular re-profile (post-① fusion) + a fresh 5-investigator/adversarial-verify Workflow team
+(12 proposals, 10 survived). The team's rank-1 (flagged speculative, "may collapse to ~0 against a
+scatter-bound floor") turned out to be the **biggest win of the whole campaign**:
+
+### ✅ Jagged per-axis bin stride in the histogram intermediates — BYTE-IDENTICAL, -23 to -42% hist_build
+The per-axis `AxisHist` intermediates were allocated/zeroed/scattered/reduced at the UNIFORM global
+`max_bins` stride, even though most axes need far fewer bins (allstate: 104/130 features need <=16 bins
+but got 255 — an 8.36x inflated stride). Now each axis's intermediate is sized to ITS OWN grid
+`n_bins` (`accumulate_axis*` + `AxisHist::try_zeros`); `build_histogram` re-expands each jagged
+sub-histogram into the uniform `max_bins`-strided final tensor (high cells stay zero, exactly as
+before). BYTE-IDENTICAL: no row has `bin >= axis_bins`, so only always-zero cells are omitted; the
+final tensor and the chunk-order f64 fold are unchanged. Verified: all 6 suite scores + diamonds/kick/
+allstate o3 reproduce EXACTLY; 234 core + 20 py green; clippy + fmt.
+
+**The mechanism corrects pass 2's verdict.** Pass 2 concluded the histogram was scatter-bound and "at
+its safe-Rust floor" because the level-0/bounds/assembly micro-opts measured ~0. But the dominant
+random scatter was CACHE-bound, not count-bound: at 255-bin stride a low-card axis's `[leaf][bin]`
+working set is ~20KB (spills L1); at its true 16-bin stride it is ~1.3KB (L1-resident), so the random
+writes hit L1. Shrinking the stride is a structural cache win, not a micro-op — which is why it
+landed where the micro-ops didn't.
+- **Measured (best-of-3, profiler):** allstate o3 hist_build 50.6->38.8s (-23%, wall 67.4->53.7 -20%);
+  allstate suite 8.0->7.06s (-12%); diamonds o3 3.39->2.25s (-34%, wall 8.1->5.6 -31%); kick o3
+  8.51->4.96s (-42%). Helps EVERY dataset (any axis with n_bins < max_bins), biggest where low-card
+  axes dominate. The single largest training speedup of the campaign.

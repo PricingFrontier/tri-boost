@@ -96,29 +96,26 @@ pub(crate) fn build_histogram(
     // Each axis is built independently (disjoint output region) on its own task.
     let subs: Result<Vec<AxisHist>, PbError> = axes
         .par_iter()
-        .map(|&a| {
-            accumulate_axis(
-                x,
-                gh,
-                rows,
-                leaf_of_row,
-                n_leaves,
-                a,
-                max_bins,
-                weight,
-                unit_weight,
-            )
-        })
+        .map(|&a| accumulate_axis(x, gh, rows, leaf_of_row, n_leaves, a, weight, unit_weight))
         .collect();
     let subs = subs?;
 
-    // Assemble the disjoint per-axis sub-histograms into the flat tensor, in axis
-    // order — deterministic regardless of how rayon scheduled the per-axis tasks.
+    // Assemble the disjoint per-axis sub-histograms into the flat tensor, in axis order —
+    // deterministic regardless of how rayon scheduled the per-axis tasks. Each `sub` was built at
+    // its OWN (jagged) n_bins stride, so copy its `axis_bins` cells per leaf into the uniform
+    // max_bins-strided tensor; the high cells (`axis_bins..max_bins`) stay zero, exactly as before.
     let mut hist = Hist::try_zeros(n_leaves, n_axes, max_bins)?;
     for (axis_pos, sub) in subs.iter().enumerate() {
+        let axis = *axes.get(axis_pos).ok_or_else(oob("axis pos escaped"))?;
+        let axis_bins = usize::from(
+            x.grids
+                .get(axis as usize)
+                .ok_or_else(oob("axis has no grid"))?
+                .n_bins,
+        );
         for leaf in 0..n_leaves {
-            for bin in 0..max_bins {
-                let src = offset2(leaf, bin, max_bins, "axis histogram offset overflow")?;
+            for bin in 0..axis_bins {
+                let src = offset2(leaf, bin, axis_bins, "axis histogram offset overflow")?;
                 let dst = offset3(
                     leaf,
                     axis_pos,
@@ -416,7 +413,6 @@ fn accumulate_axis(
     leaf_of_row: &[u8],
     n_leaves: usize,
     axis: u32,
-    max_bins: usize,
     weight: &[f32],
     unit_weight: bool,
 ) -> Result<AxisHist, PbError> {
@@ -428,7 +424,6 @@ fn accumulate_axis(
             leaf_of_row,
             n_leaves,
             axis,
-            max_bins,
             weight,
             unit_weight,
         );
@@ -443,21 +438,26 @@ fn accumulate_axis(
                 leaf_of_row,
                 n_leaves,
                 axis,
-                max_bins,
                 weight,
                 unit_weight,
             )
         })
         .collect();
     let chunks = chunks?;
-    let mut out = AxisHist::try_zeros(n_leaves, max_bins)?;
+    // Reduce at the same per-axis (jagged) stride the chunks were built at.
+    let axis_bins = usize::from(
+        x.grids
+            .get(axis as usize)
+            .ok_or_else(oob("axis has no grid"))?
+            .n_bins,
+    );
+    let mut out = AxisHist::try_zeros(n_leaves, axis_bins)?;
     for chunk in &chunks {
         add_axis_hist(&mut out, chunk)?;
     }
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn accumulate_axis_sequential(
     x: &BinnedMatrix,
@@ -466,7 +466,6 @@ fn accumulate_axis_sequential(
     leaf_of_row: &[u8],
     n_leaves: usize,
     axis: u32,
-    max_bins: usize,
     weight: &[f32],
     unit_weight: bool,
 ) -> Result<AxisHist, PbError> {
@@ -474,7 +473,19 @@ fn accumulate_axis_sequential(
         .data
         .get(axis as usize)
         .ok_or_else(oob("axis has no column"))?;
-    let mut out = AxisHist::try_zeros(n_leaves, max_bins)?;
+    // Per-axis (jagged) bin stride: size this axis's intermediate to ITS OWN grid `n_bins`, not the
+    // global `max_bins`. The per-row scatter then writes into a smaller, more L1-resident array for
+    // low-cardinality axes, and the zero/reduce passes shrink to O(n_leaves·axis_bins). Byte-
+    // identical: no row has `bin >= axis_bins`, so the high cells the uniform-stride build left zero
+    // are exactly the ones omitted here, and `build_histogram` re-expands to the uniform max_bins
+    // stride. Deterministic: stride is a pure function of the (frozen) grid, not the thread count.
+    let axis_bins = usize::from(
+        x.grids
+            .get(axis as usize)
+            .ok_or_else(oob("axis has no grid"))?
+            .n_bins,
+    );
+    let mut out = AxisHist::try_zeros(n_leaves, axis_bins)?;
     // Sequential over rows in their given (fixed) order ⇒ deterministic f64 fold. When
     // `unit_weight`, the per-row weight read + `Σw` add are skipped (the loop-invariant branch
     // is hoisted by LLVM into two loop variants), and `wsum` is set from `count` afterwards —
@@ -483,12 +494,12 @@ fn accumulate_axis_sequential(
         let ru = r as usize;
         let bin = usize::from(*col.get(ru).ok_or_else(oob("row out of column"))?);
         let leaf = usize::from(*leaf_of_row.get(ru).ok_or_else(oob("row out of leaf map"))?);
-        if leaf >= n_leaves || bin >= max_bins {
+        if leaf >= n_leaves || bin >= axis_bins {
             return Err(PbError::Internal {
                 what: "leaf or bin id out of histogram range".into(),
             });
         }
-        let idx = offset2(leaf, bin, max_bins, "axis histogram row offset overflow")?;
+        let idx = offset2(leaf, bin, axis_bins, "axis histogram row offset overflow")?;
         // One bounds-checked write to the packed g/h/count cell (one cache line).
         let cell = out.ghc.get_mut(idx).ok_or_else(oob("ghc cell"))?;
         cell.g += f64::from(*gh.g.get(ru).ok_or_else(oob("gh.g"))?);
