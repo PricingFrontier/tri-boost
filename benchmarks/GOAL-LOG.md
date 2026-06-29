@@ -797,3 +797,32 @@ win), explored every deferred pass-3 idea instead of assuming sub-second:
 **Lesson reinforced:** the jagged stride was a one-off STRUCTURAL (cache-locality) surprise; the rest of
 the deferred set is bounded linear dead-work that measures as predicted. But ⑤ shows it's still worth
 MEASURING each at the config where it actually fires (⑤ was invisible on the profiler's full-sample run).
+
+## Bottleneck pass 4 (2026-06-29) — the floor, confirmed (post jagged stride)
+
+Re-profiled post pass-3 and ran a 5-investigator/adversarial-verify Workflow team (15 proposals, 7
+survived) pushed toward STRUCTURAL ideas (the jagged-stride bar). The team's own headline: "the easy
+wins are gone." Two survivors had real magnitude; both resolve to ~0:
+
+- ❌ **Rank 2/3 — leaf-partitioned histogram accumulation (the leaf-dimension jagged-stride analog)** —
+  ruled out STRUCTURALLY: post-jagged, level 0 (all rows, single leaf) already scatters into one
+  axis's ~5KB bin row (L1-resident), and level 0 dominates the row count. Leaf-partition only touches
+  the multi-leaf level-2 build (~1/4 rows, ~10KB working set that likely already fits L1). So the
+  residual hist cost (allstate o3 34.7s) is THROUGHPUT-bound — ~150k rows x ~130 axes x 2000 trees
+  ≈ 39B scatter ops at ~L1 speed ≈ the observed time — not cache-bound. Not worth building.
+- ❌ **Rank 1 — logistic backtrack capped-deviance early-abort** — BUILT (byte-identical: binomial
+  deviance terms are non-negative ⇒ monotone fold ⇒ aborting when the chunk-ordered running acc >= cap
+  can never disagree with the f32 accept test; accepted trials run the full chunk-order fold) and
+  MEASURED ~0: kick o3 backtrack_eval 5.27-5.45s vs 5.24s baseline (no change), score 0.76975 exact.
+  The rejects are sparse (convex + lr=0.05 damped ⇒ scale=1 usually accepts) and happen at convergence
+  where the trial deviance ≈ best, so the monotone partial reaches the cap only near the end — the
+  wave-abort never fires early. Reverted.
+- The other 5 survivors were S-effort ~0 cleanups (fit_raw clone, alpha gating, etc.) already
+  established as latency-hidden in the boosting-loop overhead band.
+
+**Verdict — the engine is at its safe-Rust floor.** Unlike pass 2's "floor" (a cache GUESS that the
+jagged stride disproved), this is grounded: the histogram is now THROUGHPUT-bound (irreducible op
+count, L1-resident scatter), and the logistic line-search rejects are genuinely sparse/late. The
+jagged stride (pass 3) was the last structural lever. Further training speedup requires fewer ops
+(G0 relaxation — fewer trees/axes/order, off the table) or `unsafe` SIMD (which won't help an
+L1-resident throughput-bound scatter much). Campaign training-speed frontier: closed.
