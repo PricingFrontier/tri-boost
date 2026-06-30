@@ -1020,3 +1020,15 @@ parallel bag loop. Recipe: lr=0.2, n_bags=8, bag_subsample<1 for classification,
 n_trees=16000 + early-stop (the standing rule). The original -4% gaps were UNDER-FITTING, not structure.
 REFUTED + discarded with evidence: cyclic, CTR combos, per-split re-sort, path_smooth, refine-off, T2
 mains-first ramp, OOB validation, T5 pair selection, ridge_refit/refine fitting. CAMPAIGN CLOSED.
+
+## Split-diversification levers tested too — confirm BANK (2026-06-30, final final)
+
+Hypothesis: weak pairs are STARVED by the deterministic greedy; diversify split selection to un-starve.
+Tested random_strength {1,4} and dart_drop_rate=0.03 on a winner (miami o2) and the behind one (particulate o2):
+- random_strength: NO effect on particulate (-1.61% -> -1.59%); slightly HELPS miami (+1.76% -> +2.86% at rs=4).
+- DART (0.03): BREAKS both catastrophically (miami -176%, particulate -40%) — a footgun at this config.
+Mechanism clarified: the team's oracle showed tri GROWS 27-28/28 pairs, so the weak pairs are GROWN, just
+UNDER-FIT (their 2D surface never converges). So GROWING levers (random_strength/colsample/DART) can't help
+(pairs already grown), and FITTING levers (ridge_refit) can't add capacity. Only dedicated per-pair (GA2M)
+boosting converges each grown surface — and the oracle proves that only ties. EXHAUSTED: selection, trees,
+refit, refine, random_strength, DART all fail, each for a now-understood reason. BANK stands, fully substantiated.
