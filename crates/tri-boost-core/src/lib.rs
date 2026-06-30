@@ -23,6 +23,7 @@
 pub mod backend;
 pub mod boosters;
 pub mod cat;
+pub mod cell_refit;
 pub mod constraints;
 pub mod data;
 pub mod engine;
