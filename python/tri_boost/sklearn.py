@@ -101,6 +101,8 @@ class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped 
         hist_precision: str | None = None,
         n_bags: int = 0,
         bag_subsample: float = 1.0,
+        cell_refit_base: float | None = None,
+        cell_refit_gamma: float = 2.0,
         ridge_refit_l2: float | None = None,
         ridge_refit_max_iter: int = 5,
         nesterov: bool = False,
@@ -143,6 +145,8 @@ class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped 
         self.hist_precision = hist_precision
         self.n_bags = n_bags
         self.bag_subsample = bag_subsample
+        self.cell_refit_base = cell_refit_base
+        self.cell_refit_gamma = cell_refit_gamma
         self.ridge_refit_l2 = ridge_refit_l2
         self.ridge_refit_max_iter = ridge_refit_max_iter
         self.nesterov = nesterov
@@ -347,6 +351,8 @@ class _BaseTriBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped 
             hist_precision=self.hist_precision,
             n_bags=int(self.n_bags),
             bag_subsample=float(self.bag_subsample),
+            cell_refit_base=None if self.cell_refit_base is None else float(self.cell_refit_base),
+            cell_refit_gamma=float(self.cell_refit_gamma),
             ridge_refit_l2=None if self.ridge_refit_l2 is None else float(self.ridge_refit_l2),
             ridge_refit_max_iter=int(self.ridge_refit_max_iter),
             nesterov=bool(self.nesterov),
@@ -551,6 +557,8 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):  # type: ignore[misc]
         hist_precision: str | None = None,
         n_bags: int = 0,
         bag_subsample: float = 1.0,
+        cell_refit_base: float | None = None,
+        cell_refit_gamma: float = 2.0,
         ridge_refit_l2: float | None = None,
         ridge_refit_max_iter: int = 5,
         nesterov: bool = False,
@@ -594,6 +602,8 @@ class TriBoostClassifier(ClassifierMixin, _BaseTriBoost):  # type: ignore[misc]
             hist_precision=hist_precision,
             n_bags=n_bags,
             bag_subsample=bag_subsample,
+            cell_refit_base=cell_refit_base,
+            cell_refit_gamma=cell_refit_gamma,
             ridge_refit_l2=ridge_refit_l2,
             ridge_refit_max_iter=ridge_refit_max_iter,
             nesterov=nesterov,
