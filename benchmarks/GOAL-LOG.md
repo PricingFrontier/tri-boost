@@ -919,3 +919,22 @@ production-generalization-not-artifacts.
 CAMPAIGN STATUS: with the honest feature set, tri TIES-OR-WINS EBM on all 5 datasets at depth-1
 (diamonds/allstate/particulate ties, miami ~tie, kick win). interpret now installed => fair_compare runs
 LIVE EBM (no more stale cache).
+
+## Parallel bag loop (✅) + T2 mains-first ramp (❌ refuted) (2026-06-30)
+
+### ✅ Parallel bag loop — byte-identical speed win
+fit_outer_bag now grows the bags via rayon `into_par_iter` collected IN BAG ORDER (soup_models folds in
+that fixed order), so it is byte-identical to the sequential fit across thread counts (verified 1 vs 4).
+Nests with fit_single's own rayon via the shared pool (work-stealing). Speedup (n_bags=8, f=1.0):
+diamonds 65s->29s (2.2x), miami 21s->6.8s (3.1x), allstate 434s->362s (1.2x). Small datasets win big
+(per-bag work underuses cores); big datasets get little here (inner histogram already saturates) — which is
+exactly where subagging does the speed work. Together they cover both regimes.
+
+### ❌ T2 mains-first staged max_order ramp — REFUTED, reverted
+Grew order-1 until the validation plateaued, then switched interactions on. Measured WORSE at o2 on 3/4:
+diamonds 0.10749 (= o1 EXACTLY — order-2 phase contributed nothing), miami 0.16136 (vs greedy 0.13280),
+allstate 0.54781 (vs 0.54403); only kick improved (0.76841 vs 0.76055). Mechanism: fully converging the
+mains drives the residual gradient too small for pair splits to clear min_split_gain, so interactions are
+never grown — the greedy's INTERLEAVING (capture pairs while the residual is still large) is strictly
+better. kick's gain was overfit-regularization, not interaction quality (its real fix is T5 pair selection).
+Greedy interleaving stays the default.

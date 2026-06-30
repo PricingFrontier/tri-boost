@@ -38,6 +38,7 @@ use crate::error::PbError;
 use crate::loss::{GradHess, Link};
 use crate::serialize::SCHEMA_VERSION;
 use rand::RngCore;
+use rayon::prelude::*;
 
 fn invalid_config(what: &'static str) -> PbError {
     PbError::InvalidConfig { what: what.into() }
@@ -811,39 +812,43 @@ fn fit_outer_bag(
     }
 
     let n_rows = x.n_rows as usize;
-    let mut members = Vec::new();
-    members
-        .try_reserve_exact(usize::from(n_bags))
-        .map_err(|_| PbError::Internal {
-            what: "OuterBag member allocation failed".into(),
-        })?;
     let alpha = 1.0_f64 / f64::from(n_bags);
     // bag_subsample >= 1 ⇒ full-size bootstrap WITH replacement (classic bagging); < 1 ⇒
     // without-replacement subagging of round(f * n_rows) rows (faster, more diverse, leak-free).
     let subsample = bag_subsample < 1.0;
     let sample_len =
         (((n_rows as f64) * f64::from(bag_subsample)).round() as usize).clamp(1, n_rows);
-    for bag in 0..n_bags {
-        let bag_round = u32::from(bag);
-        let rows = if subsample {
-            subagging_rows(spec.seed, bag_round, n_rows, sample_len)?
-        } else {
-            bootstrap_rows(spec.seed, bag_round, n_rows, n_rows)?
-        };
-        let data = row_subset(x, y, spec.weight, spec.exposure, &rows)?;
-        let bag_seed = pb_seed(spec.seed, bag_round, Stage::Sample as u32, 0);
-        let bag_spec = FitSpec {
-            loss: spec.loss,
-            weight: data.weight.as_deref(),
-            exposure: data.exposure.as_deref(),
-            monotone: spec.monotone.clone(),
-            interaction: spec.interaction.clone(),
-            credibility: spec.credibility,
-            seed: bag_seed,
-        };
-        let model = fit_single(&base_config, &data.x, &data.y, &bag_spec, cat_encoders)?;
-        members.push(WeightedModel { alpha, model });
-    }
+    // Bags are independent (each seeded by its index) and collected IN BAG ORDER, so fitting them
+    // concurrently is byte-identical to the sequential fit regardless of thread count; soup_models
+    // then folds the members in that fixed order. Nests with fit_single's own rayon parallelism on the
+    // shared pool (work-stealing), which is what recovers speed in the small-bag regime that
+    // per-bag row subsampling cannot.
+    let members: Vec<WeightedModel> = (0..usize::from(n_bags))
+        .into_par_iter()
+        .map(|bag| -> Result<WeightedModel, PbError> {
+            let bag_round = u32::try_from(bag).map_err(|_| PbError::Internal {
+                what: "OuterBag bag index exceeded u32".into(),
+            })?;
+            let rows = if subsample {
+                subagging_rows(spec.seed, bag_round, n_rows, sample_len)?
+            } else {
+                bootstrap_rows(spec.seed, bag_round, n_rows, n_rows)?
+            };
+            let data = row_subset(x, y, spec.weight, spec.exposure, &rows)?;
+            let bag_seed = pb_seed(spec.seed, bag_round, Stage::Sample as u32, 0);
+            let bag_spec = FitSpec {
+                loss: spec.loss,
+                weight: data.weight.as_deref(),
+                exposure: data.exposure.as_deref(),
+                monotone: spec.monotone.clone(),
+                interaction: spec.interaction.clone(),
+                credibility: spec.credibility,
+                seed: bag_seed,
+            };
+            let model = fit_single(&base_config, &data.x, &data.y, &bag_spec, cat_encoders)?;
+            Ok(WeightedModel { alpha, model })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     soup_models(&members)
 }
 
