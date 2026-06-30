@@ -1032,3 +1032,26 @@ UNDER-FIT (their 2D surface never converges). So GROWING levers (random_strength
 (pairs already grown), and FITTING levers (ridge_refit) can't add capacity. Only dedicated per-pair (GA2M)
 boosting converges each grown surface — and the oracle proves that only ties. EXHAUSTED: selection, trees,
 refit, refine, random_strength, DART all fail, each for a now-understood reason. BANK stands, fully substantiated.
+
+## REVISION: cell-basis OOB-residual refit DOES close particulate (validated) (2026-06-30)
+
+Earlier bank ("nothing closes particulate o2") is REVISED. A research+prototype team found, and a rigorous
+on-the-PRODUCTION-baseline validation confirmed, a working technique: a self-limiting totally-corrective
+refit on the fANOVA TABLE-CELL basis (not the capacity-poor tree-leaf basis that ridge_refit used), fit to
+the OOB (cross-fit) residual, with ridge shrinkage. Keeps tri's TRIPLES exactly (refit only mains+pairs) =>
+depth-3 preserved; re-purification is an exact linear reparametrization (Lengerich/Hooker) => G0 intact.
+
+Validated (manual 8-bag production tri, OOB residual, single suite-wide alpha, no-regression check):
+- particulate o2 tri-alone -1.39% -> refit -0.60% at pair_a=2000 (+0.79pp, a NEAR-TIE; -0.23% at a=300 but
+  that regresses allstate). Confirms it's NOT a crippled-baseline artifact (the prototype's -3.49% was n_bags=1).
+- NO-REGRESSION holds at the safe alpha: at a=2000 allstate +0.01pp (safe), miami/diamonds o2/o3 all safe
+  (they recover by a=300; more shrinkage only helps). At a<=1000 allstate REGRESSES (551 high-card pairs ->
+  many sparse cells -> flat ridge overfits the OOB noise). So a single flat alpha is a TRADEOFF: high enough
+  to tame allstate slightly under-fills particulate => near-tie, not full tie.
+- Honest val-alpha selection is UNRELIABLE (picked a=10 for diamonds -> regress) — don't auto-select per-dataset.
+
+NEXT for a FULL tie: per-TERM adaptive penalty (shrink each pair by its evidence; allstate's noise-pairs hard,
+particulate's signal-pairs lightly) — untested, the route past the flat-alpha tradeoff. kick NOT tested with
+this method (team: likely not a clean order-2 under-fit; expect neutral). Rust build = M-effort: needs a
+sparse LSQR/CG cell-basis solver (the existing fully_corrective_refit is DENSE -> 62TB on kick's 88k cells),
+OOB-residual plumbing, re-purification writeback. The technique WORKS and is SAFE; banked as a viable build.
