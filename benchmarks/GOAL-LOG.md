@@ -1079,3 +1079,28 @@ in the build (robustness across the base=4000 region + uniform winner-improvemen
 exact purified grid. BUILD = M-effort: sparse LSQR/CG cell-basis solver (existing refit is dense -> 62TB on
 kick), OOB-residual plumbing through the bag loop, per-term adaptive reweighting, re-purification writeback.
 Reverses the "interactions can't be fit as well" verdict: they CAN, validated.
+
+## Pre-build de-risk checks BOTH PASS — adaptive cell-refit improves every dataset (2026-06-30)
+
+CHECK 1 (held-out config selection): on a 20% train val carve, ALL configs base=2000-8000 have every
+WINNER val-nonneg (no-regression is val-confirmed, not test-luck) and particulate val-positive; base~4000
+is a robust plateau (selectable, not test-overfit). Caveat retired. (val-carve costs data: particulate
+-0.26..-0.36% here vs -0.18% full-data, so production build closes it MORE.)
+CHECK 2 (kick, logistic Newton-step adaptive): team's "neutral" prediction WRONG — kick IMPROVES too,
+-0.82% -> -0.47% (+0.35pp). The method helps clf as well.
+
+Consolidated (per-term adaptive cell-refit, base~4000 g~2, production 8-bag OOB):
+| dataset | tri-alone | refit |
+| particulate o2 | -1.39% | -0.18% TIE |
+| kick o2 | -0.82% | -0.47% near-tie |
+| allstate o2 | -0.04% | +0.03% win |
+| miami o2 | +4.01% | +4.34% win |
+| diamonds o2 | +0.26% | +1.21% win |
+| diamonds o3 | +4.38% | +4.83% win |
+=> a GENERAL interaction-fitting upgrade: fills under-fit datasets a lot, tightens winners a little,
+held-out-validated, G0-exact, depth-3 kept. GREENLIT for the Rust build.
+
+BUILD plan (M-L): (1) sparse cell-indicator design on tri's purified grid + LSQR/CG solver (existing
+fully_corrective_refit is dense -> infeasible at cell width); (2) OOB residual through the bag loop;
+(3) per-term adaptive reweight (flat init -> s_term^gamma -> refit); (4) re-purify writeback -> exact
+<=d tables; (5) base/gamma as suite-wide params; (6) determinism + G0 + byte-identical-across-threads gates.
