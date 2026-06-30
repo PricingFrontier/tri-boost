@@ -1134,3 +1134,24 @@ Build increments: (1) plumbing skeleton + G0 test with a hand-set delta [predict
 (2) sparse cell design + iterative ridge + adaptive reweight (unit-tested); (3) OOB residual in fit_outer_bag
 + wire solve after soup + config flag; (4) benchmark reproduce (particulate -1.39->-0.18 tie, kick near-tie,
 winners improve, depth-3 kept) + determinism across 1/2/8 threads.
+
+## RUST BUILD COMPLETE — G1 cell-refit shipped + first validation (2026-06-30)
+
+All 5 implementation increments committed (79a..77.. series): (1) correction plumbing on Model
+(predict + decompose fold + all 5 G0 gates, hand-set-delta test); (2) sparse cell-basis design +
+diagonally-preconditioned CG adaptive-ridge solver (2 unit tests); (3) OOB residual in fit_outer_bag
++ Newton working residual (z=-g/h, weight h via grad_hess; reg+clf) + correctable_supports (mains+pairs,
+triples untouched) + attach (e2e test: G0 exact + byte-identical across 1/2/8 threads); (5) sklearn
+cell_refit_base/gamma -> pyo3 -> EnsembleSpec::OuterBag.cell_refit. 238/238 core tests pass. .so rebuilt
+via cargo build --release -p tri-boost-py (maturin absent).
+
+VALIDATION (real Rust, internal bagging+OOB+refit; recipe = prototype: n_trees, lr=0.20, leaf_refine=4,
+8 bags f=0.8, early-stop 300):
+  diamonds o2: tri bagged +0.45% -> +cell_refit(4000,2) +0.99% vs EBM (Δtri +0.54pp); refit model
+  decomposes into 45 exact tables orders [1,2] => G0 holds on the corrected model. WORKS end-to-end.
+Gain a touch below the Python prototype's +0.96pp because the Rust correction lives on the model's
+MERGED grid (realized borders) vs the prototype's separate 254/24-bin design — a resolution/tuning lever,
+not correctness. particulate o2 (the tie target, 394k) running.
+
+KNOWN LEVERS if a dataset under-delivers vs prototype: (a) finer correction grid than merged borders;
+(b) base/gamma; (c) n_bags coverage (8 -> 83% OOB covered; fewer bags = noisier residual).
