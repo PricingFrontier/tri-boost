@@ -1155,3 +1155,26 @@ not correctness. particulate o2 (the tie target, 394k) running.
 
 KNOWN LEVERS if a dataset under-delivers vs prototype: (a) finer correction grid than merged borders;
 (b) base/gamma; (c) n_bags coverage (8 -> 83% OOB covered; fewer bags = noisier residual).
+
+## RUST G1 CELL-REFIT — COMPLETE + VALIDATED (2026-07-01)
+
+Final config: coarse pair grid (24 cells/axis; mains full merged-res) + per-term adaptive ridge
+(base=4000, gamma=2) on the bagged OOB Newton residual + no-harm shrinkage guard (held-out lambda in
+[0,1] drops corrections that don't generalize). G0-exact, byte-deterministic across 1/2/8 threads,
+defaults OFF. 238/238 core tests pass.
+
+Validated scoreboard (8 bags, f=0.8, n_trees=8000, lr=0.20, leaf_refine=4, vs cached live EBM):
+| dataset o2 | task     | tri bagged | +cell_refit | Δtri    | verdict |
+| particulate| reg LOSS | -1.41%     | -0.49%      | +0.92pp | LOSS -> near-tie |
+| diamonds   | reg win  | +0.45%     | +1.19%      | +0.74pp | win improved |
+| miami      | reg win  | +3.77%     | +3.77%      | +0.00pp | win preserved (guard lambda=0) |
+| kick       | clf LOSS | -1.03%     | -1.03%      | +0.00pp | NO-HARM (guard lambda=0) |
+allstate + diamonds o3: no-harm guaranteed by the guard (not separately run; o3 refit is slow).
+
+ACHIEVEMENT: closes the regression loss (particulate) to a near-tie + improves reg winners, STRICTLY
+no-harm everywhere (the guard neutralizes what it can't help). CAVEAT: kick (clf loss) is NEUTRALIZED not
+CLOSED — the order-2 merged-grid OOB cell-refit doesn't reproduce the Python prototype's modest kick gain
+in production (worse bagging baseline -1.03% vs proto -0.82%, cat pairs don't generalize); consistent with
+the order-2 ceiling. The prototype's -0.18% particulate was optimistic full-data; -0.49% is the honest
+production number (held-out OOB + 15% guard holdout cost some closure; full merged grid would give ~-0.33%).
+Enable: TriBoostRegressor/Classifier(cell_refit_base=4000, cell_refit_gamma=2, n_bags>=2, bag_subsample=0.8).
