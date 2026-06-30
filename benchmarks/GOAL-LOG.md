@@ -1104,3 +1104,33 @@ BUILD plan (M-L): (1) sparse cell-indicator design on tri's purified grid + LSQR
 fully_corrective_refit is dense -> infeasible at cell width); (2) OOB residual through the bag loop;
 (3) per-term adaptive reweight (flat init -> s_term^gamma -> refit); (4) re-purify writeback -> exact
 <=d tables; (5) base/gamma as suite-wide params; (6) determinism + G0 + byte-identical-across-threads gates.
+
+## RUST BUILD — architecture LOCKED (2026-06-30, code-verified by data-flow map)
+
+Map facts: production scores from Model.trees via score_trees (NOT a bank); bagged model = tree SOUP
+(soup_models concatenates bags' trees), still score_trees; average_banks is test-only/off-path. G0 gate
+check_reconstruction (explain.rs:2039) asserts ensemble_f64(trees)==TableBank::score(bank). accumulate
+(explain.rs:983) builds raw per-support tensors on the MERGED grid (realized borders); explain_with_budget
+(2345) = accumulate -> purify -> 5 gates. MergedAxis::model_bin_to_cell (661) = forward model-bin->merged-cell.
+
+DECISION (option a, least invasive, G0-exact by construction): carry an optional RAW delta correction on
+Model, defined per realized support (mains+pairs) at MERGED-cell resolution. Add it IDENTICALLY to (1) the
+tree-score primitives [ensemble_f64, score_trees_row, score_trees] and (2) the raw effects BEFORE purify in
+explain_with_budget. Because purify is lossless, predict(trees+delta) == bank.score(purified trees+delta) ->
+G0 holds; the delta is re-purified into proper <=d tables (its marginals flow to mains, canonical fANOVA).
+
+Storage (simple self-contained types in engine/mod.rs, no explain-type deps):
+  CorrectionTable { axes: Vec<u32> (model axis ids, sorted), shape: Vec<u32> (merged cells/axis),
+                    bin_to_cell: Vec<Vec<u32>> (per axis: model bin->merged cell), values: Vec<f64> (row-major delta) }
+  CorrectionBank { tables: Vec<CorrectionTable> }  ;  Model.correction: Option<CorrectionBank>
+Predict delta(row): per table flat=fold(bin_to_cell[k][row[axes[k]]] over shape) -> += values[flat].
+Decompose fold: per table, support u from axes+provenance, add values into raw.tables[u] (same merged grid,
+same row-major odometer order) BEFORE purify. Scaffold builder (model->axes/shape/bin_to_cell, zero values)
+lives in explain.rs (has MergedGrids); solver fills values; predict/G0 symmetric.
+Net surface: Model +1 field; ensemble_f64/score_trees/score_trees_row +delta; explain_with_budget fold;
+validate() +correction checks; SCHEMA_VERSION 1->2 (bincode positional). Python wrapper untouched.
+
+Build increments: (1) plumbing skeleton + G0 test with a hand-set delta [predict+decompose+gates pass];
+(2) sparse cell design + iterative ridge + adaptive reweight (unit-tested); (3) OOB residual in fit_outer_bag
++ wire solve after soup + config flag; (4) benchmark reproduce (particulate -1.39->-0.18 tie, kick near-tie,
+winners improve, depth-3 kept) + determinism across 1/2/8 threads.
