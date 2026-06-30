@@ -74,11 +74,16 @@ class Dataset:
     task: str          # "regression" | "binary"
     log_target: bool = True   # regression: fit/score on log1p(y) (heavy-tail-appropriate)
     note: str = ""
+    # Columns dropped at load time. Used to remove leaky / non-generalizable features whose only
+    # benchmark value comes from the random split (e.g. a high-cardinality timestamp memorized
+    # because every level is shared train/test — useless when predicting future dates in production).
+    drop_cols: tuple[str, ...] = ()
 
 
 DATASETS = [
     Dataset("allstate", 42571, "regression", note="insurance severity; cat≤326; heavy tail"),
-    Dataset("particulate", 42207, "regression", note="high-card location + heavy tail + spatial"),
+    Dataset("particulate", 42207, "regression", note="high-card location + heavy tail + spatial",
+            drop_cols=("datetime",)),  # 8760-level hourly timestamp: random-split memorization, not real signal
     Dataset("diamonds", 46923, "regression", note="TabArena; order-3 carat×cut×color×clarity"),
     Dataset("miami_housing", 46942, "regression", note="TabArena; heavy tail + spatial"),
     Dataset("amazon_access", 4135, "binary", log_target=False, note="extreme high-card (7518 levels)"),
@@ -92,10 +97,13 @@ def load_xy(spec: Dataset) -> tuple[pd.DataFrame, pd.Series]:
     path = os.path.join(_DATA_CACHE, f"{spec.data_id}.joblib")
     if os.path.exists(path):
         X, y = joblib.load(path)
-        return X, y
-    bunch = fetch_openml(data_id=spec.data_id, as_frame=True)
-    X, y = bunch.data, bunch.target
-    joblib.dump((X, y), path)
+    else:
+        bunch = fetch_openml(data_id=spec.data_id, as_frame=True)
+        X, y = bunch.data, bunch.target
+        joblib.dump((X, y), path)  # cache the RAW frame; drops are applied on load (reversible)
+    drop = [c for c in spec.drop_cols if c in X.columns]
+    if drop:
+        X = X.drop(columns=drop)
     return X, y
 
 

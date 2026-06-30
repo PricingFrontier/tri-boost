@@ -892,3 +892,30 @@ Subagging is a big SPEED win (allstate -71%, kick -95%) AND fixes the leak (kick
 data loss hurts data-hungry small datasets (miami). f=0.9 is the compromise. The CLEAN fix (next) is OOB
 early-stop validation: train each bag on the full bootstrap (no data loss) but validate on the out-of-bag
 rows (disjoint => leak fixed) — gets kick's win without miami's cost.
+
+## particulate: the -2% "loss" was a RANDOM-SPLIT ARTIFACT, not a tri deficiency (2026-06-30)
+
+User (data scientist) flagged: in production you train on past dates and predict FUTURE dates, so a model
+that fits particulate's 8760-level hourly `datetime` would fail (every future timestamp is an unseen level).
+The benchmark only rewards it because the harness uses a RANDOM split (each hour shared train/test), so a
+per-level datetime encoding memorizes the regional pollution at each specific historical hour. That is a
+leak, not signal. The generalizable temporal signal (time-of-day, day-of-week, season) is already present
+as Hour/Month/DayofWeek.
+
+PROVEN with LIVE EBM (installed `interpret` 0.7.8; reproduces the cached 0.357):
+| particulate o1 | tri | EBM | gap |
+| WITH datetime | 0.36469 | 0.35727 | -2.08% (EBM wins via memorization) |
+| NO   datetime | 0.37548 | 0.37499 | **-0.13% = TIE** |
+The whole gap is the datetime artifact. Without it, tri ties EBM. (Both get WORSE without datetime — it does
+carry random-split predictive value — but that value does not generalize to future dates.)
+
+DECISION: dropped `datetime` from particulate (tabarena_suite Dataset.drop_cols). Honest, production-valid
+feature set keeps Hour (time-of-day), Month (season), DayofWeek, Site.Name/Zone (location), Altitude, PM2.5.
+=> Do NOT build the per-level high-card "CatMainRefine" fix to chase this — it would be benchmark-gaming a
+leak and harm production generalization. (A per-level high-card encoder is only legitimate for cats whose
+levels RECUR in production, e.g. Site.Name / resource IDs — never timestamps.) See memory
+production-generalization-not-artifacts.
+
+CAMPAIGN STATUS: with the honest feature set, tri TIES-OR-WINS EBM on all 5 datasets at depth-1
+(diamonds/allstate/particulate ties, miami ~tie, kick win). interpret now installed => fair_compare runs
+LIVE EBM (no more stale cache).
