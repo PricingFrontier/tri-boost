@@ -2321,6 +2321,7 @@ mod tests {
                 },
             },
             schema_version: crate::serialize::SCHEMA_VERSION,
+            correction: None,
         }
     }
 

@@ -21,7 +21,10 @@ pub const FORMAT_VERSION: u32 = 1;
 
 /// The `Model`/`schema` wire-schema version (spec §2.6). A single monotone `u32`
 /// bumped on any wire-incompatible change to the model contents.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2: added the optional `Model::correction` cell-basis refit field (§G1). bincode is
+/// positional, so appending a field is wire-breaking for older readers.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The serialized envelope (spec §02.8): a plain nested `{ format_version,
 /// schema_version, model }`. No `#[serde(flatten)]` — it does not round-trip through

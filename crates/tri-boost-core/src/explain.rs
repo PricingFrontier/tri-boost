@@ -2086,6 +2086,44 @@ fn ensemble_w_mean(model: &Model, grids: &MergedGrids, w: &WeightCache) -> Resul
         })?;
         mass += f64::from(*alpha) * tree_int;
     }
+    // The cell-basis correction is added to `ensemble_f64`, so its w-weighted mass must be
+    // accounted here too — otherwise it lands only in `bank.f0` (via the purify cascade) and
+    // mass conservation (I2.2: `E_w[F_ens] == f0`) fails by exactly `Σ_cells w·delta`.
+    if let Some(corr) = &model.correction {
+        for table in &corr.tables {
+            let mut raws = Vec::with_capacity(table.axes.len());
+            for &axis in &table.axes {
+                raws.push(
+                    model
+                        .provenance
+                        .get(axis as usize)
+                        .ok_or_else(|| PbError::Internal {
+                            what: format!("correction mass axis {axis} absent from provenance"),
+                        })?
+                        .raw,
+                );
+            }
+            let extents: Vec<usize> = table.shape.iter().map(|&s| s as usize).collect();
+            let mut flat = 0usize;
+            walk_extents(&extents, |tuple| {
+                let mut wprod = 1.0_f64;
+                for (k, r) in raws.iter().enumerate() {
+                    let cell = *tuple.get(k).ok_or_else(|| PbError::Internal {
+                        what: "correction mass tuple shorter than support".into(),
+                    })?;
+                    wprod *= *w.axis(*r)?.get(cell).ok_or_else(|| PbError::Internal {
+                        what: "correction mass cell escaped axis weights".into(),
+                    })?;
+                }
+                let v = *table.values.get(flat).ok_or_else(|| PbError::Internal {
+                    what: "correction mass flat index escaped values".into(),
+                })?;
+                flat += 1;
+                mass += wprod * v;
+                Ok(())
+            })?;
+        }
+    }
     Ok(mass)
 }
 
@@ -2410,6 +2448,7 @@ impl Model {
 
         let grids = MergedGrids::from_model(self)?;
         let (mut raw, factored_supports) = accumulate(self, &grids, &budget)?;
+        fold_correction_into_raw(self, &grids, &mut raw)?;
         let weights = build_weights(x, &grids, &w)?;
         // §08.10: shed each over-budget order-3 support per tree into the dense lower tables,
         // keeping the residual factored (no dense cube). No-op when none are over budget.
@@ -2435,6 +2474,145 @@ impl Model {
         check_three_way_equal(self, &bank)?;
         Ok(bank)
     }
+}
+
+/// Fold a model's cell-basis correction (the §G1 adaptive fANOVA-cell refit) into the
+/// raw per-support tensors, in place, BEFORE purify. Each correction table's raw delta is
+/// added cell-for-cell on the merged grid; a zero raw table is inserted first when the
+/// support was not a realized tree support (e.g. a pure main whose feature only appeared
+/// inside higher-order trees). No-op when the model carries no correction.
+///
+/// This is the decompose half of the G0-exact symmetry: the SAME raw delta that
+/// [`Model::correction_delta`] adds to the tree score is added here to the raw effects, so
+/// `purify` re-expresses `trees + delta` losslessly and `bank.score == ensemble_f64`.
+fn fold_correction_into_raw(
+    model: &Model,
+    grids: &MergedGrids,
+    raw: &mut RawBank,
+) -> Result<(), PbError> {
+    let Some(bank) = &model.correction else {
+        return Ok(());
+    };
+    for table in &bank.tables {
+        // Support = sorted raw feature ids of the corrected axes (green-spine: raw == axis).
+        let mut u_ids: SmallVec<[FeatureId; 3]> = SmallVec::new();
+        for &axis in &table.axes {
+            let raw_id = model
+                .provenance
+                .get(axis as usize)
+                .ok_or_else(|| PbError::Internal {
+                    what: format!("correction axis {axis} absent from provenance"),
+                })?
+                .raw;
+            if !u_ids.contains(&raw_id) {
+                u_ids.push(raw_id);
+            }
+        }
+        u_ids.sort_unstable();
+        let u = FeatureSet(u_ids.clone());
+        // The correction's merged shape must match this model's merged grid for the support.
+        let mut extents = Vec::with_capacity(u_ids.len());
+        for r in &u_ids {
+            extents.push(grids.cells(*r)?);
+        }
+        if extents.len() != table.shape.len()
+            || extents
+                .iter()
+                .zip(&table.shape)
+                .any(|(&e, &s)| e != s as usize)
+        {
+            return Err(PbError::Internal {
+                what: format!(
+                    "correction shape {:?} != merged extents {extents:?} for {u:?}",
+                    table.shape
+                ),
+            });
+        }
+        if !raw.tables.contains_key(&u) {
+            let mut axes = Vec::with_capacity(u_ids.len());
+            for r in &u_ids {
+                axes.push(grids.axis_id(*r)?);
+            }
+            raw.tables.insert(
+                u.clone(),
+                RawTable {
+                    u: u.clone(),
+                    axes,
+                    values: Tensor::try_zeros(extents.clone())?,
+                },
+            );
+        }
+        let rt = raw.tables.get_mut(&u).ok_or_else(|| PbError::Internal {
+            what: "correction raw table vanished after insert".into(),
+        })?;
+        // Add the raw delta cell-for-cell. `walk_extents` enumerates the merged cells in the
+        // same row-major (last-axis-fastest) order the `values` vector was built in.
+        let mut flat = 0usize;
+        walk_extents(&extents, |tuple| {
+            let v = *table.values.get(flat).ok_or_else(|| PbError::Internal {
+                what: "correction flat index escaped values during fold".into(),
+            })?;
+            flat += 1;
+            rt.values.add(tuple, v)
+        })?;
+    }
+    Ok(())
+}
+
+/// Build a zero-valued cell-basis correction scaffold for `supports` (each a sorted list
+/// of model axis ids of size 1..=3), at the model's merged-grid resolution. Fills `shape`
+/// (merged cells per axis) and `bin_to_cell` (model bin → merged cell, the exact forward
+/// map predict uses); leaves `values` zeroed for the §G1 solver to fill. Centralises the
+/// merged-grid logic so predict, the decompose fold, and the solver share one cell layout.
+///
+/// # Errors
+/// [`PbError::Internal`] if an axis is absent from the model or a bin/cell exceeds `u8`/`u32`.
+pub(crate) fn correction_scaffold(
+    model: &Model,
+    supports: &[Vec<u32>],
+) -> Result<crate::engine::CorrectionBank, PbError> {
+    let grids = MergedGrids::from_model(model)?;
+    let mut tables = Vec::with_capacity(supports.len());
+    for axes in supports {
+        let mut shape = Vec::with_capacity(axes.len());
+        let mut bin_to_cell = Vec::with_capacity(axes.len());
+        for &axis in axes {
+            let raw = model
+                .provenance
+                .get(axis as usize)
+                .ok_or_else(|| PbError::Internal {
+                    what: format!("correction scaffold axis {axis} absent from provenance"),
+                })?
+                .raw;
+            let n_cells = grids.cells(raw)?;
+            shape.push(u32::try_from(n_cells).map_err(|_| PbError::Internal {
+                what: "merged cell count exceeded u32".into(),
+            })?);
+            let grid = model
+                .grids
+                .get(axis as usize)
+                .ok_or_else(|| PbError::Internal {
+                    what: format!("correction scaffold axis {axis} absent from grids"),
+                })?;
+            let axis_merged = grids.axis(raw)?;
+            let mut map = Vec::with_capacity(usize::from(grid.n_bins));
+            for bin in 0..grid.n_bins {
+                let b = u8::try_from(bin).map_err(|_| PbError::Internal {
+                    what: "model bin exceeded u8 in correction scaffold".into(),
+                })?;
+                map.push(axis_merged.model_bin_to_cell(b)?);
+            }
+            bin_to_cell.push(map);
+        }
+        let cells: usize = shape.iter().map(|&s| s as usize).product();
+        tables.push(crate::engine::CorrectionTable {
+            axes: axes.clone(),
+            shape,
+            bin_to_cell,
+            values: vec![0.0; cells],
+        });
+    }
+    Ok(crate::engine::CorrectionBank { tables })
 }
 
 /// The pre-purify exact-accumulation checkpoint (spec §08.2): `f0 + Σ_u T_raw[u](x) ==
@@ -3069,6 +3247,7 @@ pub fn fixture_model() -> Model {
         mode: ExactnessMode::Exact,
         schema: fixture_schema(),
         schema_version: crate::serialize::SCHEMA_VERSION,
+        correction: None,
     }
 }
 
@@ -3124,6 +3303,7 @@ pub fn fixture_over_budget_model() -> Model {
         },
         schema: fixture_schema(),
         schema_version: crate::serialize::SCHEMA_VERSION,
+        correction: None,
     }
 }
 
@@ -4438,6 +4618,53 @@ mod tests {
     }
 
     #[test]
+    fn correction_preserves_g0_and_shifts_prediction() {
+        // A 2-feature target WITH a {0,1} interaction, so the model realizes the pair.
+        let n = 64usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 4 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| ((i / 4) % 4 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                let a = if x0[i] <= 2.0 { 10.0 } else { 20.0 };
+                let b = if x1[i] <= 2.0 { 5.0 } else { 0.0 };
+                let ab = if x0[i] <= 2.0 && x1[i] <= 2.0 { 7.0 } else { 0.0 };
+                a + b + ab
+            })
+            .collect();
+        let (mut model, x) = fit(&[x0, x1], &y, exact_cfg(40));
+
+        // Baseline decomposition passes the five gates.
+        let base_bank = model.explain(&x, RefMeasure::default()).unwrap();
+        assert_exact_decomposition(&model, &base_bank, &x).unwrap();
+        let row = [1u8, 1u8];
+        let base_score = model.ensemble_f64(&row).unwrap();
+
+        // Attach a raw cell-basis correction: a main on axis 0 AND the {0,1} pair.
+        let mut corr = correction_scaffold(&model, &[vec![0], vec![0, 1]]).unwrap();
+        for (c, v) in corr.tables[0].values.iter_mut().enumerate() {
+            *v = 0.25 + 0.1 * c as f64;
+        }
+        for (c, v) in corr.tables[1].values.iter_mut().enumerate() {
+            *v = -0.2 + 0.05 * c as f64;
+        }
+        model.correction = Some(corr);
+        model.validate().unwrap();
+
+        // Prediction moves by EXACTLY the correction delta at `row`.
+        let corr_score = model.ensemble_f64(&row).unwrap();
+        let delta = model.correction_delta(&row).unwrap();
+        assert!(delta.abs() > 1e-9, "correction must be nonzero");
+        assert!((corr_score - base_score - delta).abs() < 1e-12);
+
+        // G0 WITH the correction present: explain re-runs all five exactness gates internally
+        // (reconstruction ties ensemble_f64 == bank.score), and they must still pass.
+        let bank = model.explain(&x, RefMeasure::default()).unwrap();
+        assert_exact_decomposition(&model, &bank, &x).unwrap();
+        // The correction's marginal flowed into the decomposition (a {0} or {0,1} table exists).
+        assert!(!bank.tables.is_empty());
+    }
+
+    #[test]
     fn empty_model_explains_to_intercept_only() {
         // A constant target → no trees → the bank is just f0 (== mean), gates trivial.
         let (model, x) = fit(
@@ -4516,6 +4743,7 @@ mod tests {
                 },
             },
             schema_version: crate::serialize::SCHEMA_VERSION,
+            correction: None,
         };
         let x = ServeBinnedMatrix(BinnedMatrix {
             data: vec![vec![0, 1, 2, 1, 2]], // a genuine missing (bin 0) row at index 0
@@ -4590,6 +4818,7 @@ mod tests {
                 },
             },
             schema_version: crate::serialize::SCHEMA_VERSION,
+            correction: None,
         };
         let serve = ServeBinnedMatrix(crate::data::BinnedMatrix {
             data: vec![

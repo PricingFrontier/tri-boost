@@ -718,6 +718,7 @@ fn fit_single(
         mode: ExactnessMode::Exact,
         schema,
         schema_version: SCHEMA_VERSION,
+        correction: None,
     })
 }
 
@@ -1392,6 +1393,7 @@ fn soup_models(members: &[WeightedModel]) -> Result<Model, PbError> {
         mode: ExactnessMode::Exact,
         schema: first.model.schema.clone(),
         schema_version: first.model.schema_version,
+        correction: None,
     };
     model.validate()?;
     Ok(model)

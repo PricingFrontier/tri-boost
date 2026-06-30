@@ -371,11 +371,44 @@ pub struct ModelSchema {
     pub objective: ObjectiveTag,
 }
 
+/// One per-support raw (pre-purification) correction table at merged-cell resolution.
+///
+/// The §G1 fully-corrective cell-basis refit solves a per-cell additive delta on the
+/// model's realized supports (mains + pairs), fit to the bagged out-of-bag residual on
+/// the fANOVA cell basis. The delta is stored RAW (unpurified) at the merged-grid
+/// resolution so it can be (a) added directly to the tree score at serve and (b) folded
+/// into the raw effects before [`purify`](crate::explain) during decomposition. Because
+/// purify is lossless, `trees + delta == purified(trees + delta)`, so G0 (the exact
+/// `ensemble == bank.score` reconstruction) holds by construction and the delta is
+/// re-purified into the canonical ≤order-d tables (its marginals flow to lower orders).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CorrectionTable {
+    /// Model axis ids of this support, sorted ascending (length = order, 1 or 2).
+    pub axes: Vec<u32>,
+    /// Merged cells per axis (parallel to `axes`); `Π shape == values.len()`.
+    pub shape: Vec<u32>,
+    /// Per axis (parallel to `axes`): model bin → merged cell id. `bin_to_cell[k].len()`
+    /// equals that axis's model `n_bins`; every entry is `< shape[k]`.
+    pub bin_to_cell: Vec<Vec<u32>>,
+    /// Raw additive delta, row-major over the merged cells (last axis fastest),
+    /// length `Π shape`.
+    pub values: Vec<f64>,
+}
+
+/// An optional cell-basis correction carried on a [`Model`]: a set of per-support raw
+/// deltas added to the tree score at serve and folded into the decomposition before
+/// purification. Empty `tables` is equivalent to `None`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CorrectionBank {
+    /// One table per corrected realized support (mains + pairs).
+    pub tables: Vec<CorrectionTable>,
+}
+
 /// The trained ensemble (spec §2.6): intercept + weighted oblivious trees, the
 /// shared binning grids, provenance, the loss/link, an exactness flag, and the
 /// serve/export schema.
 ///
-/// Inference: `raw(x) = f0 + offset + Σ alpha_t · tree_t.lookup(x)`.
+/// Inference: `raw(x) = f0 + offset + Σ alpha_t · tree_t.lookup(x) + correction(x)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     /// `link(weighted mean)` — a scalar intercept, never "tree 0".
@@ -394,6 +427,10 @@ pub struct Model {
     pub schema: ModelSchema,
     /// Monotone wire-version covering `Model` AND `schema`.
     pub schema_version: u32,
+    /// Optional cell-basis correction (the §G1 adaptive fANOVA-cell refit). Added to the
+    /// tree score at serve and folded into the raw effects before purify — G0-exact.
+    #[serde(default)]
+    pub correction: Option<CorrectionBank>,
 }
 
 impl Model {
@@ -572,6 +609,77 @@ impl Model {
                 }
             }
         }
+        if let Some(bank) = &self.correction {
+            for (t, table) in bank.tables.iter().enumerate() {
+                let order = table.axes.len();
+                if !(1..=3).contains(&order) {
+                    return Err(PbError::InvalidInput {
+                        what: format!("correction table {t} order {order} not in 1..=3"),
+                    });
+                }
+                if table.shape.len() != order || table.bin_to_cell.len() != order {
+                    return Err(PbError::ShapeMismatch {
+                        what: format!(
+                            "correction table {t}: axes {order}, shape {}, bin_to_cell {}",
+                            table.shape.len(),
+                            table.bin_to_cell.len()
+                        ),
+                    });
+                }
+                for (k, &axis) in table.axes.iter().enumerate() {
+                    if k > 0 && axis <= table.axes[k - 1] {
+                        return Err(PbError::InvalidInput {
+                            what: format!("correction table {t} axes not strictly ascending"),
+                        });
+                    }
+                    let grid =
+                        self.grids
+                            .get(axis as usize)
+                            .ok_or_else(|| PbError::ShapeMismatch {
+                                what: format!("correction table {t} axis {axis} absent from grids"),
+                            })?;
+                    let map = &table.bin_to_cell[k];
+                    if map.len() != usize::from(grid.n_bins) {
+                        return Err(PbError::ShapeMismatch {
+                            what: format!(
+                                "correction table {t} axis {axis} bin_to_cell len {} != n_bins {}",
+                                map.len(),
+                                grid.n_bins
+                            ),
+                        });
+                    }
+                    let extent = table.shape[k];
+                    if let Some(&bad) = map.iter().find(|&&c| c >= extent) {
+                        return Err(PbError::InvalidInput {
+                            what: format!(
+                                "correction table {t} axis {axis} cell {bad} >= shape {extent}"
+                            ),
+                        });
+                    }
+                }
+                let mut cells: usize = 1;
+                for &s in &table.shape {
+                    cells = cells.checked_mul(s as usize).ok_or_else(|| PbError::Internal {
+                        what: format!("correction table {t} shape product overflow"),
+                    })?;
+                }
+                if table.values.len() != cells {
+                    return Err(PbError::ShapeMismatch {
+                        what: format!(
+                            "correction table {t} values len {} != cell count {cells}",
+                            table.values.len()
+                        ),
+                    });
+                }
+                if let Some((c, &v)) =
+                    table.values.iter().enumerate().find(|(_, v)| !v.is_finite())
+                {
+                    return Err(PbError::InvalidInput {
+                        what: format!("correction table {t} value {c} must be finite, got {v}"),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -584,6 +692,45 @@ impl Model {
         let mut acc = f64::from(self.f0);
         for (alpha, tree) in &self.trees {
             acc += f64::from(*alpha) * f64::from(tree.lookup(row_bins)?);
+        }
+        acc += self.correction_delta(row_bins)?;
+        Ok(acc)
+    }
+
+    /// The cell-basis correction's additive contribution for one already-binned row
+    /// (`0.0` when there is no correction). Sums each table's raw delta at the merged
+    /// cell the row's model bins map to. This is the SAME quantity folded into the raw
+    /// effects before purify, so predict and the decomposed bank stay byte-identical (G0).
+    #[inline]
+    pub fn correction_delta(&self, row_bins: &[u8]) -> Result<f64, PbError> {
+        let Some(bank) = &self.correction else {
+            return Ok(0.0);
+        };
+        let mut acc = 0.0_f64;
+        for table in &bank.tables {
+            let mut flat = 0usize;
+            for (k, &axis) in table.axes.iter().enumerate() {
+                let bin = *row_bins
+                    .get(axis as usize)
+                    .ok_or_else(|| PbError::ShapeMismatch {
+                        what: format!("row has no axis {axis} for correction lookup"),
+                    })?;
+                let map = table.bin_to_cell.get(k).ok_or_else(|| PbError::Internal {
+                    what: "correction bin_to_cell shorter than axes".into(),
+                })?;
+                let cell = *map.get(bin as usize).ok_or_else(|| PbError::InvalidInput {
+                    what: format!(
+                        "correction: model bin {bin} outside bin_to_cell for axis {axis}"
+                    ),
+                })?;
+                let extent = *table.shape.get(k).ok_or_else(|| PbError::Internal {
+                    what: "correction shape shorter than axes".into(),
+                })?;
+                flat = flat * extent as usize + cell as usize;
+            }
+            acc += *table.values.get(flat).ok_or_else(|| PbError::Internal {
+                what: "correction flat index escaped values".into(),
+            })?;
         }
         Ok(acc)
     }
@@ -608,6 +755,7 @@ impl Model {
         for (alpha, tree) in &self.trees {
             acc += *alpha * tree.lookup(row_bins)?;
         }
+        acc += self.correction_delta(row_bins)? as f32;
         Ok(acc)
     }
 
@@ -641,11 +789,56 @@ impl Model {
             .iter()
             .map(|(_, tree)| tree_split_columns(tree, &x.data))
             .collect::<Result<_, _>>()?;
+        // Precompute the cell-basis correction's flat values index per (table, row), so
+        // the inner loop is a single add. Bins are validated `< n_bins == bin_to_cell.len()`.
+        let corr_flat: Vec<Vec<usize>> = match &self.correction {
+            Some(bank) => {
+                let mut all = Vec::with_capacity(bank.tables.len());
+                for table in &bank.tables {
+                    let mut flats = vec![0usize; n_rows];
+                    for (k, &axis) in table.axes.iter().enumerate() {
+                        let col = x.data.get(axis as usize).ok_or_else(|| {
+                            PbError::ShapeMismatch {
+                                what: format!("matrix has no axis {axis} for correction"),
+                            }
+                        })?;
+                        let map = table.bin_to_cell.get(k).ok_or_else(|| PbError::Internal {
+                            what: "correction bin_to_cell shorter than axes".into(),
+                        })?;
+                        let extent = *table.shape.get(k).ok_or_else(|| PbError::Internal {
+                            what: "correction shape shorter than axes".into(),
+                        })? as usize;
+                        for (r, slot) in flats.iter_mut().enumerate() {
+                            let bin = *col.get(r).ok_or_else(|| PbError::Internal {
+                                what: "correction column shorter than n_rows".into(),
+                            })? as usize;
+                            let cell = *map.get(bin).ok_or_else(|| PbError::InvalidInput {
+                                what: format!(
+                                    "correction: model bin {bin} outside bin_to_cell axis {axis}"
+                                ),
+                            })?;
+                            *slot = *slot * extent + cell as usize;
+                        }
+                    }
+                    all.push(flats);
+                }
+                all
+            }
+            None => Vec::new(),
+        };
         for r in 0..n_rows {
             let off = offset.and_then(|o| o.get(r).copied()).unwrap_or(0.0);
             let mut score = self.f0 + off;
             for ((alpha, tree), columns) in self.trees.iter().zip(&tree_columns) {
                 score += *alpha * tree_value_for_row_with_columns(tree, columns, r)?;
+            }
+            if let Some(bank) = &self.correction {
+                for (t, table) in bank.tables.iter().enumerate() {
+                    let flat = corr_flat[t][r];
+                    score += *table.values.get(flat).ok_or_else(|| PbError::Internal {
+                        what: "correction flat index escaped values".into(),
+                    })? as f32;
+                }
             }
             let dst = out.get_mut(r).ok_or_else(|| PbError::Internal {
                 what: "score_trees output row escaped buffer".into(),
