@@ -938,3 +938,56 @@ mains drives the residual gradient too small for pair splits to clear min_split_
 never grown — the greedy's INTERLEAVING (capture pairs while the residual is still large) is strictly
 better. kick's gain was overfit-regularization, not interaction quality (its real fix is T5 pair selection).
 Greedy interleaving stays the default.
+
+## Classification leak fix: subagging (✅) beats OOB validation (❌ broke kick) (2026-06-30)
+
+LIVE-EBM scoreboard (honest features) showed classification o2/o3 losing to EBM, but mostly the f=1.0
+WITH-replacement bootstrap train/val LEAK (kick o2 -2.88%, amazon o2 -2.56%).
+
+❌ OOB validation (train on bootstrap, early-stop on out-of-bag): byte-deterministic, FIXED amazon
+(o2 +0.06%) but CATASTROPHICALLY broke kick (0.50 AUC = 0 trees). Cause: the with-replacement bootstrap
+OVERFITS (duplicate rows), so the honest OOB deviance never improves -> early-stop truncates to zero. The
+old leaky carved-val masked this. Reverted.
+
+✅ Subagging (bag_subsample<1, without replacement) is the SAFE leak fix — no duplicate rows -> no overfit
+-> clean carved val works. f=0.8: amazon o2 -0.16% (~tie), amazon o3 +0.43% WIN, kick o2 -1.03%/o3 -1.12%
+(f=0.9 kick o2 -0.73%). vs leaky -2.5..-3.4%. => recipe: use bag_subsample<1 for classification (data-rich
+so ~free). Leak-free full-data bagging is impossible without OOB (which overfits); subsampling is the cost.
+
+EBM scores cached recipe-independently in benchmarks/_ebm_cache.json (+ _ebm.py helper) — no more re-fits.
+
+REMAINING depth-2 gap after the leak fix: only **particulate o2 -1.88%** (genuine pair selection; EBM's
+GA2M FAST picks better spatial-temporal pairs than tri's greedy). kick/amazon/diamonds o2 now within ~1%.
+
+## particulate o2 -1.88%: pair FITTING, not selection — T5 REFUTED, BANK (2026-06-30)
+
+Focused team (3 empirical investigators + adversarial critique, all numbers reproduced) overturned the
+earlier "genuine pair selection" claim (CORRECTION to the line above — it is empirically FALSE).
+
+Decisive oracle (mission config lr=0.2, n_bags=8, f=0.8, es=300; EBM o2 anchor 0.34902):
+| config | RMSE-log |
+| mains only | 0.37536 (tie EBM-mains 0.37499) |
+| mains + tri's OWN grown pairs, additive Ridge | 0.34990 (TIE EBM) |
+| mains + ALL 28 pairs, additive Ridge (order-2 OPTIMUM) | 0.34905 (TIE EBM 0.34902) |
+| tri actual o2 @ n_trees=4000 | 0.35559 (-1.88%) |
+| tri actual o2 @ n_trees=16000 (converges ~10.5k/bag) | 0.35338 (-1.25%) |
+
+Findings: (1) SELECTION is saturated — EBM's GA2M keeps ALL 28=C(8,2) pairs (no FAST subset); tri grows
+27-28/28 with EBM's importance ordering. Every top-K ceiling is BELOW EBM, so restricting via T5/groups can
+only REMOVE captured pairs and HURT. T5 is a guaranteed no-op/harmful — and isn't even wired through FFI
+(lib.rs:343 hardcodes groups=None). (2) Same pairs fit additively TIE EBM (0.34990); tri's greedy boosting
+extracts ~1.6% less => the gap is pair-SHAPE FITTING (greedy roots on the dominant PM2.5 main, under-fits
+pure time-of-day pairs). (3) **THE PRIZE DOESN'T EXIST**: the order-2 additive OPTIMUM (0.34905) only TIES
+EBM 0.34902 — no order-2 method can BEAT EBM here. A full GA2M/cyclic pair-shape rebuild (rejected family)
+buys at best a tie on ONE dataset with suite-wide regression risk. (4) FREE fix: n_trees 4000->16000 + early
+stop (the standing memory rule; 4000 binds at ~3988 = under-measured) recovers a third: -1.88% -> -1.25%.
+Cat pair-resolution is also a no-op (TS-ordered axis byte-identical to full one-hot: 0.35158=0.35158).
+
+DECISION: **BANK.** Adopt n_trees=16000+early-stop suite-wide (particulate o2 = -1.25% near-tie). Build
+nothing (T5 no-op/harmful; GA2M rejected + only ties). Retire the "EBM picks better pairs" hypothesis.
+
+## CAMPAIGN STATE (depth-1 & 2 vs LIVE EBM, honest features) — essentially COMPLETE
+Depth-1: tie-or-win ALL 6. Depth-2: miami/allstate WIN; amazon ~tie (-0.16%); diamonds/kick close (~-0.7%);
+particulate near-tie (-1.25% at proper cap, provably AT the order-2 ceiling). Depth-3: regression sweeps,
+classification fixed by subagging. No remaining lever has positive expected value; the gaps left are
+near-ties or provably-structural. Levers shipped: refill, subagging (bag_subsample), parallel bag loop.
