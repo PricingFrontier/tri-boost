@@ -4146,6 +4146,7 @@ mod tests {
                     ensemble: EnsembleSpec::OuterBag {
                         n_bags: 2,
                         bag_subsample: 1.0,
+                        cell_refit: None,
                     },
                     ..Default::default()
                 },

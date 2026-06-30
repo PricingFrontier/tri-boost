@@ -139,6 +139,17 @@ impl NesterovSpec {
     }
 }
 
+/// §G1 cell-basis refit configuration: an adaptive ridge on the purified fANOVA *cell*
+/// basis, fit to the bagged out-of-bag residual and attached to the bagged soup as an
+/// exact correction. Suite-wide params (no per-dataset tuning); `None` disables it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellRefit {
+    /// Base ridge penalty `α` on the cell coefficients.
+    pub base: f64,
+    /// Adaptive exponent `γ` (`0` = flat ridge; high-signal terms penalised less).
+    pub gamma: f64,
+}
+
 /// Exact ensemble-averaging configuration (§09.5).
 #[derive(Clone, Debug, PartialEq)]
 pub enum EnsembleSpec {
@@ -152,6 +163,9 @@ pub enum EnsembleSpec {
         /// bagging). `0 < f < 1.0` ⇒ without-replacement subsample of `round(f * n_rows)` rows
         /// (subagging): faster per bag, more cross-bag diversity, and no within-bag train/val leak.
         bag_subsample: f32,
+        /// §G1 cell-basis refit on the bagged soup, fit to the OOB residual (`None` = off).
+        /// Requires real bagging (`n_bags >= 2`) so an out-of-bag residual exists.
+        cell_refit: Option<CellRefit>,
     },
     /// Hyperparameter-diverse library with bagged greedy selection.
     GreedySelect {
@@ -173,6 +187,7 @@ impl EnsembleSpec {
             EnsembleSpec::OuterBag {
                 n_bags,
                 bag_subsample,
+                cell_refit,
             } => {
                 if *n_bags == 0 {
                     return Err(PbError::InvalidConfig {
@@ -183,6 +198,24 @@ impl EnsembleSpec {
                     return Err(PbError::InvalidConfig {
                         what: "OuterBag bag_subsample must be finite and > 0".into(),
                     });
+                }
+                if let Some(cr) = cell_refit {
+                    if !(cr.base.is_finite() && cr.base > 0.0) {
+                        return Err(PbError::InvalidConfig {
+                            what: "OuterBag cell_refit base must be finite and > 0".into(),
+                        });
+                    }
+                    if !(cr.gamma.is_finite() && cr.gamma >= 0.0) {
+                        return Err(PbError::InvalidConfig {
+                            what: "OuterBag cell_refit gamma must be finite and >= 0".into(),
+                        });
+                    }
+                    if *n_bags < 2 {
+                        return Err(PbError::InvalidConfig {
+                            what: "OuterBag cell_refit requires n_bags >= 2 (needs an OOB residual)"
+                                .into(),
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -935,6 +968,7 @@ mod tests {
         cfg.ensemble = EnsembleSpec::OuterBag {
             n_bags: 0,
             bag_subsample: 1.0,
+            cell_refit: None,
         };
         assert!(matches!(cfg.validate(), Err(PbError::InvalidConfig { .. })));
         cfg.ensemble = EnsembleSpec::Off;

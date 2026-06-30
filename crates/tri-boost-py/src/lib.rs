@@ -15,7 +15,9 @@ use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Arc;
-use tri_boost_core::boosters::{BoosterConfig, DartSpec, EnsembleSpec, NesterovSpec, RefitSpec};
+use tri_boost_core::boosters::{
+    BoosterConfig, CellRefit, DartSpec, EnsembleSpec, NesterovSpec, RefitSpec,
+};
 use tri_boost_core::cat::{CatTarget, LeakageScheme, Smooth, TsConfig, TsEncodingId};
 use tri_boost_core::constraints::{CredibilityFloor, InteractionPolicy, MonoSign, MonotoneMap};
 use tri_boost_core::data::{
@@ -227,6 +229,8 @@ impl PyBooster {
         cat_n_perms=1,
         cat_k=5,
         cat_min_data_per_group=10.0,
+        cell_refit_base=None,
+        cell_refit_gamma=2.0,
         seed=0,
         n_jobs=None
     ))]
@@ -268,15 +272,22 @@ impl PyBooster {
         cat_n_perms: u32,
         cat_k: u32,
         cat_min_data_per_group: f32,
+        cell_refit_base: Option<f64>,
+        cell_refit_gamma: f64,
         seed: u64,
         n_jobs: Option<usize>,
     ) -> PyResult<Self> {
+        let cell_refit = cell_refit_base.map(|base| CellRefit {
+            base,
+            gamma: cell_refit_gamma,
+        });
         let ensemble = if n_bags == 0 {
             EnsembleSpec::Off
         } else {
             EnsembleSpec::OuterBag {
                 n_bags,
                 bag_subsample,
+                cell_refit,
             }
         };
         let refit_leaves = match ridge_refit_l2 {

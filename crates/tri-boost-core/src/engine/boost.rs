@@ -22,7 +22,7 @@
 //! between the two scorers (same `low_bit` routing); only the accumulation width differs.
 
 use crate::backend::{pb_rng, pb_seed, Stage};
-use crate::boosters::{DartSpec, EnsembleSpec, HpGrid, NesterovSpec, RefitSpec};
+use crate::boosters::{CellRefit, DartSpec, EnsembleSpec, HpGrid, NesterovSpec, RefitSpec};
 use crate::cat::CatEncoderStore;
 use crate::constraints::MonoSign;
 use crate::data::{compute_offset, BinnedMatrix};
@@ -235,7 +235,17 @@ pub(crate) fn fit(
         EnsembleSpec::OuterBag {
             n_bags,
             bag_subsample,
-        } => fit_outer_bag(config, x, y, spec, *n_bags, *bag_subsample, cat_encoders),
+            cell_refit,
+        } => fit_outer_bag(
+            config,
+            x,
+            y,
+            spec,
+            *n_bags,
+            *bag_subsample,
+            *cell_refit,
+            cat_encoders,
+        ),
         EnsembleSpec::GreedySelect {
             library_size,
             hp_grid,
@@ -797,6 +807,13 @@ fn validate_ensemble_fit_inputs(
     Ok(())
 }
 
+/// One bag's out-of-bag contribution for the §G1 cell-basis refit: which rows the bag
+/// trained on (OOB = complement) and the bag's raw predictions on EVERY training row.
+struct BagOob {
+    in_bag: Vec<bool>,
+    preds: Vec<f32>,
+}
+
 fn fit_outer_bag(
     config: &Config,
     x: &BinnedMatrix,
@@ -804,6 +821,7 @@ fn fit_outer_bag(
     spec: &FitSpec,
     n_bags: u16,
     bag_subsample: f32,
+    cell_refit: Option<CellRefit>,
     cat_encoders: &CatEncoderStore,
 ) -> Result<Model, PbError> {
     validate_ensemble_fit_inputs(config, x, y, spec)?;
@@ -819,14 +837,15 @@ fn fit_outer_bag(
     let subsample = bag_subsample < 1.0;
     let sample_len =
         (((n_rows as f64) * f64::from(bag_subsample)).round() as usize).clamp(1, n_rows);
+    let collect_oob = cell_refit.is_some();
     // Bags are independent (each seeded by its index) and collected IN BAG ORDER, so fitting them
     // concurrently is byte-identical to the sequential fit regardless of thread count; soup_models
     // then folds the members in that fixed order. Nests with fit_single's own rayon parallelism on the
     // shared pool (work-stealing), which is what recovers speed in the small-bag regime that
     // per-bag row subsampling cannot.
-    let members: Vec<WeightedModel> = (0..usize::from(n_bags))
+    let members: Vec<(WeightedModel, Option<BagOob>)> = (0..usize::from(n_bags))
         .into_par_iter()
-        .map(|bag| -> Result<WeightedModel, PbError> {
+        .map(|bag| -> Result<(WeightedModel, Option<BagOob>), PbError> {
             let bag_round = u32::try_from(bag).map_err(|_| PbError::Internal {
                 what: "OuterBag bag index exceeded u32".into(),
             })?;
@@ -847,10 +866,152 @@ fn fit_outer_bag(
                 seed: bag_seed,
             };
             let model = fit_single(&base_config, &data.x, &data.y, &bag_spec, cat_encoders)?;
-            Ok(WeightedModel { alpha, model })
+            let oob = if collect_oob {
+                let mut in_bag = vec![false; n_rows];
+                for &r in &rows {
+                    if let Some(slot) = in_bag.get_mut(r as usize) {
+                        *slot = true;
+                    }
+                }
+                let preds = raw_predictions(&model, x)?;
+                Some(BagOob { in_bag, preds })
+            } else {
+                None
+            };
+            Ok((WeightedModel { alpha, model }, oob))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    soup_models(&members)
+
+    let mut weighted = Vec::with_capacity(members.len());
+    let mut oobs = Vec::with_capacity(members.len());
+    for (wm, oob) in members {
+        weighted.push(wm);
+        if let Some(o) = oob {
+            oobs.push(o);
+        }
+    }
+    let model = soup_models(&weighted)?;
+    match cell_refit {
+        Some(cr) => attach_cell_correction(model, x, y, spec, &oobs, cr),
+        None => Ok(model),
+    }
+}
+
+/// The realized supports (order 1..=2) the §G1 refit corrects: every main that appears in a
+/// tree, plus every realized pair (each order-2 subset of any tree's support). Order-3
+/// supports are left untouched so the depth-3 edge is preserved. Axis ids == raw ids under
+/// the green spine, which is what `correction_scaffold` and the decompose fold expect.
+fn correctable_supports(model: &Model) -> Vec<Vec<u32>> {
+    use std::collections::BTreeSet;
+    let mut mains: BTreeSet<u32> = BTreeSet::new();
+    let mut pairs: BTreeSet<(u32, u32)> = BTreeSet::new();
+    for (_, tree) in &model.trees {
+        let mut axes: Vec<u32> = Vec::new();
+        for s in &tree.splits {
+            if !axes.contains(&s.axis) {
+                axes.push(s.axis);
+            }
+        }
+        for &a in &axes {
+            mains.insert(a);
+        }
+        for i in 0..axes.len() {
+            for j in (i + 1)..axes.len() {
+                let (lo, hi) = if axes[i] < axes[j] {
+                    (axes[i], axes[j])
+                } else {
+                    (axes[j], axes[i])
+                };
+                pairs.insert((lo, hi));
+            }
+        }
+    }
+    let mut supports: Vec<Vec<u32>> = Vec::with_capacity(mains.len() + pairs.len());
+    for a in mains {
+        supports.push(vec![a]);
+    }
+    for (a, b) in pairs {
+        supports.push(vec![a, b]);
+    }
+    supports
+}
+
+/// Fit the §G1 cell-basis correction to the bagged out-of-bag residual and attach it to the
+/// soup. Out-of-bag = honest cross-fit: each row's residual uses only the bags that did not
+/// train on it, so the correction tightens the soup's interaction surfaces without the
+/// in-sample over-fit that broke earlier totally-corrective attempts. Determinism: the OOB
+/// accumulation, the Newton residual, and the CG solve are all sequential / fixed-order.
+fn attach_cell_correction(
+    mut model: Model,
+    x: &BinnedMatrix,
+    y: &[f32],
+    spec: &FitSpec,
+    oobs: &[BagOob],
+    cr: CellRefit,
+) -> Result<Model, PbError> {
+    let n_rows = x.n_rows as usize;
+    // Out-of-bag raw prediction per row: mean over bags that did NOT train on the row.
+    let mut oob_sum = vec![0.0_f64; n_rows];
+    let mut oob_cnt = vec![0u32; n_rows];
+    for bag in oobs {
+        for r in 0..n_rows {
+            if !bag.in_bag[r] {
+                oob_sum[r] += f64::from(bag.preds[r]);
+                oob_cnt[r] += 1;
+            }
+        }
+    }
+    // Rows with no OOB coverage fall back to the soup prediction so grad_hess stays in-domain;
+    // they are then excluded from the fit via a zero IRLS weight.
+    let soup_raw = raw_predictions(&model, x)?;
+    let mut oob_raw = vec![0.0_f32; n_rows];
+    for r in 0..n_rows {
+        oob_raw[r] = if oob_cnt[r] > 0 {
+            (oob_sum[r] / f64::from(oob_cnt[r])) as f32
+        } else {
+            soup_raw[r]
+        };
+    }
+    // Newton working residual z = -g/h with IRLS weight h, evaluated at the OOB prediction.
+    // (Squared error → z = y − raw, h = 1; logistic → z = (y − p)/(p(1−p)), h = p(1−p).)
+    let sample_w: Vec<f32> = match spec.weight {
+        Some(w) => w.to_vec(),
+        None => vec![1.0_f32; n_rows],
+    };
+    let mut gh = crate::loss::GradHess {
+        g: vec![0.0_f32; n_rows],
+        h: vec![0.0_f32; n_rows],
+    };
+    spec.loss.grad_hess(y, &oob_raw, &sample_w, &mut gh)?;
+    let mut residual = vec![0.0_f64; n_rows];
+    let mut weight = vec![0.0_f64; n_rows];
+    for r in 0..n_rows {
+        if oob_cnt[r] > 0 {
+            let h = f64::from(gh.h[r]).max(1e-12);
+            residual[r] = -f64::from(gh.g[r]) / h;
+            weight[r] = h;
+        }
+    }
+    let supports = correctable_supports(&model);
+    if supports.is_empty() {
+        return Ok(model);
+    }
+    let refit_spec = crate::cell_refit::CellRefitSpec {
+        base: cr.base,
+        gamma: cr.gamma,
+        ..Default::default()
+    };
+    let bank = crate::cell_refit::fit_cell_correction(
+        &model,
+        &x.data,
+        &residual,
+        &weight,
+        &supports,
+        &refit_spec,
+    )?;
+    model.correction = Some(bank);
+    model.validate()?;
+    Ok(model)
 }
 
 fn fit_greedy_select(
@@ -3823,6 +3984,7 @@ mod tests {
                 ensemble: EnsembleSpec::OuterBag {
                     n_bags: 3,
                     bag_subsample: 1.0,
+                    cell_refit: None,
                 },
                 ..BoosterConfig::default()
             },
@@ -3852,6 +4014,77 @@ mod tests {
         };
         let b1 = bytes(1);
         assert_eq!(b1, bytes(2));
+        assert_eq!(b1, bytes(8));
+    }
+
+    #[test]
+    fn cell_refit_outer_bag_is_g0_exact_and_thread_deterministic() {
+        // A 2-feature target with a genuine {0,1} interaction, fit with bagging + the §G1
+        // OOB cell-refit. The attached correction must keep G0 exact and be byte-identical
+        // across thread counts (the OOB accumulation and the CG solve are deterministic).
+        let n = 240usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 8 + 1) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| ((i / 8) % 6 + 1) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                let a = if x0[i] <= 4.0 { 1.5 } else { -2.0 };
+                let b = if x1[i] <= 3.0 { 1.0 } else { -0.5 };
+                let ab = if x0[i] <= 4.0 && x1[i] <= 3.0 { 2.0 } else { 0.0 };
+                a + b + ab + (i % 13) as f32 * 0.02
+            })
+            .collect();
+        let x = binned(&[x0, x1]);
+        let cfg = Config {
+            n_trees: 30,
+            learning_rate: 0.25,
+            lambda: 1.0,
+            min_split_gain: 0.0,
+            max_delta_step: None,
+            sampling: Default::default(),
+            hist_precision: Default::default(),
+            l1_leaf: 0.0,
+            colsample_bytree: 1.0,
+            learning_rate_decay: 0.0,
+            validation_fraction: None,
+            early_stopping_rounds: 50,
+            leaf_refine_steps: 0,
+            leaf_refine_backtracks: 4,
+            boosters: BoosterConfig {
+                ensemble: EnsembleSpec::OuterBag {
+                    n_bags: 4,
+                    bag_subsample: 0.8,
+                    cell_refit: Some(CellRefit {
+                        base: 50.0,
+                        gamma: 2.0,
+                    }),
+                },
+                ..BoosterConfig::default()
+            },
+        };
+        let sqe = SquaredError;
+        let bytes = |nt: usize| -> Vec<u8> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let model = Booster::with_config(cfg.clone())
+                    .fit(&x, &y, &spec(&sqe))
+                    .unwrap();
+                let corr = model
+                    .correction
+                    .as_ref()
+                    .expect("cell_refit must attach a correction");
+                assert!(!corr.tables.is_empty(), "correction should be non-empty");
+                // G0 holds WITH the OOB-fit correction present.
+                let serve = crate::data::ServeBinnedMatrix(x.clone());
+                let bank = model.explain(&serve, RefMeasure::default()).unwrap();
+                assert_exact_decomposition(&model, &bank, &serve).unwrap();
+                crate::serialize::encode_model(&model).unwrap()
+            })
+        };
+        let b1 = bytes(1);
+        assert_eq!(b1, bytes(2), "cell-refit must be byte-identical across threads");
         assert_eq!(b1, bytes(8));
     }
 
@@ -3886,6 +4119,7 @@ mod tests {
         bag_cfg.boosters.ensemble = EnsembleSpec::OuterBag {
             n_bags: 1,
             bag_subsample: 1.0,
+            cell_refit: None,
         };
         let base = Booster::with_config(base_cfg)
             .fit(&x, &y, &spec(&sqe))
