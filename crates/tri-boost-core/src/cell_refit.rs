@@ -27,6 +27,13 @@ pub struct CellRefitSpec {
     /// Adaptive exponent `γ`: per-term penalty is `base / (s_term^γ normalised)²`, so
     /// high-signal terms (large `s_term`) are penalised less. `γ = 0` is a flat ridge.
     pub gamma: f64,
+    /// Maximum coarse cells per axis for ORDER-2 (pair) corrections; mains keep full merged
+    /// resolution. The full merged pair grid (realized borders of both features) over-fits
+    /// noisy high-cardinality surfaces — acute for categoricals — so pairs are solved on a
+    /// coarsened grid (contiguous groups of merged cells), matching the prototype's coarse
+    /// pair grids. The δ stays constant WITHIN merged cells, so the correction is still
+    /// stored at merged resolution and G0 is untouched.
+    pub pair_cell_cap: u32,
     /// Maximum conjugate-gradient iterations per solve.
     pub cg_iters: usize,
     /// Conjugate-gradient relative residual tolerance (‖r‖/‖b‖).
@@ -35,10 +42,12 @@ pub struct CellRefitSpec {
 
 impl Default for CellRefitSpec {
     fn default() -> Self {
-        // base≈4000, γ≈2 — the held-out-validated prototype plateau.
+        // base≈4000, γ≈2 — the held-out-validated prototype plateau; pair grid capped at the
+        // prototype's 24 cells/axis.
         CellRefitSpec {
             base: 4000.0,
             gamma: 2.0,
+            pair_cell_cap: 24,
             cg_iters: 500,
             cg_tol: 1e-7,
         }
@@ -46,16 +55,33 @@ impl Default for CellRefitSpec {
 }
 
 /// The sparse cell-indicator design, stored implicitly: every row activates exactly one
-/// cell per corrected support, so we keep only the global column id per (support, row).
+/// COARSE cell per corrected support, so we keep only the global column id per (support,
+/// row). Columns are at the (possibly coarsened) solve resolution; the solved δ is expanded
+/// back to merged resolution for storage, so the design need only carry the coarse layout.
 struct Design {
-    /// `active[u][r]` = global column id activated by row `r` on support `u`.
+    /// `active[u][r]` = global coarse column id activated by row `r` on support `u`.
     active: Vec<Vec<u32>>,
-    /// Total column count (Σ cells over supports).
+    /// Total coarse column count (Σ coarse cells over supports).
     n_cols: usize,
-    /// `col_term[c]` = the support index owning column `c` (for per-term reweighting).
+    /// `col_term[c]` = the support index owning coarse column `c` (for per-term reweighting).
     col_term: Vec<u32>,
-    /// First global column id of each support (prefix sum of per-support cell counts).
+    /// First global coarse column id of each support (prefix sum of per-support coarse cells).
     col_offset: Vec<u32>,
+    /// `coarse_shape[u][k]` = coarse cell count of support `u`'s axis `k` (parallel to its axes).
+    coarse_shape: Vec<Vec<u32>>,
+    /// `groups[u][k][merged_cell]` = the coarse group id a merged cell maps to, for expanding
+    /// the solved δ back to merged resolution when filling the [`CorrectionBank`].
+    groups: Vec<Vec<Vec<u32>>>,
+}
+
+/// Map each of `merged_m` merged cells to one of `min(merged_m, cap)` contiguous coarse
+/// groups (`cap` ≥ 1). Returns the per-merged-cell group ids and the coarse group count.
+fn coarse_groups(merged_m: u32, cap: u32) -> (Vec<u32>, u32) {
+    let k = merged_m.min(cap.max(1)).max(1);
+    let groups: Vec<u32> = (0..merged_m)
+        .map(|c| ((u64::from(c) * u64::from(k)) / u64::from(merged_m.max(1))) as u32)
+        .collect();
+    (groups, k)
 }
 
 impl Design {
@@ -84,31 +110,63 @@ impl Design {
     }
 }
 
-/// Build the implicit design for `bank`'s supports from the binned training columns.
-/// `data[axis][row]` is the model bin id. Each support's active local cell is the
-/// row-major fold of its per-axis `bin_to_cell` maps (the same layout `correction_delta`
-/// uses), shifted by the support's global column offset.
-fn build_design(bank: &CorrectionBank, data: &[Vec<u8>], n_rows: usize) -> Result<Design, PbError> {
-    let mut col_offset = Vec::with_capacity(bank.tables.len());
+/// Build the implicit COARSE design for `bank`'s supports from the binned training columns.
+/// `data[axis][row]` is the model bin id. For each support, each axis's merged cells are
+/// grouped into ≤`pair_cell_cap` coarse cells for ORDER-2 supports (mains keep full merged
+/// resolution); a row's active coarse column is the row-major fold of its per-axis
+/// (model bin → merged cell → coarse group) maps, shifted by the support's coarse offset.
+fn build_design(
+    bank: &CorrectionBank,
+    data: &[Vec<u8>],
+    n_rows: usize,
+    pair_cell_cap: u32,
+) -> Result<Design, PbError> {
+    let n_terms = bank.tables.len();
+    let mut col_offset = Vec::with_capacity(n_terms);
+    let mut coarse_shape: Vec<Vec<u32>> = Vec::with_capacity(n_terms);
+    let mut groups: Vec<Vec<Vec<u32>>> = Vec::with_capacity(n_terms);
     let mut n_cols: usize = 0;
     for table in &bank.tables {
+        let order = table.axes.len();
+        let mut ks = Vec::with_capacity(order);
+        let mut grps = Vec::with_capacity(order);
+        let mut term_cols: usize = 1;
+        for k in 0..order {
+            let merged_m = table.shape[k];
+            let cap = if order <= 1 { merged_m } else { pair_cell_cap };
+            let (g, kk) = coarse_groups(merged_m, cap);
+            ks.push(kk);
+            grps.push(g);
+            term_cols = term_cols
+                .checked_mul(kk as usize)
+                .ok_or_else(|| PbError::Internal {
+                    what: "cell-refit coarse term column count overflow".into(),
+                })?;
+        }
         col_offset.push(u32::try_from(n_cols).map_err(|_| PbError::Internal {
             what: "cell-refit column offset exceeded u32".into(),
         })?);
         n_cols = n_cols
-            .checked_add(table.values.len())
+            .checked_add(term_cols)
             .ok_or_else(|| PbError::Internal {
                 what: "cell-refit column count overflow".into(),
             })?;
+        coarse_shape.push(ks);
+        groups.push(grps);
     }
     let mut col_term = vec![0u32; n_cols];
-    for (t, table) in bank.tables.iter().enumerate() {
+    for t in 0..n_terms {
         let start = col_offset[t] as usize;
-        for c in start..start + table.values.len() {
+        let end = if t + 1 < n_terms {
+            col_offset[t + 1] as usize
+        } else {
+            n_cols
+        };
+        for c in start..end {
             col_term[c] = t as u32;
         }
     }
-    let mut active: Vec<Vec<u32>> = Vec::with_capacity(bank.tables.len());
+    let mut active: Vec<Vec<u32>> = Vec::with_capacity(n_terms);
     for (t, table) in bank.tables.iter().enumerate() {
         let mut col = vec![0u32; n_rows];
         for (k, &axis) in table.axes.iter().enumerate() {
@@ -117,17 +175,24 @@ fn build_design(bank: &CorrectionBank, data: &[Vec<u8>], n_rows: usize) -> Resul
             })?;
             if column.len() != n_rows {
                 return Err(PbError::ShapeMismatch {
-                    what: format!("cell-refit: axis {axis} column len {} != n_rows {n_rows}", column.len()),
+                    what: format!(
+                        "cell-refit: axis {axis} column len {} != n_rows {n_rows}",
+                        column.len()
+                    ),
                 });
             }
             let map = &table.bin_to_cell[k];
-            let extent = table.shape[k];
+            let grp = &groups[t][k];
+            let kk = coarse_shape[t][k];
             for (r, slot) in col.iter_mut().enumerate() {
                 let bin = column[r] as usize;
-                let cell = *map.get(bin).ok_or_else(|| PbError::InvalidInput {
+                let merged_cell = *map.get(bin).ok_or_else(|| PbError::InvalidInput {
                     what: format!("cell-refit: bin {bin} outside bin_to_cell axis {axis}"),
+                })? as usize;
+                let coarse = *grp.get(merged_cell).ok_or_else(|| PbError::Internal {
+                    what: "cell-refit: merged cell escaped coarse groups".into(),
                 })?;
-                *slot = *slot * extent + cell;
+                *slot = *slot * kk + coarse;
             }
         }
         let offset = col_offset[t];
@@ -141,6 +206,8 @@ fn build_design(bank: &CorrectionBank, data: &[Vec<u8>], n_rows: usize) -> Resul
         n_cols,
         col_term,
         col_offset,
+        coarse_shape,
+        groups,
     })
 }
 
@@ -269,7 +336,7 @@ pub fn fit_cell_correction(
     if bank.tables.is_empty() {
         return Ok(bank);
     }
-    let design = build_design(&bank, data, n_rows)?;
+    let design = build_design(&bank, data, n_rows, spec.pair_cell_cap)?;
 
     // Flat ridge init (γ folded in afterwards): λ_col = base.
     let flat = vec![spec.base; design.n_cols];
@@ -320,11 +387,30 @@ pub fn fit_cell_correction(
         solve_ridge_cg(&design, sample_weight, residual, &lambda, spec)
     };
 
-    // Scatter δ into the bank's per-support values (global col → support-local cell).
+    // Expand the solved COARSE δ to the bank's merged-resolution values: each merged cell
+    // takes its coarse group's δ (constant within coarse groups ⊇ merged cells, so G0 holds).
     for (t, table) in bank.tables.iter_mut().enumerate() {
-        let start = design.col_offset[t] as usize;
-        for (cell, v) in table.values.iter_mut().enumerate() {
-            *v = delta[start + cell];
+        let coarse_off = design.col_offset[t] as usize;
+        let ks = &design.coarse_shape[t];
+        let grps = &design.groups[t];
+        let merged_shape: Vec<usize> = table.shape.iter().map(|&s| s as usize).collect();
+        let order = merged_shape.len();
+        let mut cells = vec![0usize; order];
+        for merged_flat in 0..table.values.len() {
+            // Decode merged_flat (row-major, last axis fastest) into per-axis merged cells.
+            let mut rem = merged_flat;
+            for k in (0..order).rev() {
+                let e = merged_shape[k];
+                cells[k] = rem % e;
+                rem /= e;
+            }
+            // Map each merged cell to its coarse group, refold to the coarse column.
+            let mut coarse_flat = 0usize;
+            for k in 0..order {
+                let g = grps[k][cells[k]] as usize;
+                coarse_flat = coarse_flat * ks[k] as usize + g;
+            }
+            table.values[merged_flat] = delta[coarse_off + coarse_flat];
         }
     }
     Ok(bank)
@@ -356,12 +442,13 @@ mod tests {
         let spec = CellRefitSpec {
             base: 1.0,
             gamma: 0.0,
+            pair_cell_cap: 24,
             cg_iters: 200,
             cg_tol: 1e-12,
         };
         let bank = fit_cell_correction(&model, &data, &resid, &w, &[vec![0]], &spec).unwrap();
         // Predict the correction at bins 1 and 2 and check it reduces the residual a lot.
-        let design = build_design(&bank, &data, n).unwrap();
+        let design = build_design(&bank, &data, n, 24).unwrap();
         let delta_flat: Vec<f64> = bank.tables[0].values.clone();
         let mut pred = vec![0.0_f64; n];
         design.matvec(&delta_flat, &mut pred);
@@ -391,8 +478,8 @@ mod tests {
         let w = vec![1.0_f64; n];
         let supports = vec![vec![0u32], vec![1u32]];
 
-        let flat_spec = CellRefitSpec { base: 50.0, gamma: 0.0, cg_iters: 300, cg_tol: 1e-12 };
-        let adapt_spec = CellRefitSpec { base: 50.0, gamma: 2.0, cg_iters: 300, cg_tol: 1e-12 };
+        let flat_spec = CellRefitSpec { base: 50.0, gamma: 0.0, pair_cell_cap: 24, cg_iters: 300, cg_tol: 1e-12 };
+        let adapt_spec = CellRefitSpec { base: 50.0, gamma: 2.0, pair_cell_cap: 24, cg_iters: 300, cg_tol: 1e-12 };
         let flat = fit_cell_correction(&model, &data, &resid, &w, &supports, &flat_spec).unwrap();
         let adapt = fit_cell_correction(&model, &data, &resid, &w, &supports, &adapt_spec).unwrap();
 
