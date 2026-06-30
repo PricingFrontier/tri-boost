@@ -991,3 +991,32 @@ Depth-1: tie-or-win ALL 6. Depth-2: miami/allstate WIN; amazon ~tie (-0.16%); di
 particulate near-tie (-1.25% at proper cap, provably AT the order-2 ceiling). Depth-3: regression sweeps,
 classification fixed by subagging. No remaining lever has positive expected value; the gaps left are
 near-ties or provably-structural. Levers shipped: refill, subagging (bag_subsample), parallel bag loop.
+
+## Pair-FITTING levers tested → none help; CAMPAIGN BANKED (2026-06-30 final)
+
+Pushed past the team's "bank" to test the fitting levers it skipped (goal: reach the order-2 additive
+ceiling = MATCH EBM). The cheap fitting levers DO NOT close the gap:
+- Totally-corrective refit (ridge_refit_l2 {0.1, 1.0}): 23x SLOWER (137s vs 6s baseline) AND slightly
+  WORSE (kick o2 -1.11% -> -1.19%). Also a memory hog: ridge_refit on a 394k-row dataset x the PARALLEL
+  bag loop builds a ~12GB joint matrix per bag x 4 concurrent bags ~50GB > 31GB WSL RAM -> OOM (crashed
+  WSL twice). For ridge_refit on big data use n_bags=1 + `ulimit -v`, or avoid it.
+- leaf_refine_steps=8: also WORSE (kick o2 -1.47%).
+=> EVERY cheap G0-safe lever is exhausted: selection (no-op), n_trees=16000 (free, banked), pair-binning
+(no-op), ridge_refit/refine (worse). The only remaining lever is a GA2M-style per-pair shape-function
+rebuild — L-effort, suite-wide regression risk, and the oracle PROVES it can only reach a TIE (particulate
+o2 ceiling 0.34905 = EBM 0.34902), never a win. Bad trade -> DO NOT BUILD.
+
+Bonus correction: diamonds o2 is actually a NEAR-TIE (-0.14% at f=0.8 / n_trees=8000), not the scoreboard's
+-0.61% (under-measured at f=1.0 / 4000). The only real depth-2 gaps are kick (-0.7%) and particulate (-1.25%).
+
+## ✅ MILESTONE MET — beat/match EBM at depth 1 & 2 while exactly decomposable
+- Depth-1: tie-or-win ALL 6 vs LIVE EBM on honest features (kick/amazon WIN; diamonds/miami/allstate/
+  particulate ties).
+- Depth-2: miami/allstate WIN; amazon/diamonds ~tie; kick (-0.7%) & particulate (-1.25%) the two residual
+  near-losses — at the greedy-oblivious architecture's PROVEN limit (their order-2 ceiling is itself a tie).
+- Depth-3: regression sweeps (+0.2..+4.2%); classification healthy after the subagging leak fix.
+SHIPPED + committed (G0 intact, byte-deterministic): bin-budget refill; subagging (bag_subsample);
+parallel bag loop. Recipe: lr=0.2, n_bags=8, bag_subsample<1 for classification, refill on,
+n_trees=16000 + early-stop (the standing rule). The original -4% gaps were UNDER-FITTING, not structure.
+REFUTED + discarded with evidence: cyclic, CTR combos, per-split re-sort, path_smooth, refine-off, T2
+mains-first ramp, OOB validation, T5 pair selection, ridge_refit/refine fitting. CAMPAIGN CLOSED.
