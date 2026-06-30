@@ -983,10 +983,13 @@ fn attach_cell_correction(
         h: vec![0.0_f32; n_rows],
     };
     spec.loss.grad_hess(y, &oob_raw, &sample_w, &mut gh)?;
+    // A deterministic ~15% slice held OUT of the correction fit, used below to choose a global
+    // shrinkage so the correction can only help on honest data (the no-harm guard).
+    let is_holdout = |r: usize| ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38;
     let mut residual = vec![0.0_f64; n_rows];
     let mut weight = vec![0.0_f64; n_rows];
     for r in 0..n_rows {
-        if oob_cnt[r] > 0 {
+        if oob_cnt[r] > 0 && !is_holdout(r) {
             let h = f64::from(gh.h[r]).max(1e-12);
             residual[r] = -f64::from(gh.g[r]) / h;
             weight[r] = h;
@@ -1010,6 +1013,58 @@ fn attach_cell_correction(
         &refit_spec,
     )?;
     model.correction = Some(bank);
+    // No-harm guard: choose a global shrinkage λ ∈ [0,1] minimising held-out deviance of
+    // `oob_raw + λ·correction` on the OOB-covered held-out slice. λ=0 (the correction does not
+    // generalise — e.g. noisy high-cardinality categorical pairs) drops it entirely; λ=1 keeps
+    // it at full strength (signal that generalises, e.g. particulate's time-of-day pairs). This
+    // is the prototype's held-out config selection, built into the fit, so the refit can only
+    // help or be neutralised — never regress a winner.
+    let mut hy: Vec<f32> = Vec::new();
+    let mut hraw: Vec<f32> = Vec::new();
+    let mut hw: Vec<f32> = Vec::new();
+    let mut hd: Vec<f32> = Vec::new();
+    let mut row_bins = vec![0u8; x.data.len()];
+    for r in 0..n_rows {
+        if oob_cnt[r] > 0 && is_holdout(r) {
+            for (a, col) in x.data.iter().enumerate() {
+                if let Some(&bin) = col.get(r) {
+                    row_bins[a] = bin;
+                }
+            }
+            hy.push(y[r]);
+            hraw.push(oob_raw[r]);
+            hw.push(sample_w[r]);
+            hd.push(model.correction_delta(&row_bins)? as f32);
+        }
+    }
+    // No held-out coverage → cannot evaluate → keep the correction at full strength.
+    let mut best_lambda = 1.0_f32;
+    if !hy.is_empty() {
+        best_lambda = 0.0;
+        let mut best_dev = f32::INFINITY;
+        let mut raw_buf = vec![0.0_f32; hy.len()];
+        for &lam in &[0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            for (i, slot) in raw_buf.iter_mut().enumerate() {
+                *slot = hraw[i] + lam * hd[i];
+            }
+            let dev = spec.loss.deviance(&hy, &raw_buf, &hw)?;
+            if dev < best_dev {
+                best_dev = dev;
+                best_lambda = lam;
+            }
+        }
+    }
+    if best_lambda <= 0.0 {
+        model.correction = None;
+    } else if best_lambda < 1.0 {
+        if let Some(bank) = &mut model.correction {
+            for table in &mut bank.tables {
+                for v in &mut table.values {
+                    *v *= f64::from(best_lambda);
+                }
+            }
+        }
+    }
     model.validate()?;
     Ok(model)
 }
@@ -4071,12 +4126,9 @@ mod tests {
                 let model = Booster::with_config(cfg.clone())
                     .fit(&x, &y, &spec(&sqe))
                     .unwrap();
-                let corr = model
-                    .correction
-                    .as_ref()
-                    .expect("cell_refit must attach a correction");
-                assert!(!corr.tables.is_empty(), "correction should be non-empty");
-                // G0 holds WITH the OOB-fit correction present.
+                // The no-harm guard may keep, shrink, or drop the correction depending on the
+                // held-out fit; either way the bag→OOB→refit→guard pipeline must be byte-
+                // deterministic and the (possibly corrected) model must stay G0-exact.
                 let serve = crate::data::ServeBinnedMatrix(x.clone());
                 let bank = model.explain(&serve, RefMeasure::default()).unwrap();
                 assert_exact_decomposition(&model, &bank, &serve).unwrap();
