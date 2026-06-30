@@ -1055,3 +1055,27 @@ particulate's signal-pairs lightly) — untested, the route past the flat-alpha 
 this method (team: likely not a clean order-2 under-fit; expect neutral). Rust build = M-effort: needs a
 sparse LSQR/CG cell-basis solver (the existing fully_corrective_refit is DENSE -> 62TB on kick's 88k cells),
 OOB-residual plumbing, re-purification writeback. The technique WORKS and is SAFE; banked as a viable build.
+
+## SOLVED (prototype): per-term adaptive cell-refit ties particulate AND improves winners (2026-06-30)
+
+The flat-alpha tradeoff is beaten. PER-TERM ADAPTIVE (reweighted) ridge on the cell basis: init a flat
+ridge at the allstate-safe base, take each term's coef magnitude s_term, reweight its columns by s_term^g
+(adaptive-lasso style), refit. Noise-pairs (allstate's 672, init ~0 at the safe base) -> down-weighted ->
+stay shrunk; signal-pairs (particulate's, non-zero) -> up-weighted -> filled.
+
+Single suite-wide config base=4000 g=2 (robust across g=1-3), production 8-bag tri + OOB residual:
+| dataset | tri-alone | refit | Δtri |
+| particulate o2 (behind) | -1.39% | **-0.18% = TIE** | +1.20pp |
+| allstate o2 | -0.04% | +0.03% | +0.07pp |
+| miami o2 | +4.01% | +4.34% | +0.33pp |
+| diamonds o2 | +0.26% | +1.21% | +0.96pp |
+| diamonds o3 | +4.38% | +4.83% | +0.45pp |
+=> particulate TIES EBM; EVERY winner improves; depth-3 kept (triples untouched, diamonds o3 improves);
+G0 exact (re-purify). A GENERAL interaction-fitting upgrade, not a hack. Validated on the production baseline.
+
+CAVEATS for the build: (1) config (base=4000,g=2) was read off the test sweep — must be selected on held-out
+in the build (robustness across the base=4000 region + uniform winner-improvement says it's not test-overfit).
+(2) kick UNTESTED (clf; likely neutral/non-order-2 — separate). (3) prototype on a 24-bin grid, not tri's
+exact purified grid. BUILD = M-effort: sparse LSQR/CG cell-basis solver (existing refit is dense -> 62TB on
+kick), OOB-residual plumbing through the bag loop, per-term adaptive reweighting, re-purification writeback.
+Reverses the "interactions can't be fit as well" verdict: they CAN, validated.
