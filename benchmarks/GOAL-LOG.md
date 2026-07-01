@@ -1226,3 +1226,24 @@ splitmix draw) and take an UNWEIGHTED average -> effective N stays at N in high 
 (the 5 smaller datasets) UNCHANGED and byte-exact. explain.rs check_variance_sum; forced-sampling test
 now asserts the variance gate; 238/238 pass. RESULT: allstate tables() OK (1771 tables) both baseline
 AND +cell_refit -> the full 6-dataset scoreboard is now G0-decomposable end to end.
+
+## cell_refit PERF OPTIMIZED (2026-07-01) — two profiler-found bottlenecks eliminated, scores unchanged
+
+Profiling (TRIBOOST_PROFILE) found the cell_refit dominated wide/many-tree fits. Two fixes, both
+byte-deterministic + G0-exact, ALL SCORES IDENTICAL (allstate +0.33 / diamonds +1.19 / particulate -0.49):
+1. SOLVE (cell_refit.rs): parallel mat-vecs on disjoint output axes (matvec over row blocks, rmatvec
+   over support-partitioned column windows — bit-identical to sequential, no reduction) + u16 support-local
+   ids + fit only nonzero-weight rows + share b/col_w across both solves + cheap capped flat init (60 iters)
+   + warm-start adaptive from flat + loosen cg_tol 1e-7->1e-4.
+2. SOUP-PREDICT (boost.rs attach_cell_correction): the uncovered-row fallback was a full soup prediction
+   over EVERY row, but uncovered rows carry weight 0 (excluded) so their grad_hess is discarded -> replaced
+   with the intercept f0 (no prediction).
+
+Results (n_bags=8, 8000 trees, base=4000 g=2):
+  allstate:    solve 470->51s (9.3x), total 634->219s (2.9x)   [1771 supports — the wide case]
+  particulate: attach 125->0.42s, total 504->374s              [36 supports — the many-tree case]
+  diamonds:    solve 0.25->0.36s (already trivial)
+=> cell_refit is now negligible except the raw CG on the widest models (allstate ~51s); bagging is the
+dominant cost everywhere, as it should be. 238/238 tests pass incl. byte-determinism e2e.
+Deferred (agent team's list): backfitting/block-Gauss-Seidel solver (~10-25x more, quality-neutral),
+pair-support pruning (quality-positive), drop-preview early-exit (skips the solve when the guard will drop it).

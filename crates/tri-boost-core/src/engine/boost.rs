@@ -994,15 +994,16 @@ fn attach_cell_correction(
             }
         }
     }
-    // Rows with no OOB coverage fall back to the soup prediction so grad_hess stays in-domain;
-    // they are then excluded from the fit via a zero IRLS weight.
-    let soup_raw = raw_predictions(&model, x)?;
+    // Rows with no OOB coverage fall back to the intercept f0 — any in-domain raw works, since
+    // they carry weight 0 below and their grad_hess is discarded. (Previously this was a full
+    // soup prediction over every row, a wasted whole-ensemble pass that dominated the attach on
+    // large, many-tree models like particulate.)
     let mut oob_raw = vec![0.0_f32; n_rows];
     for r in 0..n_rows {
         oob_raw[r] = if oob_cnt[r] > 0 {
             (oob_sum[r] / f64::from(oob_cnt[r])) as f32
         } else {
-            soup_raw[r]
+            model.f0
         };
     }
     // Newton working residual z = -g/h with IRLS weight h, evaluated at the OOB prediction.
