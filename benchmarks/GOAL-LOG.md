@@ -1342,3 +1342,26 @@ pre-gather. Remaining un-done team levers are modest: leaf_refine hessian-reuse 
 raw-invariant across the 4 steps) + dense-buffer rewrite (~0.5s), per-round heap cleanup (allocator
 churn, below noise). Two of three "big" levers this campaign proved phantoms — the safe wins are the
 small algorithmic reductions (OOB-rows-only, update_raw-split), not the parallelism plays.
+
+## MEMORY profiling + cell_refit fit-row cap for 10M-row scaling (2026-07-01)
+
+Added RSS/structure snapshots to TRIBOOST_PROFILE (prof::mem reads /proc VmRSS/VmHWM; structural
+sizes for shared X, per-bag X, cell_refit Design). Findings: the library is memory-LIGHT — allstate's
+own peak working set is ~421 MB over a ~1.6 GB Python+data baseline; narrow data ~10 MB. The ONE large
+library structure is the cell_refit Design.active (supports x n_solve x u16) = 378 MB on allstate, and
+it drives the overall peak (DURING cell_refit, not bagging — bagging is transient, freed per-bag).
+
+Scaling projection to 10M rows: base bagged model ~8 GB (feasible), but Design.active -> ~25 GB (OOM)
+and the solve -> ~50 min. Both O(supports x rows) — the scaling wall is entirely cell_refit.
+Design.active can't shrink byte-identically without paying time (materialize once = fast+big vs
+recompute per-sweep = ~70x time), so the fix is to bound the ROWS it fits on.
+
+FIX — CellRefitSpec.max_fit_rows cap (default 1,000,000): the correction is a coarse over-determined
+surface (<= pair_cell_cap^2 coeffs/pair), so above the cap a deterministic HASH-based subsample
+(splitmix64 of row id — robust to sorted/periodic row order; a strided pick biased an alternating-bin
+test, caught + switched) of the fit rows gives a near-identical fit while bounding Design.active
+(~3.5 GB) AND the solve. Cap set ~9x the widest current dataset (allstate 106k n_solve), so NOTHING in
+the suite is subsampled: allstate 0.53984 / diamonds 0.09045 byte-identical confirmed, Design still
+378 MB (cap dormant). Only 10M-scale datasets hit it. tri-boost now scales to 10M+ rows with bounded
+cell_refit memory + time, at zero cost to any current fit. Pinned by
+fit_row_cap_recovers_the_effect_and_stays_deterministic.

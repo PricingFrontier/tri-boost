@@ -51,6 +51,13 @@ pub struct CellRefitSpec {
     /// Relative per-sweep coefficient-change tolerance (max|Δ| / max|δ|). The solved δ is
     /// globally rescaled by the held-out no-harm guard, so sub-noise precision is wasted.
     pub cg_tol: f64,
+    /// Maximum rows used to FIT the correction. The correction is a coarse, over-determined surface
+    /// (≤ `pair_cell_cap`² coeffs per pair), so above this a deterministic strided subsample of the
+    /// (sorted) nonzero-weight rows gives a near-identical fit while bounding `Design.active`
+    /// (supports × rows × u16) and the solve — the two structures that scale with row count. Set far
+    /// above every realistic dataset's OOB-covered row count, so ordinary fits are NEVER subsampled
+    /// (byte-identical); only very large datasets (10M+ rows) hit it.
+    pub max_fit_rows: usize,
 }
 
 impl Default for CellRefitSpec {
@@ -65,6 +72,9 @@ impl Default for CellRefitSpec {
             flat_cg_iters: 30,
             cg_iters: 100,
             cg_tol: 1e-4,
+            // ~9x the widest current dataset's OOB fit rows (allstate ≈ 106k), so nothing in the
+            // suite is ever subsampled; only 10M-row-scale datasets hit the cap.
+            max_fit_rows: 1_000_000,
         }
     }
 }
@@ -94,6 +104,16 @@ struct Design {
     /// `groups[u][k][merged_cell]` = the coarse group id a merged cell maps to, for expanding
     /// the solved δ back to merged resolution when filling the [`CorrectionBank`].
     groups: Vec<Vec<Vec<u32>>>,
+}
+
+/// Bijective 64-bit scramble (splitmix64 finalizer): deterministic, tie-free, and uncorrelated with
+/// input order. Used to subsample the cell-refit fit rows on huge datasets without biasing on sorted
+/// or periodic row order.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 /// Map each of `merged_m` merged cells to one of `min(merged_m, cap)` contiguous coarse
@@ -465,9 +485,24 @@ pub fn fit_cell_correction(
 
     // Fit only nonzero-weight rows. Held-out/uncovered rows carry weight 0 and contribute
     // EXACTLY 0 to `b` and `col_w`, so compacting them out is lossless (same δ, cheaper).
-    let rows: Vec<usize> = (0..n_rows).filter(|&r| sample_weight[r] > 0.0).collect();
+    let mut rows: Vec<usize> = (0..n_rows).filter(|&r| sample_weight[r] > 0.0).collect();
     if rows.is_empty() {
         return Ok(bank);
+    }
+    // Bound the fit rows for very large datasets (see [`CellRefitSpec::max_fit_rows`]). Keep the
+    // `cap` rows with the smallest bijective scramble of their row id — a HASH-based subsample
+    // (a strided pick would bias on sorted/periodic row order, e.g. date-sorted data), uncorrelated
+    // with row structure and tie-free (splitmix64 is a bijection). Re-sort by row id so the solve
+    // keeps ascending/sequential access. Pure function of the row set ⇒ byte-deterministic. Below
+    // the cap — every ordinary dataset — `rows` is untouched, so the fit is byte-identical.
+    if rows.len() > spec.max_fit_rows {
+        let cap = spec.max_fit_rows;
+        let mut keyed: Vec<(u64, usize)> =
+            rows.iter().map(|&r| (splitmix64(r as u64), r)).collect();
+        keyed.select_nth_unstable_by_key(cap - 1, |&(h, _)| h);
+        keyed.truncate(cap);
+        rows = keyed.into_iter().map(|(_, r)| r).collect();
+        rows.sort_unstable();
     }
     let w_c: Vec<f64> = rows.iter().map(|&r| sample_weight[r]).collect();
     let r_c: Vec<f64> = rows.iter().map(|&r| residual[r]).collect();
@@ -607,6 +642,7 @@ mod tests {
             flat_cg_iters: 200,
             cg_iters: 200,
             cg_tol: 1e-12,
+            max_fit_rows: 1_000_000,
         };
         let bank = fit_cell_correction(&model, &data, &resid, &w, &[vec![0]], &spec).unwrap();
         // Predict the correction at bins 1 and 2 and check it reduces the residual a lot.
@@ -648,6 +684,7 @@ mod tests {
             flat_cg_iters: 300,
             cg_iters: 300,
             cg_tol: 1e-12,
+            max_fit_rows: 1_000_000,
         };
         let adapt_spec = CellRefitSpec {
             gamma: 2.0,
@@ -665,6 +702,51 @@ mod tests {
         assert!(
             adapt_ratio < flat_ratio,
             "adaptive should shrink the zero-signal term more: flat {flat_ratio} adapt {adapt_ratio}"
+        );
+    }
+
+    #[test]
+    fn fit_row_cap_recovers_the_effect_and_stays_deterministic() {
+        // The fit-row cap subsamples the fit rows for very large datasets. Verify it (a) still
+        // recovers the effect (the correction is a coarse over-determined surface, so it barely needs
+        // the extra rows) and (b) is byte-deterministic (the strided subsample is a pure function of
+        // the row set — no RNG).
+        let model = small_model();
+        let n = 2000usize;
+        let a0: Vec<u8> = (0..n).map(|i| if i % 2 == 0 { 1 } else { 2 }).collect();
+        let a1 = vec![1u8; n];
+        let data = vec![a0.clone(), a1];
+        let resid: Vec<f64> = a0.iter().map(|&b| if b == 1 { 3.0 } else { -3.0 }).collect();
+        let w = vec![1.0_f64; n];
+        let spec = CellRefitSpec {
+            base: 1.0,
+            gamma: 0.0,
+            pair_cell_cap: 24,
+            flat_cg_iters: 200,
+            cg_iters: 200,
+            cg_tol: 1e-12,
+            max_fit_rows: 500, // << n, so the strided subsample fires
+        };
+        let bank1 = fit_cell_correction(&model, &data, &resid, &w, &[vec![0]], &spec).unwrap();
+        let bank2 = fit_cell_correction(&model, &data, &resid, &w, &[vec![0]], &spec).unwrap();
+        // Deterministic: identical banks bit-for-bit across runs.
+        assert_eq!(bank1.tables.len(), bank2.tables.len());
+        for (t1, t2) in bank1.tables.iter().zip(&bank2.tables) {
+            for (v1, v2) in t1.values.iter().zip(&t2.values) {
+                assert_eq!(v1.to_bits(), v2.to_bits(), "capped fit is not deterministic");
+            }
+        }
+        // Still recovers the ±3 step (a 500-row subsample fits the 2-cell main near-perfectly).
+        let rows: Vec<usize> = (0..n).collect();
+        let design = build_design(&bank1, &data, &rows, 24).unwrap();
+        let delta_flat: Vec<f64> = bank1.tables[0].values.clone();
+        let mut pred = vec![0.0_f64; n];
+        design.matvec(&delta_flat, &mut pred);
+        let before: f64 = resid.iter().map(|r| r * r).sum();
+        let after: f64 = resid.iter().zip(&pred).map(|(r, p)| (r - p).powi(2)).sum();
+        assert!(
+            after < 0.1 * before,
+            "capped fit did not recover the effect: before {before} after {after}"
         );
     }
 }

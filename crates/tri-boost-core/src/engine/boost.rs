@@ -1080,21 +1080,25 @@ fn attach_cell_correction(
     if supports.is_empty() {
         return Ok(model);
     }
-    let prof = std::env::var_os("TRIBOOST_PROFILE").is_some();
-    if prof {
-        let n_solve = weight.iter().filter(|&&w| w > 0.0).count();
-        let design_mb = (supports.len() * n_solve * 2) as f64 / 1e6;
-        eprintln!(
-            "[mem] cell_refit design: active ~{design_mb:.0} MB ({} supports x {n_solve} rows, u16)",
-            supports.len(),
-        );
-    }
-    let t_solve = std::time::Instant::now();
     let refit_spec = crate::cell_refit::CellRefitSpec {
         base: cr.base,
         gamma: cr.gamma,
         ..Default::default()
     };
+    let prof = std::env::var_os("TRIBOOST_PROFILE").is_some();
+    if prof {
+        let n_solve = weight
+            .iter()
+            .filter(|&&w| w > 0.0)
+            .count()
+            .min(refit_spec.max_fit_rows);
+        let design_mb = (supports.len() * n_solve * 2) as f64 / 1e6;
+        eprintln!(
+            "[mem] cell_refit design: active ~{design_mb:.0} MB ({} supports x {n_solve} fit rows, u16)",
+            supports.len(),
+        );
+    }
+    let t_solve = std::time::Instant::now();
     let bank = crate::cell_refit::fit_cell_correction(
         &model,
         &x.data,
