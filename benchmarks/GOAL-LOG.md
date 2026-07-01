@@ -1213,3 +1213,16 @@ NOTE (pre-existing, NOT cell_refit): allstate tables()/decompose trips the SAMPL
 (σ²(F)==Σσ²(f_u)) — the BASELINE (no refit) fails it identically. It's a statistical certification on
 >JOINT_CAP-cell models (allstate has 551 pairs), noisy on the largest model; the decomposition is still
 exact (reconstruction+mass+purity pass). Independent of this build; flag for the variance-gate sampling.
+
+## VarianceSum sampled-gate FIXED (2026-07-01) — allstate now decomposes
+
+Root cause (pre-existing, not cell_refit): the sampled VarianceSum estimator (>JOINT_CAP-cell models)
+drew each axis's cell UNIFORMLY then importance-weighted by wprod = Π w_axis. On wide models
+(allstate ~40 realized features) that product collapses — a few sampled points carry ~all the weight,
+effective sample size ~ O(1) — so var_ens was garbage and false-failed even though the decomposition
+is exact (reconstruction/mass/purity pass). BASELINE allstate failed identically (confirmed).
+Fix: sample each axis's cell FROM the reference measure w itself (per-axis inverse-CDF, deterministic
+splitmix draw) and take an UNWEIGHTED average -> effective N stays at N in high dim. Exhaustive path
+(the 5 smaller datasets) UNCHANGED and byte-exact. explain.rs check_variance_sum; forced-sampling test
+now asserts the variance gate; 238/238 pass. RESULT: allstate tables() OK (1771 tables) both baseline
+AND +cell_refit -> the full 6-dataset scoreboard is now G0-decomposable end to end.

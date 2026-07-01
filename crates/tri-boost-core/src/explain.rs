@@ -2238,27 +2238,89 @@ pub(crate) fn check_variance_sum(
     let tol = ExactTol::for_model(model).var_tol;
     let grids = MergedGrids::from_model(model)?;
     let feats = gate_features(model, bank)?;
-    let (mut m1, mut m2, mut wsum) = (0.0_f64, 0.0_f64, 0.0_f64);
-    let sampled = enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
-        let wprod = joint_weight(w, &feats, x_cells)?;
-        let e = model.ensemble_f64(rep_bins)?;
-        m1 += wprod * e;
-        m2 += wprod * e * e;
-        wsum += wprod;
-        Ok(())
-    })?;
-    // Self-normalize by the realized total weight. For the EXHAUSTIVE sweep `wsum == 1`
-    // (the product of per-axis-normalized weights summed over the full grid), so this is
-    // a no-op and the integral stays exact. For the SAMPLED sweep `wsum < 1`, this turns
-    // the partial sum into a consistent self-normalized (Horvitz–Thompson) estimator of
-    // the true moments — fixing the prior bug where the un-normalized partial sum made a
-    // large exact model false-fail VarianceSum.
-    if !wsum.is_finite() || wsum <= 0.0 {
-        return Err(PbError::Internal {
-            what: "variance check accumulated non-positive total weight".into(),
-        });
+    let mut extents = Vec::with_capacity(feats.len());
+    for r in &feats {
+        extents.push(grids.cells(*r)?);
     }
-    let var_ens = (m2 / wsum) - (m1 / wsum) * (m1 / wsum);
+    let total = saturating_product_u64(&extents);
+
+    let (var_ens, sampled) = if total <= joint_cap() as u64 {
+        // EXHAUSTIVE: exact w-weighted moments over the full joint grid. `wsum == 1` here (the
+        // product of per-axis-normalized weights summed over the full grid), so the
+        // self-normalization is a no-op and the integral stays bit-exact.
+        let (mut m1, mut m2, mut wsum) = (0.0_f64, 0.0_f64, 0.0_f64);
+        enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
+            let wprod = joint_weight(w, &feats, x_cells)?;
+            let e = model.ensemble_f64(rep_bins)?;
+            m1 += wprod * e;
+            m2 += wprod * e * e;
+            wsum += wprod;
+            Ok(())
+        })?;
+        if !wsum.is_finite() || wsum <= 0.0 {
+            return Err(PbError::Internal {
+                what: "variance check accumulated non-positive total weight".into(),
+            });
+        }
+        ((m2 / wsum) - (m1 / wsum) * (m1 / wsum), false)
+    } else {
+        // SAMPLED: draw each axis's cell from the REFERENCE MEASURE `w` itself (per-axis
+        // inverse-CDF via a deterministic splitmix draw), then take an UNWEIGHTED average.
+        // This keeps the effective sample size at N even in high dimensions. The former
+        // uniform-sample + product-weight importance estimator collapsed on wide models —
+        // a handful of points carried nearly all the weight — and false-failed VarianceSum
+        // (e.g. allstate's ~40 realized features), even though the decomposition is exact
+        // (reconstruction/mass/purity all hold). Sampling ∝ w removes the weight collapse.
+        let mut cdfs: Vec<Vec<f64>> = Vec::with_capacity(feats.len());
+        let mut totals: Vec<f64> = Vec::with_capacity(feats.len());
+        for r in &feats {
+            let aw = w.axis(*r)?;
+            let mut cum = Vec::with_capacity(aw.len());
+            let mut acc = 0.0_f64;
+            for &x in aw {
+                acc += x.max(0.0);
+                cum.push(acc);
+            }
+            if !(acc.is_finite() && acc > 0.0) {
+                return Err(PbError::Internal {
+                    what: "variance sampler: axis has non-positive total weight".into(),
+                });
+            }
+            cdfs.push(cum);
+            totals.push(acc);
+        }
+        let nfeat = grids.n_features();
+        let mut x_cells = vec![0u32; nfeat];
+        let mut rep_bins = vec![0u8; nfeat];
+        let samples = joint_cap() as u64;
+        let (mut m1, mut m2) = (0.0_f64, 0.0_f64);
+        for s in 0..samples {
+            for (k, r) in feats.iter().enumerate() {
+                let mut z = s
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((k as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z ^= z >> 27;
+                let unit = (z >> 11) as f64 / (1u64 << 53) as f64; // uniform in [0, 1)
+                let u = unit * totals[k];
+                let cell = cdfs[k].partition_point(|&c| c <= u).min(cdfs[k].len() - 1);
+                let ma = grids.axis(*r)?;
+                *x_cells
+                    .get_mut(r.0 as usize)
+                    .ok_or_else(|| PbError::Internal {
+                        what: "variance sample x_cells index escaped".into(),
+                    })? = cell as u32;
+                *rep_bins.get_mut(ma.axis).ok_or_else(|| PbError::Internal {
+                    what: "variance sample rep_bins index escaped".into(),
+                })? = ma.rep_model_bin(cell)?;
+            }
+            let e = model.ensemble_f64(&rep_bins)?;
+            m1 += e;
+            m2 += e * e;
+        }
+        let nf = samples as f64;
+        ((m2 / nf) - (m1 / nf) * (m1 / nf), true)
+    };
     let var_tables: f64 = bank.tables.iter().map(|t| t.variance).sum::<f64>()
         + bank.factored.iter().map(|ft| ft.variance).sum::<f64>();
     // Exact tolerance when exhaustive; a relative band when sampled (the sampled estimator
@@ -4281,6 +4343,10 @@ mod tests {
         check_mass_conservation(&model, &bank, &w).unwrap();
         check_reconstruction(&model, &bank).unwrap();
         check_three_way_equal(&model, &bank).unwrap();
+        // VarianceSum under sampling now draws ∝ w (per-axis inverse-CDF) and averages
+        // unweighted, so the estimator stays accurate instead of collapsing on the product
+        // weight — it must certify this exact model, not false-fail.
+        check_variance_sum(&model, &bank, &w).unwrap();
 
         // Self-normalization recovers the true mean from the partial sample. Replicate
         // the estimator: the UN-normalized m1 would be ≈ (Σ_sampled wprod)·f0, a small
