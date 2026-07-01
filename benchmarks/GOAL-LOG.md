@@ -1192,3 +1192,24 @@ prefers the coarse-24 regularization. REVERTED the per-type-cap machinery — fi
 pairs is the better default and aligns with the no-per-dataset-tuning principle. (Also confirmed the
 no-harm guard costs ~0.08pp on particulate via its 15% holdout: uncapped w/o guard was -0.33%, w/
 guard -0.41%; a deliberate safety trade.) DO NOT re-chase per-type pair grids.
+
+## FULL o2 SCOREBOARD with cell_refit ON (2026-07-01, coarse-24 + no-harm guard, live EBM)
+Recipe: n_bags=8, f=0.8, n_trees=8000, lr=0.20, leaf_refine=4, base=4000, gamma=2. +% = tri better than EBM.
+| dataset o2   | task | tri bagged | + cell_refit | Δtri    | verdict |
+| particulate  | reg  | -1.41%     | -0.49%       | +0.92pp | loss -> near-tie |
+| diamonds     | reg  | +0.45%     | +1.19%       | +0.74pp | WIN improved |
+| allstate     | reg  | +0.01%     | +0.33%       | +0.32pp | WIN improved |
+| miami_housing| reg  | +3.77%     | +3.77%       | +0.00pp | WIN preserved (guard) |
+| kick         | clf  | -1.03%     | -1.03%       | +0.00pp | loss, NO-HARM (guard) |
+| amazon_access| clf  | -0.16%     | -0.16%       | +0.00pp | loss, NO-HARM (guard) |
+
+NET: cell_refit IMPROVES all 3 non-trivial regression cases (particulate closes to near-tie; diamonds
++0.74pp; allstate +0.32pp), PRESERVES miami, and is strictly NO-HARM on both classification losses
+(kick, amazon neutralized by the guard). With refit ON, tri WINS 3 reg (diamonds/allstate/miami),
+near-ties particulate, loses 2 clf (kick -1.03%, amazon -0.16%) — the clf gap is the order-2 ceiling
+the refit can't cross but the guard ensures it never widens.
+
+NOTE (pre-existing, NOT cell_refit): allstate tables()/decompose trips the SAMPLED VarianceSum gate
+(σ²(F)==Σσ²(f_u)) — the BASELINE (no refit) fails it identically. It's a statistical certification on
+>JOINT_CAP-cell models (allstate has 551 pairs), noisy on the largest model; the decomposition is still
+exact (reconstruction+mass+purity pass). Independent of this build; flag for the variance-gate sampling.
