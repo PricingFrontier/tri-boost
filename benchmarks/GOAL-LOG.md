@@ -1278,3 +1278,26 @@ Experiments:
   148->28.75s (5.2x), total 374->348.6s (-26s wall), score -0.50% unchanged. Small on allstate (6s cpu).
 Pending from the agent list: hist_build g/h pre-gather (~10-25% off the dominant bagging, byte-identical),
 move-trees-into-soup, flatten Design.active, dead per-round clones, build_design per-distinct-axis.
+
+## PERF LOOP iteration 1 — closeout: the two remaining levers are NO-OPS (2026-07-01)
+
+Both took the byte-identical route and both delivered ZERO speedup on rigorous measurement — kept the
+OOB win from above, reverted these:
+- FLATTEN Design.active (Vec<Vec<u16>> -> one flat buffer + n_solve stride): solve 38.21s vs ~38s. No
+  change — the backfit sweep is memory-BANDWIDTH-bound (streams active+res+w), not indirection-bound, so
+  removing the pointer-chase saves nothing. Byte-identical (+0.33% held). REVERTED.
+- HIST_BUILD g/h PRE-GATHER (the agent's headline Rank-1 lever, est. 10-25%): interleave g/h into one
+  struct + gather g/h/leaf/weight into `rows` order ONCE per build_histogram, so each axis reads them
+  sequentially instead of re-gathering by absolute row id (n_axes=130 times/row at level 0). Implemented
+  byte-identically (RowInputs pre-gather; 259/259 tests pass incl. both hist thread-count-identity tests;
+  allstate score EXACTLY 0.53984 +0.33%). But CLEAN single-thread A/B (n_jobs=1, n_bags=1, no contention):
+  baseline median 58.15s / min 53.56s vs pre-gather median 58.10s / min 54.09s — DEAD EVEN (pre-gather min
+  a hair WORSE). Mechanism: tri SORTS its sampled rows (sample_rows sorts; subagging keeps ascending), so
+  the per-axis gh[ru] gather is already an ASCENDING, prefetched access — not the random-access the lever
+  assumed. hist_build is bound by raw accumulation VOLUME (O(rows·axes·levels·trees)) + the output-side
+  scatter/bounds-checks, NOT input-gather latency. Adding a gather+alloc pass only costs. REVERTED.
+=> hist_build is near its byte-exact FLOOR: it's a scalar scatter-accumulation whose gather is already
+  prefetched. Remaining hist levers are lossy (subsample/fewer-axes/fewer-bins — all reject: change scores)
+  or small+risky (level-0 fast path, output-side bounds-elision — can't elide the data-dependent idx
+  without unsafe, which is forbidden). Loop iteration 1 net: OOB-rows-only KEPT (-26s particulate); solve
+  backfit + OOB-predict are the real wins; the two "biggest remaining" levers proved to be phantoms.
