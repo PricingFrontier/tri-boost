@@ -1247,3 +1247,20 @@ Results (n_bags=8, 8000 trees, base=4000 g=2):
 dominant cost everywhere, as it should be. 238/238 tests pass incl. byte-determinism e2e.
 Deferred (agent team's list): backfitting/block-Gauss-Seidel solver (~10-25x more, quality-neutral),
 pair-support pruning (quality-positive), drop-preview early-exit (skips the solve when the guard will drop it).
+
+## cell_refit SOLVE levers explored (2026-07-01) — backfitting shipped, lossy levers rejected
+
+Explored the agent team's remaining levers for the allstate solve (the wide-model bottleneck, 130 feats):
+- PRUNING (top pairs by frequency, 0.90 mass) + ROW SUBSAMPLING (50k rows): fast (solve 51->11s) but
+  QUALITY-LOSSY — allstate +0.33% -> +0.14% (both) / +0.18% (subsample only), ~HALVING the gain. allstate's
+  interaction signal is spread across many weak pairs and needs the rows; the tail isn't noise here. REJECTED.
+- BACKFITTING (block Gauss-Seidel: each support's block is diagonal since cells are mutually exclusive ->
+  closed-form shrunk-weighted-mean update, no inner solve): QUALITY-NEUTRAL (same minimizer) — allstate
+  +0.33% / diamonds +1.19% / particulate -0.50% all held. Solve 51 -> 38s (~1.3x). It's SEQUENTIAL
+  (Gauss-Seidel couples supports within a sweep) and allstate's coupling needs ~70 sweeps, so the win is
+  modest; parallelizing it is overhead-limited (thousands of tiny per-support ops). SHIPPED (CG kept as
+  #[allow(dead_code)] fallback).
+
+FINAL solve: 470s (orig) -> 51s (parallel/warm-start CG) -> 38s (backfit) on the widest model; <1s on every
+other dataset; attach soup-predict eliminated (125->0.42s on particulate). All scores unchanged. The
+quality-safe FLOOR on allstate is ~38s — lower needs the lossy levers (halve the gain) or a parallel backfit.

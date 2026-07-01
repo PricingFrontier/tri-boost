@@ -43,26 +43,27 @@ pub struct CellRefitSpec {
     /// pair grids. The δ stays constant WITHIN merged cells, so the correction is still
     /// stored at merged resolution and G0 is untouched.
     pub pair_cell_cap: u32,
-    /// Iteration cap for the CHEAP flat init. Its per-cell values are discarded — only the
-    /// per-term RMS magnitudes feed the adaptive reweighting — so a rough solve suffices.
+    /// Sweep cap for the CHEAP flat init. Its per-cell values are discarded — only the per-term
+    /// RMS magnitudes feed the adaptive reweighting — so a rough solve suffices.
     pub flat_cg_iters: usize,
-    /// Iteration cap for the accurate adaptive solve.
+    /// Sweep cap for the accurate adaptive solve.
     pub cg_iters: usize,
-    /// Conjugate-gradient relative residual tolerance (‖r‖/‖b‖). The solved δ is globally
-    /// rescaled by the held-out no-harm guard, so sub-noise precision is wasted.
+    /// Relative per-sweep coefficient-change tolerance (max|Δ| / max|δ|). The solved δ is
+    /// globally rescaled by the held-out no-harm guard, so sub-noise precision is wasted.
     pub cg_tol: f64,
 }
 
 impl Default for CellRefitSpec {
     fn default() -> Self {
         // base≈4000, γ≈2 — the held-out-validated prototype plateau; pair grid capped at the
-        // prototype's 24 cells/axis; cheap flat init (60 iters) + loosened tol (1e-4).
+        // prototype's 24 cells/axis. Backfitting converges in far fewer sweeps than CG needs
+        // iterations, so the sweep caps are small (30 flat / 100 adaptive); tol 1e-4.
         CellRefitSpec {
             base: 4000.0,
             gamma: 2.0,
             pair_cell_cap: 24,
-            flat_cg_iters: 60,
-            cg_iters: 500,
+            flat_cg_iters: 30,
+            cg_iters: 100,
             cg_tol: 1e-4,
         }
     }
@@ -251,7 +252,9 @@ fn build_design(
 /// `b = XᵀW r` and `col_w = XᵀW` (the diagonal) are precomputed and shared across solves.
 /// `w` is the per-row IRLS weight; `x0` an optional warm start. Deterministic: the mat-vecs are
 /// bit-identical to sequential and all vector reductions are sequential.
-#[allow(clippy::too_many_arguments)]
+///
+/// Retained as a fallback; `fit_cell_correction` now uses [`solve_ridge_backfit`].
+#[allow(clippy::too_many_arguments, dead_code)]
 fn solve_ridge_cg(
     design: &Design,
     w: &[f64],
@@ -345,6 +348,91 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
     s
 }
 
+/// Solve the SAME ridge `(XᵀWX + diag(lambda)) δ = XᵀW r_target` by block Gauss-Seidel
+/// (backfitting) over supports. Within a support each row activates exactly one cell, so the
+/// support's block of `XᵀWX` is DIAGONAL and its coordinate update is closed-form (a shrunk
+/// weighted cell-mean) — no inner solve. One sweep costs one mat-vec pair but takes an EXACT
+/// block step per support, so on the purified near-orthogonal basis it converges in far fewer
+/// sweeps than CG needs iterations. Converges to the SAME minimizer, so it changes speed, not
+/// the correction. Deterministic: supports swept in fixed order, each cell/residual reduction
+/// in fixed row order (sequential — Gauss-Seidel couples supports within a sweep).
+fn solve_ridge_backfit(
+    design: &Design,
+    w: &[f64],
+    r_target: &[f64],
+    col_w: &[f64],
+    lambda: &[f64],
+    x0: Option<&[f64]>,
+    max_sweeps: usize,
+    tol: f64,
+) -> Vec<f64> {
+    let n_rows = w.len();
+    let n_cols = design.n_cols;
+    let mut delta = match x0 {
+        Some(x0) => x0.to_vec(),
+        None => vec![0.0_f64; n_cols],
+    };
+    // Running residual res = r_target − X δ (maintained incrementally across supports).
+    let mut res = r_target.to_vec();
+    if x0.is_some() {
+        let mut f = vec![0.0_f64; n_rows];
+        design.matvec(&delta, &mut f);
+        for i in 0..n_rows {
+            res[i] -= f[i];
+        }
+    }
+    let max_cells = design
+        .term_cols
+        .iter()
+        .map(|&t| t as usize)
+        .max()
+        .unwrap_or(0);
+    let mut s_buf = vec![0.0_f64; max_cells];
+    let mut d_buf = vec![0.0_f64; max_cells];
+    for _sweep in 0..max_sweeps {
+        let mut max_change = 0.0_f64;
+        let mut max_coef = 1e-30_f64;
+        for (u, active_u) in design.active.iter().enumerate() {
+            let off = design.col_offset[u] as usize;
+            let ncell = design.term_cols[u] as usize;
+            // s[c] = Σ_{rows in cell c} w_r · res_r (the support's gradient against res).
+            let s = &mut s_buf[..ncell];
+            for v in s.iter_mut() {
+                *v = 0.0;
+            }
+            for (i, &c) in active_u.iter().enumerate() {
+                s[c as usize] += w[i] * res[i];
+            }
+            // Exact diagonal-block ridge update; Δ = new − old.
+            let d = &mut d_buf[..ncell];
+            for (cc, dcc) in d.iter_mut().enumerate() {
+                let c = off + cc;
+                let old = delta[c];
+                let cw = col_w[c];
+                let den = cw + lambda[c];
+                let new = if den > 0.0 {
+                    (s[cc] + old * cw) / den
+                } else {
+                    0.0
+                };
+                *dcc = new - old;
+                delta[c] = new;
+                max_change = max_change.max(dcc.abs());
+                max_coef = max_coef.max(new.abs());
+            }
+            // Propagate the change into the running residual (Gauss-Seidel: later supports in
+            // this sweep already see it).
+            for (i, &c) in active_u.iter().enumerate() {
+                res[i] -= d[c as usize];
+            }
+        }
+        if max_change <= tol * max_coef {
+            break;
+        }
+    }
+    delta
+}
+
 /// Fit the §G1 cell-basis correction for `supports` (each a sorted list of model axis ids,
 /// order 1..=2 — mains and pairs; triples are left to the trees). `data[axis][row]` is the
 /// binned training matrix, `residual` the bagged OOB working residual, `sample_weight` the
@@ -387,20 +475,16 @@ pub fn fit_cell_correction(
     let design = build_design(&bank, data, &rows, spec.pair_cell_cap)?;
     let n_cols = design.n_cols;
 
-    // Precompute b = Xᵀ(W r) and col_w = Xᵀ W (the diagonal preconditioner base). Both are
-    // byte-identical across the two solves (same X, W, r), so compute them once.
-    let wr: Vec<f64> = w_c.iter().zip(&r_c).map(|(w, r)| w * r).collect();
-    let mut b = vec![0.0_f64; n_cols];
-    design.rmatvec(&wr, &mut b);
+    // col_w = Xᵀ W (the per-support diagonal block), shared by both backfit solves.
     let mut col_w = vec![0.0_f64; n_cols];
     design.rmatvec(&w_c, &mut col_w);
 
-    // Cheap capped flat ridge init (λ=base): only its per-term RMS magnitudes are used.
+    // Cheap flat ridge init (λ=base): only its per-term RMS magnitudes feed the reweighting.
     let flat = vec![spec.base; n_cols];
-    let delta0 = solve_ridge_cg(
+    let delta0 = solve_ridge_backfit(
         &design,
         &w_c,
-        &b,
+        &r_c,
         &col_w,
         &flat,
         None,
@@ -450,12 +534,12 @@ pub fn fit_cell_correction(
     let delta = if spec.gamma == 0.0 {
         delta0
     } else {
-        // Warm-start the accurate adaptive solve from the flat solution (same X,W,r; only λ
-        // changed), so it starts near the answer and needs far fewer iterations.
-        solve_ridge_cg(
+        // Warm-start the accurate adaptive backfit from the flat solution (same X,W,r; only λ
+        // changed), so it starts near the answer and needs far fewer sweeps.
+        solve_ridge_backfit(
             &design,
             &w_c,
-            &b,
+            &r_c,
             &col_w,
             &lambda,
             Some(&delta0),
