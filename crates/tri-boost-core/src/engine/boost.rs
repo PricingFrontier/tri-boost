@@ -534,14 +534,21 @@ fn fit_single(
                     // `raw` spans ALL rows (incl. any validation rows); grow's `leaf_of_row` covers
                     // every one of them only when grow saw the full set, so reuse it for the
                     // tree-walk-free update just then. Otherwise update_raw re-walks (unchanged).
+                    // Reuse grow's leaf map for the train rows and re-walk ONLY the validation
+                    // holdout (grow saw every train row when `full_sample`); else fall back to the
+                    // covers-all fast path or a full walk. All branches update each row exactly once,
+                    // byte-identically to a full re-walk.
                     let covers_all_rows = sampled_rows.len() == x.n_rows as usize;
-                    prof::timed("update_raw", || {
-                        update_raw(
+                    prof::timed("update_raw", || match validation_rows.as_deref() {
+                        Some(val) if full_sample => {
+                            update_raw_split(&mut raw, x, &tree, &leaf_of_row, &sampled_rows, val)
+                        }
+                        _ => update_raw(
                             &mut raw,
                             x,
                             &tree,
                             covers_all_rows.then_some(leaf_of_row.as_slice()),
-                        )
+                        ),
                     })?;
                     trees.push((1.0, tree));
                 }
@@ -3210,6 +3217,48 @@ fn update_raw(
     Ok(())
 }
 
+/// Update `raw` for the validation-carve case: grow's `leaf_of_row` is indexed by ABSOLUTE row and
+/// is valid exactly for `covered_rows` (the sampled/train rows grow saw), so apply the map to those
+/// and re-walk ONLY `walk_rows` (the validation holdout) — instead of re-walking every row. Byte-
+/// identical to a full re-walk: `covered_rows` and `walk_rows` partition `0..raw.len()`, so each row
+/// is updated exactly once, and grow's map matches the walk bit-for-bit (same canonical `low_bit`;
+/// refinement changed only leaf VALUES, not memberships — pinned by
+/// `update_raw_leaf_map_matches_tree_walk_bit_for_bit`).
+fn update_raw_split(
+    raw: &mut [f32],
+    x: &BinnedMatrix,
+    tree: &ObliviousTree,
+    leaf_of_row: &[u8],
+    covered_rows: &[u32],
+    walk_rows: &[usize],
+) -> Result<(), PbError> {
+    for &r in covered_rows {
+        let leaf = *leaf_of_row.get(r as usize).ok_or_else(|| PbError::Internal {
+            what: "update_raw_split covered row escaped membership map".into(),
+        })?;
+        let slot = raw.get_mut(r as usize).ok_or_else(|| PbError::Internal {
+            what: "update_raw_split covered row escaped raw".into(),
+        })?;
+        *slot += *tree
+            .leaves
+            .get(usize::from(leaf))
+            .ok_or_else(|| PbError::Internal {
+                what: "update_raw_split leaf escaped".into(),
+            })?;
+    }
+    if !walk_rows.is_empty() {
+        let columns = tree_split_columns(tree, &x.data)?;
+        for &r in walk_rows {
+            let v = tree_value_for_row_with_columns(tree, &columns, r)?;
+            let slot = raw.get_mut(r).ok_or_else(|| PbError::Internal {
+                what: "update_raw_split walk row escaped raw".into(),
+            })?;
+            *slot += v;
+        }
+    }
+    Ok(())
+}
+
 /// Score one row against one tree by column-major reads, folding the leaf index with
 /// the SAME canonical `low_bit` rule as [`ObliviousTree::lookup`] and the grower.
 #[cfg(test)]
@@ -3443,6 +3492,66 @@ mod tests {
                 "row {r}: tree-walk update {} != leaf-map update {}",
                 raw_walk[r],
                 raw_map[r]
+            );
+        }
+    }
+
+    #[test]
+    fn update_raw_split_matches_full_walk_bit_for_bit() {
+        // The validation-carve fast path (`update_raw_split`) must match a full re-walk bit-for-bit.
+        // Covered rows are the EVENS and walk rows the ODDS — non-contiguous so `covered_rows[i] != i`,
+        // which catches absolute-vs-position indexing of `leaf_of_row` (a bug the full-sample tests
+        // where `sampled_rows[i] == i` would miss).
+        let n = 240usize;
+        let x0: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+        let x1: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
+        let x2: Vec<f32> = (0..n).map(|i| (i % 3) as f32).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| x0[i] + 2.0 * x1[i] - x2[i] + x0[i] * x1[i])
+            .collect();
+        let x = binned(&[x0, x1, x2]);
+        let weight = vec![1.0_f32; n];
+        let raw0 = vec![0.0_f32; n];
+        let sqe = SquaredError;
+        let mut gh = GradHess::default();
+        sqe.grad_hess(&y, &raw0, &weight, &mut gh).unwrap();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let cfg = GrowConfig {
+            lambda: 1.0,
+            l1_leaf: 0.0,
+            lr: 0.5,
+            min_split_gain: 0.0,
+            max_order: 3,
+            max_delta_step: None,
+            hist_precision: HistPrecision::FullF64,
+            quant_seed: 0,
+            round: 0,
+            random_strength: 0.0,
+            groups: None,
+            monotone: None,
+            table_budget_penalty: None,
+            credibility: CredibilityFloor::default(),
+            unit_weight: true,
+            hist_subtraction: true,
+        };
+        let (tree, leaf_of_row) =
+            grow_oblivious_tree_with_leaf_map(&x, &gh, &rows, &[0, 1, 2], &cfg, &weight)
+                .unwrap()
+                .expect("a tree");
+        let base: Vec<f32> = (0..n).map(|i| 0.1 * i as f32 - 3.0).collect();
+        let covered: Vec<u32> = (0..n as u32).filter(|r| r % 2 == 0).collect();
+        let walk: Vec<usize> = (0..n).filter(|r| r % 2 == 1).collect();
+        let mut raw_walk = base.clone();
+        update_raw(&mut raw_walk, &x, &tree, None).unwrap();
+        let mut raw_split = base.clone();
+        update_raw_split(&mut raw_split, &x, &tree, &leaf_of_row, &covered, &walk).unwrap();
+        for r in 0..n {
+            assert_eq!(
+                raw_walk[r].to_bits(),
+                raw_split[r].to_bits(),
+                "row {r}: full walk {} != split update {}",
+                raw_walk[r],
+                raw_split[r]
             );
         }
     }
