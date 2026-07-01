@@ -14,10 +14,19 @@
 //! corrected support), so the joint ridge is solved with a diagonally-preconditioned
 //! conjugate gradient that never materialises `XᵀX` — the existing dense refit
 //! (`fully_corrective_refit`) would be infeasible at cell width.
+//!
+//! Performance: the two mat-vecs dominate the solve. They have DISJOINT per-thread outputs
+//! (`matvec` over rows, `rmatvec` over the support-partitioned column windows), so they are
+//! parallelised with no floating-point reduction — bit-identical to the sequential result,
+//! hence byte-deterministic across thread counts. The solve also (a) fits only nonzero-weight
+//! rows (held-out/uncovered rows contribute exactly 0), (b) shares the byte-identical `b` and
+//! `col_w` across both solves, (c) runs a cheap capped flat init (its per-term magnitudes are
+//! all that feed the reweighting), and (d) warm-starts the adaptive solve from it.
 
 use crate::engine::{CorrectionBank, Model};
 use crate::error::PbError;
 use crate::explain::correction_scaffold;
+use rayon::prelude::*;
 
 /// Hyper-parameters for the cell-basis refit. Suite-wide (no per-dataset tuning).
 #[derive(Debug, Clone, Copy)]
@@ -34,39 +43,51 @@ pub struct CellRefitSpec {
     /// pair grids. The δ stays constant WITHIN merged cells, so the correction is still
     /// stored at merged resolution and G0 is untouched.
     pub pair_cell_cap: u32,
-    /// Maximum conjugate-gradient iterations per solve.
+    /// Iteration cap for the CHEAP flat init. Its per-cell values are discarded — only the
+    /// per-term RMS magnitudes feed the adaptive reweighting — so a rough solve suffices.
+    pub flat_cg_iters: usize,
+    /// Iteration cap for the accurate adaptive solve.
     pub cg_iters: usize,
-    /// Conjugate-gradient relative residual tolerance (‖r‖/‖b‖).
+    /// Conjugate-gradient relative residual tolerance (‖r‖/‖b‖). The solved δ is globally
+    /// rescaled by the held-out no-harm guard, so sub-noise precision is wasted.
     pub cg_tol: f64,
 }
 
 impl Default for CellRefitSpec {
     fn default() -> Self {
         // base≈4000, γ≈2 — the held-out-validated prototype plateau; pair grid capped at the
-        // prototype's 24 cells/axis.
+        // prototype's 24 cells/axis; cheap flat init (60 iters) + loosened tol (1e-4).
         CellRefitSpec {
             base: 4000.0,
             gamma: 2.0,
             pair_cell_cap: 24,
+            flat_cg_iters: 60,
             cg_iters: 500,
-            cg_tol: 1e-7,
+            cg_tol: 1e-4,
         }
     }
 }
 
+/// Block size (rows) for the row-parallel `matvec`: sized so each thread's output slice stays
+/// L2-resident across its passes over the supports.
+const MATVEC_BLOCK: usize = 4096;
+
 /// The sparse cell-indicator design, stored implicitly: every row activates exactly one
-/// COARSE cell per corrected support, so we keep only the global column id per (support,
-/// row). Columns are at the (possibly coarsened) solve resolution; the solved δ is expanded
-/// back to merged resolution for storage, so the design need only carry the coarse layout.
+/// COARSE cell per corrected support. `active[u][i]` is the SUPPORT-LOCAL coarse cell id
+/// (u16 — halves the index bandwidth the mat-vecs stream) of the `i`-th fit row on support
+/// `u`; the global column is `col_offset[u] + active[u][i]`.
 struct Design {
-    /// `active[u][r]` = global coarse column id activated by row `r` on support `u`.
-    active: Vec<Vec<u32>>,
+    /// `active[u][i]` = support-local coarse cell id (`< term_cols[u]`) of fit row `i`.
+    active: Vec<Vec<u16>>,
     /// Total coarse column count (Σ coarse cells over supports).
     n_cols: usize,
     /// `col_term[c]` = the support index owning coarse column `c` (for per-term reweighting).
     col_term: Vec<u32>,
     /// First global coarse column id of each support (prefix sum of per-support coarse cells).
     col_offset: Vec<u32>,
+    /// Coarse column count of each support (`col_offset[u+1] − col_offset[u]`); the width of
+    /// support `u`'s disjoint column window, used to partition `rmatvec` output in parallel.
+    term_cols: Vec<u32>,
     /// `coarse_shape[u][k]` = coarse cell count of support `u`'s axis `k` (parallel to its axes).
     coarse_shape: Vec<Vec<u32>>,
     /// `groups[u][k][merged_cell]` = the coarse group id a merged cell maps to, for expanding
@@ -85,44 +106,66 @@ fn coarse_groups(merged_m: u32, cap: u32) -> (Vec<u32>, u32) {
 }
 
 impl Design {
-    /// `y = X v` (length n_rows): sum the activated coefficients per row.
+    /// `out = X v` (length n_rows). Parallel over disjoint row blocks; each `out[r]` is summed
+    /// over supports in fixed order, so the result is bit-identical to the sequential loop
+    /// regardless of thread count (no cross-thread reduction).
     fn matvec(&self, v: &[f64], out: &mut [f64]) {
-        for o in out.iter_mut() {
-            *o = 0.0;
-        }
-        for active_u in &self.active {
-            for (r, &c) in active_u.iter().enumerate() {
-                out[r] += v[c as usize];
-            }
-        }
+        out.par_chunks_mut(MATVEC_BLOCK)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                let base = ci * MATVEC_BLOCK;
+                for o in chunk.iter_mut() {
+                    *o = 0.0;
+                }
+                for (u, active_u) in self.active.iter().enumerate() {
+                    let off = self.col_offset[u] as usize;
+                    for (i, o) in chunk.iter_mut().enumerate() {
+                        *o += v[off + active_u[base + i] as usize];
+                    }
+                }
+            });
     }
 
-    /// `z = Xᵀ y` (length n_cols): scatter each row's value to its activated columns.
+    /// `out = Xᵀ y` (length n_cols). Parallel over supports: each support owns a DISJOINT
+    /// column window `[col_offset[u], col_offset[u]+term_cols[u])`, so scatters never race and
+    /// each column accumulates its rows in fixed order — bit-identical to the sequential loop.
     fn rmatvec(&self, y: &[f64], out: &mut [f64]) {
-        for o in out.iter_mut() {
-            *o = 0.0;
+        // Partition `out` into per-support column windows (disjoint mutable sub-slices).
+        let mut windows: Vec<&mut [f64]> = Vec::with_capacity(self.active.len());
+        let mut rest = &mut out[..];
+        for &w in &self.term_cols {
+            let (head, tail) = rest.split_at_mut(w as usize);
+            windows.push(head);
+            rest = tail;
         }
-        for active_u in &self.active {
-            for (r, &c) in active_u.iter().enumerate() {
-                out[c as usize] += y[r];
-            }
-        }
+        windows
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(u, win)| {
+                for o in win.iter_mut() {
+                    *o = 0.0;
+                }
+                for (r, &c) in self.active[u].iter().enumerate() {
+                    win[c as usize] += y[r];
+                }
+            });
     }
 }
 
-/// Build the implicit COARSE design for `bank`'s supports from the binned training columns.
-/// `data[axis][row]` is the model bin id. For each support, each axis's merged cells are
+/// Build the implicit COARSE design for `bank`'s supports over the fit rows `rows` (the
+/// nonzero-weight subset). `data[axis][row]` is the model bin id; each axis's merged cells are
 /// grouped into ≤`pair_cell_cap` coarse cells for ORDER-2 supports (mains keep full merged
-/// resolution); a row's active coarse column is the row-major fold of its per-axis
-/// (model bin → merged cell → coarse group) maps, shifted by the support's coarse offset.
+/// resolution). Stores support-local coarse cell ids.
 fn build_design(
     bank: &CorrectionBank,
     data: &[Vec<u8>],
-    n_rows: usize,
+    rows: &[usize],
     pair_cell_cap: u32,
 ) -> Result<Design, PbError> {
     let n_terms = bank.tables.len();
+    let n_solve = rows.len();
     let mut col_offset = Vec::with_capacity(n_terms);
+    let mut term_cols = Vec::with_capacity(n_terms);
     let mut coarse_shape: Vec<Vec<u32>> = Vec::with_capacity(n_terms);
     let mut groups: Vec<Vec<Vec<u32>>> = Vec::with_capacity(n_terms);
     let mut n_cols: usize = 0;
@@ -130,74 +173,66 @@ fn build_design(
         let order = table.axes.len();
         let mut ks = Vec::with_capacity(order);
         let mut grps = Vec::with_capacity(order);
-        let mut term_cols: usize = 1;
+        let mut cols: usize = 1;
         for k in 0..order {
             let merged_m = table.shape[k];
             let cap = if order <= 1 { merged_m } else { pair_cell_cap };
             let (g, kk) = coarse_groups(merged_m, cap);
             ks.push(kk);
             grps.push(g);
-            term_cols = term_cols
-                .checked_mul(kk as usize)
-                .ok_or_else(|| PbError::Internal {
-                    what: "cell-refit coarse term column count overflow".into(),
-                })?;
+            cols = cols.checked_mul(kk as usize).ok_or_else(|| PbError::Internal {
+                what: "cell-refit coarse term column count overflow".into(),
+            })?;
+        }
+        // Support-local cell ids are u16: guard the per-support coarse width. Pairs are
+        // ≤ pair_cell_cap² (576 at the default), mains ≤ merged cells ≤ n_bins.
+        if cols > usize::from(u16::MAX) {
+            return Err(PbError::Internal {
+                what: format!("cell-refit support coarse width {cols} exceeds u16"),
+            });
         }
         col_offset.push(u32::try_from(n_cols).map_err(|_| PbError::Internal {
             what: "cell-refit column offset exceeded u32".into(),
         })?);
-        n_cols = n_cols
-            .checked_add(term_cols)
-            .ok_or_else(|| PbError::Internal {
-                what: "cell-refit column count overflow".into(),
-            })?;
+        term_cols.push(cols as u32);
+        n_cols = n_cols.checked_add(cols).ok_or_else(|| PbError::Internal {
+            what: "cell-refit column count overflow".into(),
+        })?;
         coarse_shape.push(ks);
         groups.push(grps);
     }
     let mut col_term = vec![0u32; n_cols];
-    for t in 0..n_terms {
-        let start = col_offset[t] as usize;
-        let end = if t + 1 < n_terms {
-            col_offset[t + 1] as usize
-        } else {
-            n_cols
-        };
-        for c in start..end {
-            col_term[c] = t as u32;
+    for (t, &off) in col_offset.iter().enumerate() {
+        let start = off as usize;
+        let end = start + term_cols[t] as usize;
+        for slot in &mut col_term[start..end] {
+            *slot = t as u32;
         }
     }
-    let mut active: Vec<Vec<u32>> = Vec::with_capacity(n_terms);
+    let mut active: Vec<Vec<u16>> = Vec::with_capacity(n_terms);
     for (t, table) in bank.tables.iter().enumerate() {
-        let mut col = vec![0u32; n_rows];
+        let mut col = vec![0u16; n_solve];
         for (k, &axis) in table.axes.iter().enumerate() {
             let column = data.get(axis as usize).ok_or_else(|| PbError::ShapeMismatch {
                 what: format!("cell-refit: data has no axis {axis}"),
             })?;
-            if column.len() != n_rows {
-                return Err(PbError::ShapeMismatch {
-                    what: format!(
-                        "cell-refit: axis {axis} column len {} != n_rows {n_rows}",
-                        column.len()
-                    ),
-                });
-            }
             let map = &table.bin_to_cell[k];
             let grp = &groups[t][k];
             let kk = coarse_shape[t][k];
-            for (r, slot) in col.iter_mut().enumerate() {
-                let bin = column[r] as usize;
+            for (i, slot) in col.iter_mut().enumerate() {
+                let row = rows[i];
+                let bin = *column.get(row).ok_or_else(|| PbError::ShapeMismatch {
+                    what: format!("cell-refit: axis {axis} column shorter than rows"),
+                })? as usize;
                 let merged_cell = *map.get(bin).ok_or_else(|| PbError::InvalidInput {
                     what: format!("cell-refit: bin {bin} outside bin_to_cell axis {axis}"),
                 })? as usize;
                 let coarse = *grp.get(merged_cell).ok_or_else(|| PbError::Internal {
                     what: "cell-refit: merged cell escaped coarse groups".into(),
                 })?;
-                *slot = *slot * kk + coarse;
+                // Row-major fold stays < the support's coarse width (≤ u16::MAX, guarded above).
+                *slot = (u32::from(*slot) * kk + coarse) as u16;
             }
-        }
-        let offset = col_offset[t];
-        for slot in &mut col {
-            *slot += offset;
         }
         active.push(col);
     }
@@ -206,39 +241,30 @@ fn build_design(
         n_cols,
         col_term,
         col_offset,
+        term_cols,
         coarse_shape,
         groups,
     })
 }
 
-/// Solve `(XᵀWX + diag(lambda)) δ = XᵀW r` by diagonally-preconditioned conjugate
-/// gradient. `w` is the per-row IRLS weight (1.0 for squared error), `r` the working
-/// residual. Deterministic: every reduction sums in a fixed (support, row) order.
+/// Solve `(XᵀWX + diag(lambda)) δ = b` by diagonally-preconditioned conjugate gradient, where
+/// `b = XᵀW r` and `col_w = XᵀW` (the diagonal) are precomputed and shared across solves.
+/// `w` is the per-row IRLS weight; `x0` an optional warm start. Deterministic: the mat-vecs are
+/// bit-identical to sequential and all vector reductions are sequential.
+#[allow(clippy::too_many_arguments)]
 fn solve_ridge_cg(
     design: &Design,
     w: &[f64],
-    r: &[f64],
+    b: &[f64],
+    col_w: &[f64],
     lambda: &[f64],
-    spec: &CellRefitSpec,
+    x0: Option<&[f64]>,
+    max_iters: usize,
+    tol: f64,
 ) -> Vec<f64> {
-    let n_rows = r.len();
-    let n_cols = design.n_cols;
+    let n_rows = w.len();
+    let n_cols = b.len();
 
-    // Right-hand side b = Xᵀ (W r).
-    let mut wr = vec![0.0_f64; n_rows];
-    for i in 0..n_rows {
-        wr[i] = w[i] * r[i];
-    }
-    let mut b = vec![0.0_f64; n_cols];
-    design.rmatvec(&wr, &mut b);
-
-    // Diagonal preconditioner M[c] = colW[c] + lambda[c], colW[c] = Σ_{row active in c} W.
-    let mut col_w = vec![0.0_f64; n_cols];
-    for active_u in &design.active {
-        for (i, &c) in active_u.iter().enumerate() {
-            col_w[c as usize] += w[i];
-        }
-    }
     let minv: Vec<f64> = (0..n_cols)
         .map(|c| {
             let d = col_w[c] + lambda[c];
@@ -264,16 +290,28 @@ fn solve_ridge_cg(
         }
     };
 
-    let mut x = vec![0.0_f64; n_cols]; // solution δ, warm-started at 0
-    let mut resid = b.clone(); // r0 = b - A·0 = b
+    let mut x = match x0 {
+        Some(x0) => x0.to_vec(),
+        None => vec![0.0_f64; n_cols],
+    };
+    // r0 = b − A·x0 (= b when x0 is zero).
+    let mut resid = vec![0.0_f64; n_cols];
+    if x0.is_some() {
+        apply_a(&x, &mut resid, &mut xv, &mut wxv);
+        for c in 0..n_cols {
+            resid[c] = b[c] - resid[c];
+        }
+    } else {
+        resid.copy_from_slice(b);
+    }
     let mut z: Vec<f64> = (0..n_cols).map(|c| minv[c] * resid[c]).collect();
     let mut p = z.clone();
     let mut ap = vec![0.0_f64; n_cols];
 
-    let b_norm = dot(&b, &b).sqrt().max(1e-30);
+    let b_norm = dot(b, b).sqrt().max(1e-30);
     let mut rz = dot(&resid, &z);
-    for _ in 0..spec.cg_iters {
-        if dot(&resid, &resid).sqrt() / b_norm <= spec.cg_tol {
+    for _ in 0..max_iters {
+        if dot(&resid, &resid).sqrt() / b_norm <= tol {
             break;
         }
         apply_a(&p, &mut ap, &mut xv, &mut wxv);
@@ -310,8 +348,8 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 /// Fit the §G1 cell-basis correction for `supports` (each a sorted list of model axis ids,
 /// order 1..=2 — mains and pairs; triples are left to the trees). `data[axis][row]` is the
 /// binned training matrix, `residual` the bagged OOB working residual, `sample_weight` the
-/// per-row IRLS weight (1.0 for squared error). Returns a [`CorrectionBank`] of raw
-/// per-merged-cell deltas ready to attach to `model`.
+/// per-row IRLS weight (1.0 for squared error; 0.0 excludes a row). Returns a [`CorrectionBank`]
+/// of raw per-merged-cell deltas ready to attach to `model`.
 ///
 /// # Errors
 /// Propagates scaffold / shape failures.
@@ -336,18 +374,46 @@ pub fn fit_cell_correction(
     if bank.tables.is_empty() {
         return Ok(bank);
     }
-    let design = build_design(&bank, data, n_rows, spec.pair_cell_cap)?;
 
-    // Flat ridge init (γ folded in afterwards): λ_col = base.
-    let flat = vec![spec.base; design.n_cols];
-    let delta0 = solve_ridge_cg(&design, sample_weight, residual, &flat, spec);
+    // Fit only nonzero-weight rows. Held-out/uncovered rows carry weight 0 and contribute
+    // EXACTLY 0 to `b` and `col_w`, so compacting them out is lossless (same δ, cheaper).
+    let rows: Vec<usize> = (0..n_rows).filter(|&r| sample_weight[r] > 0.0).collect();
+    if rows.is_empty() {
+        return Ok(bank);
+    }
+    let w_c: Vec<f64> = rows.iter().map(|&r| sample_weight[r]).collect();
+    let r_c: Vec<f64> = rows.iter().map(|&r| residual[r]).collect();
+
+    let design = build_design(&bank, data, &rows, spec.pair_cell_cap)?;
+    let n_cols = design.n_cols;
+
+    // Precompute b = Xᵀ(W r) and col_w = Xᵀ W (the diagonal preconditioner base). Both are
+    // byte-identical across the two solves (same X, W, r), so compute them once.
+    let wr: Vec<f64> = w_c.iter().zip(&r_c).map(|(w, r)| w * r).collect();
+    let mut b = vec![0.0_f64; n_cols];
+    design.rmatvec(&wr, &mut b);
+    let mut col_w = vec![0.0_f64; n_cols];
+    design.rmatvec(&w_c, &mut col_w);
+
+    // Cheap capped flat ridge init (λ=base): only its per-term RMS magnitudes are used.
+    let flat = vec![spec.base; n_cols];
+    let delta0 = solve_ridge_cg(
+        &design,
+        &w_c,
+        &b,
+        &col_w,
+        &flat,
+        None,
+        spec.flat_cg_iters,
+        spec.cg_tol,
+    );
 
     // Per-term signal s_term = sqrt(mean δ0² over the term's columns); adaptive weight
     // w_term = s_term^γ normalised to mean 1; per-column penalty λ_col = base / w_term².
     let n_terms = bank.tables.len();
     let mut sumsq = vec![0.0_f64; n_terms];
     let mut counts = vec![0.0_f64; n_terms];
-    for c in 0..design.n_cols {
+    for c in 0..n_cols {
         let t = design.col_term[c] as usize;
         sumsq[t] += delta0[c] * delta0[c];
         counts[t] += 1.0;
@@ -374,7 +440,7 @@ pub fn fit_cell_correction(
     }
     // Guard tiny weights so λ stays finite; floor relative to the mean (=1).
     const W_FLOOR: f64 = 1e-3;
-    let lambda: Vec<f64> = (0..design.n_cols)
+    let lambda: Vec<f64> = (0..n_cols)
         .map(|c| {
             let wt = w_term[design.col_term[c] as usize].max(W_FLOOR);
             spec.base / (wt * wt)
@@ -384,7 +450,18 @@ pub fn fit_cell_correction(
     let delta = if spec.gamma == 0.0 {
         delta0
     } else {
-        solve_ridge_cg(&design, sample_weight, residual, &lambda, spec)
+        // Warm-start the accurate adaptive solve from the flat solution (same X,W,r; only λ
+        // changed), so it starts near the answer and needs far fewer iterations.
+        solve_ridge_cg(
+            &design,
+            &w_c,
+            &b,
+            &col_w,
+            &lambda,
+            Some(&delta0),
+            spec.cg_iters,
+            spec.cg_tol,
+        )
     };
 
     // Expand the solved COARSE δ to the bank's merged-resolution values: each merged cell
@@ -443,12 +520,14 @@ mod tests {
             base: 1.0,
             gamma: 0.0,
             pair_cell_cap: 24,
+            flat_cg_iters: 200,
             cg_iters: 200,
             cg_tol: 1e-12,
         };
         let bank = fit_cell_correction(&model, &data, &resid, &w, &[vec![0]], &spec).unwrap();
         // Predict the correction at bins 1 and 2 and check it reduces the residual a lot.
-        let design = build_design(&bank, &data, n, 24).unwrap();
+        let rows: Vec<usize> = (0..n).collect();
+        let design = build_design(&bank, &data, &rows, 24).unwrap();
         let delta_flat: Vec<f64> = bank.tables[0].values.clone();
         let mut pred = vec![0.0_f64; n];
         design.matvec(&delta_flat, &mut pred);
@@ -478,8 +557,18 @@ mod tests {
         let w = vec![1.0_f64; n];
         let supports = vec![vec![0u32], vec![1u32]];
 
-        let flat_spec = CellRefitSpec { base: 50.0, gamma: 0.0, pair_cell_cap: 24, cg_iters: 300, cg_tol: 1e-12 };
-        let adapt_spec = CellRefitSpec { base: 50.0, gamma: 2.0, pair_cell_cap: 24, cg_iters: 300, cg_tol: 1e-12 };
+        let flat_spec = CellRefitSpec {
+            base: 50.0,
+            gamma: 0.0,
+            pair_cell_cap: 24,
+            flat_cg_iters: 300,
+            cg_iters: 300,
+            cg_tol: 1e-12,
+        };
+        let adapt_spec = CellRefitSpec {
+            gamma: 2.0,
+            ..flat_spec
+        };
         let flat = fit_cell_correction(&model, &data, &resid, &w, &supports, &flat_spec).unwrap();
         let adapt = fit_cell_correction(&model, &data, &resid, &w, &supports, &adapt_spec).unwrap();
 
