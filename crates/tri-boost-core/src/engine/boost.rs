@@ -307,6 +307,31 @@ pub(crate) mod prof {
     pub(crate) fn reset() {
         SPANS.with(|s| s.borrow_mut().clear());
     }
+    /// Current resident set size and its peak (high-water mark) in MB, from `/proc/self/status`.
+    /// RSS is process-wide physical memory (includes the Python host + shared libs); the DELTAS
+    /// between phase snapshots are what attribute memory to library steps.
+    pub(crate) fn rss_mb() -> Option<(f64, f64)> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let (mut rss, mut hwm) = (None, None);
+        for line in status.lines() {
+            let mut it = line.split_whitespace();
+            match it.next() {
+                Some("VmRSS:") => rss = it.next().and_then(|v| v.parse::<f64>().ok()),
+                Some("VmHWM:") => hwm = it.next().and_then(|v| v.parse::<f64>().ok()),
+                _ => {}
+            }
+        }
+        Some((rss? / 1024.0, hwm? / 1024.0))
+    }
+    /// Emit an RSS snapshot (gated by `TRIBOOST_PROFILE`) for a fit-lifecycle boundary.
+    pub(crate) fn mem(label: &str) {
+        if !enabled() {
+            return;
+        }
+        if let Some((rss, hwm)) = rss_mb() {
+            eprintln!("[mem] {label:<22} rss {rss:>6.0} MB   peak {hwm:>6.0} MB");
+        }
+    }
     pub(crate) fn report() {
         if !enabled() {
             return;
@@ -847,6 +872,15 @@ fn fit_outer_bag(
     let collect_oob = cell_refit.is_some();
     // Dev-only phase timers (gated by TRIBOOST_PROFILE; no-op otherwise).
     let prof = std::env::var_os("TRIBOOST_PROFILE").is_some();
+    if prof {
+        let feat = x.data.len();
+        let shared_mb = (n_rows * feat) as f64 / 1e6;
+        let bag_mb = (sample_len * feat) as f64 / 1e6;
+        eprintln!(
+            "[mem] structures: shared X {shared_mb:.0} MB ({n_rows} rows x {feat} feats, u8) | per-bag X ~{bag_mb:.0} MB x {n_bags} bags run concurrently",
+        );
+        prof::mem("fit start");
+    }
     let oob_predict_ns = std::sync::atomic::AtomicU64::new(0);
     let t_bags = std::time::Instant::now();
     // Bags are independent (each seeded by its index) and collected IN BAG ORDER, so fitting them
@@ -908,6 +942,7 @@ fn fit_outer_bag(
         .collect::<Result<Vec<_>, _>>()?;
 
     let bags_s = t_bags.elapsed().as_secs_f64();
+    prof::mem("after bag_loop");
     let mut weighted = Vec::with_capacity(members.len());
     let mut oobs = Vec::with_capacity(members.len());
     for (wm, oob) in members {
@@ -923,6 +958,7 @@ fn fit_outer_bag(
         Some(cr) => {
             let t_attach = std::time::Instant::now();
             let corrected = attach_cell_correction(model, x, y, spec, &oobs, cr)?;
+            prof::mem("after cell_refit");
             if prof {
                 let oob_s = oob_predict_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
                 eprintln!(
@@ -1045,6 +1081,14 @@ fn attach_cell_correction(
         return Ok(model);
     }
     let prof = std::env::var_os("TRIBOOST_PROFILE").is_some();
+    if prof {
+        let n_solve = weight.iter().filter(|&&w| w > 0.0).count();
+        let design_mb = (supports.len() * n_solve * 2) as f64 / 1e6;
+        eprintln!(
+            "[mem] cell_refit design: active ~{design_mb:.0} MB ({} supports x {n_solve} rows, u16)",
+            supports.len(),
+        );
+    }
     let t_solve = std::time::Instant::now();
     let refit_spec = crate::cell_refit::CellRefitSpec {
         base: cr.base,
