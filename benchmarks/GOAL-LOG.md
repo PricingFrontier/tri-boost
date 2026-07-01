@@ -1178,3 +1178,17 @@ in production (worse bagging baseline -1.03% vs proto -0.82%, cat pairs don't ge
 the order-2 ceiling. The prototype's -0.18% particulate was optimistic full-data; -0.49% is the honest
 production number (held-out OOB + 15% guard holdout cost some closure; full merged grid would give ~-0.33%).
 Enable: TriBoostRegressor/Classifier(cell_refit_base=4000, cell_refit_gamma=2, n_bags>=2, bag_subsample=0.8).
+
+## Finer numeric pair grid — TRIED, REFUTED (2026-07-01)
+
+Hypothesis: give numeric pair axes a finer grid than 24 (categoricals stay coarse) to close the
+continuous-feature loss (particulate) more. Built per-type caps (numeric vs categorical, via
+AxisKind) + a tunable knob; swept numeric cap {24,48,96,uncapped}. RESULT — a genuine dataset-
+specific TRADE-OFF, net negative:
+  particulate o2 (loss): 24->+0.92pp  96->+1.00pp  uncapped->+1.00pp  (finer gains +0.08pp, plateaus)
+  diamonds   o2 (win):   24->+0.74pp  48->+0.64pp  96->+0.48pp  uncapped->+0.47pp  (finer LOSES 0.26pp)
+Finer numeric helps particulate marginally (+0.08pp) but hurts diamonds 3x more (-0.26pp); diamonds
+prefers the coarse-24 regularization. REVERTED the per-type-cap machinery — fixed coarse-24 for all
+pairs is the better default and aligns with the no-per-dataset-tuning principle. (Also confirmed the
+no-harm guard costs ~0.08pp on particulate via its 15% holdout: uncapped w/o guard was -0.33%, w/
+guard -0.41%; a deliberate safety trade.) DO NOT re-chase per-type pair grids.
