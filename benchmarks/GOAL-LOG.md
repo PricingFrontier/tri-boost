@@ -1301,3 +1301,44 @@ OOB win from above, reverted these:
   or small+risky (level-0 fast path, output-side bounds-elision — can't elide the data-dependent idx
   without unsafe, which is forbidden). Loop iteration 1 net: OOB-rows-only KEPT (-26s particulate); solve
   backfit + OOB-predict are the real wins; the two "biggest remaining" levers proved to be phantoms.
+
+## PERF LOOP iteration 2 — agent-team pass on the NON-hist phases (2026-07-01)
+
+hist_build is at its floor (iter 1), so re-profiled everything else. Phase mix INVERTS by width:
+allstate (130 feats): grow/hist 91%, leaf_refine 6%, update_raw 1.6%, cell_refit solve 48s.
+diamonds (narrow):    grow/hist 37%, leaf_refine 35%, update_raw 9.6%, grad_hess 6.8%, solve 0.14s.
+=> the tree-scaling phases (leaf_refine/update_raw/grad_hess) dominate the NARROW datasets, which are
+most of the suite. Ran a 4-agent team (leaf_refine / cell_refit-solve / per-round+scheduling / waste).
+
+WON — update_raw reuses grow's leaf map for train rows, walks ONLY the validation holdout (agent 3):
+with a validation carve, sampled_rows==train_rows (full sample) but covers_all_rows is false, so
+update_raw re-walked ALL n rows every round despite grow already having the train-row leaf partition.
+New update_raw_split applies the map to covered (train) rows + walks only validation — a partition,
+each row once, byte-identical (map==walk per canonical low_bit; pinned by a NEW non-contiguous test
+that catches absolute-vs-position indexing — a bug I hit and caught via the exact-score check).
+update_raw ~5x on allstate (1.06->0.20s/bag) / ~9x on diamonds (0.65->0.07s/bag); scores EXACT
+(allstate 0.53984, diamonds 0.09045). COMMITTED. Bigger fraction on narrow/many-tree datasets.
+
+PHANTOM #3 — cell_refit solve cell-parallel (agent 2's headline, est. 5-8x on the 48s allstate solve):
+the solve runs single-threaded on a 22-core box; the theoretical fix is to parallelize each support's
+Gauss-Seidel block update over its CELLS (byte-identical: cells write disjoint delta/res, and a
+counting-sorted inverted index keeps each cell's f64 sum in ascending row order == the sequential
+scatter). Implemented fully — bit-identity test passed, allstate score EXACT 0.53984. But a clean A/B
+(force sequential vs parallel) showed sequential FASTER: flat 9.5s/adaptive 30.6s (seq 41.4s) vs
+9.4s/33.1s (par 44.2s). Two killers: (a) 230k+ per-support rayon dispatches (supports are sequential
+via Gauss-Seidel, so parallelism is only intra-support) whose overhead isn't amortized; (b) the
+cell-partition REPLACES the sequential res STREAM with a scattered res GATHER — byte-identity forbids
+the cheaper row-partition (breaks f64 associativity). REVERTED. The solve is at its PRACTICAL floor,
+even though the theoretical parallelism is real. (Rejected-by-agent bit-movers: SOR, sweep reorder,
+warm-start/tol changes, skip-converged — all land on a different iterate at finite tol.)
+
+NEGATIVE — bag scheduling already optimal (agent 3): it's ONE global work-stealing rayon pool
+(n_bags par-iter nested with each bag's histogram parallelism), not two static waves — stragglers are
+absorbed by stealing inner work. cell_refit can't overlap bags (hard dep on all bags' OOB preds).
+
+=> iter-2 net: 1 real byte-identical win (update_raw, suite-wide, bigger on narrow data); the 3rd big
+"breakthrough" (parallel solve) is another theoretically-real/practically-dead lever like the hist
+pre-gather. Remaining un-done team levers are modest: leaf_refine hessian-reuse (~0.3s, SE hessian is
+raw-invariant across the 4 steps) + dense-buffer rewrite (~0.5s), per-round heap cleanup (allocator
+churn, below noise). Two of three "big" levers this campaign proved phantoms — the safe wins are the
+small algorithmic reductions (OOB-rows-only, update_raw-split), not the parallelism plays.
