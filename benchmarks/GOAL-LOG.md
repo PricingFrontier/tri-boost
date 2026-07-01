@@ -1264,3 +1264,17 @@ Explored the agent team's remaining levers for the allstate solve (the wide-mode
 FINAL solve: 470s (orig) -> 51s (parallel/warm-start CG) -> 38s (backfit) on the widest model; <1s on every
 other dataset; attach soup-predict eliminated (125->0.42s on particulate). All scores unchanged. The
 quality-safe FLOOR on allstate is ~38s — lower needs the lossy levers (halve the gain) or a parallel backfit.
+
+## PERF OPTIMIZATION LOOP — iteration 1 (2026-07-01, profile → agents → experiment → keep)
+
+Profiled allstate (156.7s): bag_loop 116s (hist_build 90.6% = 40.3s/bag), cell_refit backfit 37.4s,
+OOB-predict 6.1s (allstate) / 148s (particulate). 4-agent team found score-neutral levers.
+Experiments:
+- Group-parallel backfit (block-Jacobi over support chunks): DIVERGED (NaN) — every support shares ALL
+  rows through the residual, so simultaneous updates over-shoot ~chunk×; damping would need ω~1/chunk
+  (no gain). REVERTED. Only convergent parallel backfit is within-support row-parallel (dispatch-heavy).
+- OOB-predict only the out-of-bag rows (Model::score_trees_rows): each bag scored ALL rows but only its
+  ~20% OOB rows are read. KEPT — byte-identical (in-bag preds stay 0, never read). particulate OOB-predict
+  148->28.75s (5.2x), total 374->348.6s (-26s wall), score -0.50% unchanged. Small on allstate (6s cpu).
+Pending from the agent list: hist_build g/h pre-gather (~10-25% off the dominant bagging, byte-identical),
+move-trees-into-soup, flatten Design.active, dead per-round clones, build_design per-distinct-axis.

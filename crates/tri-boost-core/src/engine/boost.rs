@@ -877,17 +877,21 @@ fn fit_outer_bag(
                         *slot = true;
                     }
                 }
-                let preds = if prof {
+                // Only out-of-bag rows are read from `preds` (attach reads `!in_bag`), so score
+                // just those — the other ~80% would be computed and discarded.
+                let oob_rows: Vec<u32> =
+                    (0..n_rows as u32).filter(|&r| !in_bag[r as usize]).collect();
+                let mut preds = vec![0.0_f32; n_rows];
+                if prof {
                     let t = std::time::Instant::now();
-                    let p = raw_predictions(&model, x)?;
+                    model.score_trees_rows(x, &oob_rows, &mut preds)?;
                     oob_predict_ns.fetch_add(
                         t.elapsed().as_nanos() as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    p
                 } else {
-                    raw_predictions(&model, x)?
-                };
+                    model.score_trees_rows(x, &oob_rows, &mut preds)?;
+                }
                 Some(BagOob { in_bag, preds })
             } else {
                 None

@@ -848,6 +848,55 @@ impl Model {
         Ok(())
     }
 
+    /// Raw score ONLY the rows in `rows`, writing `out[r]` for each (other `out` slots untouched).
+    /// `out` must be length n_rows. Byte-identical to [`Model::score_trees`] at those rows. Used to
+    /// compute the bagged out-of-bag residual, where only each bag's ~20% out-of-bag rows are read,
+    /// so scoring all rows is wasted — this scores just the needed subset.
+    ///
+    /// # Errors
+    /// [`PbError::ShapeMismatch`] on shape mismatch; propagated tree/correction lookup errors.
+    pub fn score_trees_rows(
+        &self,
+        x: &BinnedMatrix,
+        rows: &[u32],
+        out: &mut [f32],
+    ) -> Result<(), PbError> {
+        self.validate_binned_matrix(x)?;
+        let n_rows = x.n_rows as usize;
+        if out.len() != n_rows {
+            return Err(PbError::ShapeMismatch {
+                what: format!("out len {} != n_rows {n_rows}", out.len()),
+            });
+        }
+        let tree_columns: Vec<Vec<&[u8]>> = self
+            .trees
+            .iter()
+            .map(|(_, tree)| tree_split_columns(tree, &x.data))
+            .collect::<Result<_, _>>()?;
+        // The correction (rare on this path — bag models carry none) is added per row via its
+        // bins so `out` stays byte-identical to `score_trees` for the scored rows.
+        let mut row_bins = vec![0u8; if self.correction.is_some() { x.data.len() } else { 0 }];
+        for &r in rows {
+            let r = r as usize;
+            let mut score = self.f0;
+            for ((alpha, tree), columns) in self.trees.iter().zip(&tree_columns) {
+                score += *alpha * tree_value_for_row_with_columns(tree, columns, r)?;
+            }
+            if self.correction.is_some() {
+                for (a, col) in x.data.iter().enumerate() {
+                    row_bins[a] = *col.get(r).ok_or_else(|| PbError::Internal {
+                        what: "score_trees_rows column shorter than n_rows".into(),
+                    })?;
+                }
+                score += self.correction_delta(&row_bins)? as f32;
+            }
+            *out.get_mut(r).ok_or_else(|| PbError::Internal {
+                what: "score_trees_rows row escaped out".into(),
+            })? = score;
+        }
+        Ok(())
+    }
+
     /// Response-space predictions from an already-binned design.
     ///
     /// # Errors
