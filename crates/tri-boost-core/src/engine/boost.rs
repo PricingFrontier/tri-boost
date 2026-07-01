@@ -838,6 +838,10 @@ fn fit_outer_bag(
     let sample_len =
         (((n_rows as f64) * f64::from(bag_subsample)).round() as usize).clamp(1, n_rows);
     let collect_oob = cell_refit.is_some();
+    // Dev-only phase timers (gated by TRIBOOST_PROFILE; no-op otherwise).
+    let prof = std::env::var_os("TRIBOOST_PROFILE").is_some();
+    let oob_predict_ns = std::sync::atomic::AtomicU64::new(0);
+    let t_bags = std::time::Instant::now();
     // Bags are independent (each seeded by its index) and collected IN BAG ORDER, so fitting them
     // concurrently is byte-identical to the sequential fit regardless of thread count; soup_models
     // then folds the members in that fixed order. Nests with fit_single's own rayon parallelism on the
@@ -873,7 +877,17 @@ fn fit_outer_bag(
                         *slot = true;
                     }
                 }
-                let preds = raw_predictions(&model, x)?;
+                let preds = if prof {
+                    let t = std::time::Instant::now();
+                    let p = raw_predictions(&model, x)?;
+                    oob_predict_ns.fetch_add(
+                        t.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    p
+                } else {
+                    raw_predictions(&model, x)?
+                };
                 Some(BagOob { in_bag, preds })
             } else {
                 None
@@ -882,6 +896,7 @@ fn fit_outer_bag(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let bags_s = t_bags.elapsed().as_secs_f64();
     let mut weighted = Vec::with_capacity(members.len());
     let mut oobs = Vec::with_capacity(members.len());
     for (wm, oob) in members {
@@ -890,10 +905,28 @@ fn fit_outer_bag(
             oobs.push(o);
         }
     }
+    let t_soup = std::time::Instant::now();
     let model = soup_models(&weighted)?;
+    let soup_s = t_soup.elapsed().as_secs_f64();
     match cell_refit {
-        Some(cr) => attach_cell_correction(model, x, y, spec, &oobs, cr),
-        None => Ok(model),
+        Some(cr) => {
+            let t_attach = std::time::Instant::now();
+            let corrected = attach_cell_correction(model, x, y, spec, &oobs, cr)?;
+            if prof {
+                let oob_s = oob_predict_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+                eprintln!(
+                    "[outer-bag] bag_loop {bags_s:.2}s (OOB-predict cpu-sum {oob_s:.2}s, overlaps fit) | soup {soup_s:.2}s | cell_refit attach {:.2}s",
+                    t_attach.elapsed().as_secs_f64(),
+                );
+            }
+            Ok(corrected)
+        }
+        None => {
+            if prof {
+                eprintln!("[outer-bag] bag_loop {bags_s:.2}s | soup {soup_s:.2}s | no cell_refit");
+            }
+            Ok(model)
+        }
     }
 }
 
@@ -999,6 +1032,8 @@ fn attach_cell_correction(
     if supports.is_empty() {
         return Ok(model);
     }
+    let prof = std::env::var_os("TRIBOOST_PROFILE").is_some();
+    let t_solve = std::time::Instant::now();
     let refit_spec = crate::cell_refit::CellRefitSpec {
         base: cr.base,
         gamma: cr.gamma,
@@ -1012,7 +1047,9 @@ fn attach_cell_correction(
         &supports,
         &refit_spec,
     )?;
+    let solve_s = t_solve.elapsed().as_secs_f64();
     model.correction = Some(bank);
+    let t_guard = std::time::Instant::now();
     // No-harm guard: choose a global shrinkage λ ∈ [0,1] minimising held-out deviance of
     // `oob_raw + λ·correction` on the OOB-covered held-out slice. λ=0 (the correction does not
     // generalise — e.g. noisy high-cardinality categorical pairs) drops it entirely; λ=1 keeps
@@ -1064,6 +1101,13 @@ fn attach_cell_correction(
                 }
             }
         }
+    }
+    if prof {
+        eprintln!(
+            "[cell_refit] solve(design+CG) {solve_s:.2}s | guard(held-out λ={best_lambda}) {:.2}s | {} supports",
+            t_guard.elapsed().as_secs_f64(),
+            supports.len(),
+        );
     }
     model.validate()?;
     Ok(model)
