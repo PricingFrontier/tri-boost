@@ -1289,7 +1289,7 @@ OOB win from above, reverted these:
 - HIST_BUILD g/h PRE-GATHER (the agent's headline Rank-1 lever, est. 10-25%): interleave g/h into one
   struct + gather g/h/leaf/weight into `rows` order ONCE per build_histogram, so each axis reads them
   sequentially instead of re-gathering by absolute row id (n_axes=130 times/row at level 0). Implemented
-  byte-identically (RowInputs pre-gather; 259/259 tests pass incl. both hist thread-count-identity tests;
+  byte-identically (RowInputs pre-gather; 238/238 lib tests pass incl. both hist thread-count-identity tests;
   allstate score EXACTLY 0.53984 +0.33%). But CLEAN single-thread A/B (n_jobs=1, n_bags=1, no contention):
   baseline median 58.15s / min 53.56s vs pre-gather median 58.10s / min 54.09s — DEAD EVEN (pre-gather min
   a hair WORSE). Mechanism: tri SORTS its sampled rows (sample_rows sorts; subagging keeps ascending), so
